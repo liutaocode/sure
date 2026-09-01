@@ -205,7 +205,9 @@ def _check_task_compatibility(model: dict[str, Any], datasets: list[dict[str, An
     mismatched = []
     for item in datasets:
         task = _normalize_task(item.get("task"))
-        if task and task != "UNKNOWN" and (task in SYNTH_TASKS) != model_synth:
+        kws_mismatch = (model_task == "KWS" or task == "KWS") and task != model_task
+        synth_mismatch = (task in SYNTH_TASKS) != model_synth
+        if task and task != "UNKNOWN" and (kws_mismatch or synth_mismatch):
             mismatched.append(f"dataset '{item.get('name')}' has task {_task_label(task)}")
     if not mismatched:
         return

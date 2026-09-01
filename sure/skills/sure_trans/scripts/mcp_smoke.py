@@ -10,7 +10,9 @@ always writes --produces evidence (even on failure).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import select
 import subprocess
@@ -22,9 +24,35 @@ from pathlib import Path
 
 SCHEMA = "sure.trans.mcp_smoke.v1"
 STDERR_TAIL_LINES = 200
+PORTABLE_CONTAINER_ROOTS = ("/fixture/", "/models/", "/opt/", "/validation/", "/workspace/")
+KWS_OPERATING_THRESHOLD = 0.5
 
 
-def tool_arguments(tool: str, audio: Path) -> dict[str, str]:
+def sha256_file(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def portable_server_command(command: list[str]) -> list[str]:
+    portable: list[str] = []
+    for argument in command:
+        if argument.startswith(PORTABLE_CONTAINER_ROOTS) or not Path(argument).is_absolute():
+            portable.append(argument)
+        else:
+            portable.append(Path(argument).name)
+    return portable
+
+
+def tool_arguments(
+    tool: str,
+    audio: Path,
+    fixture_row: dict | None = None,
+) -> dict[str, object]:
     if tool == "synthesize_speech":
         return {
             "text": "SURE smoke test",
@@ -35,26 +63,160 @@ def tool_arguments(tool: str, audio: Path) -> dict[str, str]:
             "source_audio_path": str(audio),
             "reference_audio_path": str(audio),
         }
+    if tool == "kws_predict":
+        arguments: dict[str, object] = {"audio_path": str(audio)}
+        if fixture_row is not None and isinstance(fixture_row.get("keywords"), (str, list)):
+            arguments["keywords"] = fixture_row["keywords"]
+        if fixture_row is not None:
+            threshold = fixture_row.get("threshold")
+            if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+                if not math.isfinite(float(threshold)) or float(threshold) != KWS_OPERATING_THRESHOLD:
+                    raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
+                arguments["threshold"] = threshold
+            elif threshold is not None:
+                raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
+        return arguments
     return {"audio_path": str(audio)}
 
 
 def primary_output_field(tool: str) -> str:
-    return "audio_path" if tool in {"synthesize_speech", "convert_voice"} else "text"
+    if tool in {"synthesize_speech", "convert_voice"}:
+        return "audio_path"
+    if tool == "kws_predict":
+        return "detected"
+    return "text"
 
 
-def output_is_nonempty(primary_field: str, value: str) -> bool:
+def output_is_nonempty(primary_field: str, value: object) -> bool:
     """Whether the tool really produced its primary output.
 
     A path-valued field only proves an output exists if the file is there and
     holds bytes; the server runs as this script's child, so the path it
     returns is one this process can stat.
     """
-    if not value:
-        return False
     if primary_field.endswith("_path"):
+        if not isinstance(value, str) or not value:
+            return False
         candidate = Path(value)
         return candidate.is_file() and candidate.stat().st_size > 0
-    return True
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return value is not None
+
+
+def normalized_keyword(value: str) -> str:
+    return "".join(value.upper().split())
+
+
+def expected_detected(row: dict) -> bool:
+    value = row.get("expected_detected")
+    if isinstance(value, bool):
+        return value
+    value = row.get("expected", row.get("label"))
+    normalized = str(value).strip().lower()
+    if normalized in {"detect", "detected", "positive", "true", "1", "yes"}:
+        return True
+    if normalized in {"reject", "rejected", "negative", "false", "0", "no"}:
+        return False
+    raise ValueError("KWS fixture row requires an explicit positive or negative annotation")
+
+
+def expected_keyword(row: dict, detected: bool) -> str | None:
+    value = row.get("expected_keyword")
+    if value is None and detected:
+        value = row.get("text", row.get("txt"))
+    if detected:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("positive KWS fixture row requires expected_keyword or text")
+        return value.strip()
+    if value not in (None, ""):
+        raise ValueError("negative KWS fixture row must not declare expected_keyword")
+    return None
+
+
+def validate_kws_output(value: object, reference: dict) -> list[str]:
+    if not isinstance(value, dict):
+        return ["KWS output must be an object"]
+    violations: list[str] = []
+    for field in ("detected", "keyword", "score"):
+        if field not in value:
+            violations.append(f"missing required field: {field}")
+    detected = value.get("detected")
+    keyword = value.get("keyword")
+    score = value.get("score")
+    if not isinstance(detected, bool):
+        violations.append("detected must be a boolean")
+    if keyword is not None and (not isinstance(keyword, str) or not keyword.strip()):
+        violations.append("keyword must be a non-empty string or null")
+    if score is not None and (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+    ):
+        violations.append("score must be a finite number or null")
+    elif isinstance(score, (int, float)) and not isinstance(score, bool) and not 0 <= float(score) <= 1:
+        violations.append("score must be within [0, 1]")
+    if detected is True:
+        if not isinstance(keyword, str) or not keyword.strip():
+            violations.append("detected=true requires a keyword")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+            violations.append("detected=true requires a finite numeric score")
+        elif float(score) < KWS_OPERATING_THRESHOLD:
+            violations.append(f"detected=true requires score >= {KWS_OPERATING_THRESHOLD}")
+    elif detected is False and keyword is not None:
+        violations.append("detected=false requires keyword=null")
+    elif (
+        detected is False
+        and isinstance(score, (int, float))
+        and not isinstance(score, bool)
+        and math.isfinite(float(score))
+        and float(score) >= KWS_OPERATING_THRESHOLD
+    ):
+        violations.append(f"detected=false requires score < {KWS_OPERATING_THRESHOLD}")
+    reference_detected = expected_detected(reference)
+    if isinstance(detected, bool) and detected is not reference_detected:
+        violations.append(
+            f"detection disagrees with fixture: expected {reference_detected}, got {detected}"
+        )
+    reference_keyword = expected_keyword(reference, reference_detected)
+    if reference_detected and isinstance(keyword, str) and reference_keyword is not None:
+        if normalized_keyword(keyword) != normalized_keyword(reference_keyword):
+            violations.append(
+                f"keyword disagrees with fixture: expected {reference_keyword!r}, got {keyword!r}"
+            )
+    return violations
+
+
+def load_kws_fixture(path: Path) -> list[tuple[str, Path, dict]]:
+    rows: list[tuple[str, Path, dict]] = []
+    seen: set[str] = set()
+    polarities: set[bool] = set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"KWS fixture line {line_number} must be an object")
+        key = str(row.get("key") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"KWS fixture key is missing or duplicated: {key!r}")
+        seen.add(key)
+        audio = row.get("audio") or row.get("wav")
+        if not isinstance(audio, str) or not audio:
+            raise ValueError(f"KWS fixture {key} requires audio or wav")
+        relative = Path(audio)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"KWS fixture {key} audio path must be relative and contained")
+        audio_path = (path.parent / relative).resolve()
+        if not audio_path.is_file() or not audio_path.is_relative_to(path.parent.resolve()):
+            raise ValueError(f"KWS fixture {key} audio is missing or unsafe")
+        polarities.add(expected_detected(row))
+        rows.append((key, audio_path, row))
+    if not 2 <= len(rows) <= 5 or polarities != {False, True}:
+        raise ValueError("KWS MCP smoke requires 2 to 5 samples with positive and negative coverage")
+    return rows
 
 
 def _read_line(fd: int, buffer: bytearray, deadline: float) -> str | None:
@@ -123,7 +285,9 @@ def _read_response(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Drive the adapter MCP JSON-RPC protocol with bounded deadlines.")
-    parser.add_argument("--audio", required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--audio")
+    inputs.add_argument("--fixture-gt-jsonl")
     parser.add_argument("--tool", default="transcribe_audio")
     parser.add_argument("--server-command", nargs="*", default=["python", "/opt/sure_trans/server.py"])
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -131,7 +295,8 @@ def main() -> int:
     parser.add_argument("--server-stderr-log")
     args = parser.parse_args()
 
-    audio = Path(args.audio)
+    audio = Path(args.audio) if args.audio else None
+    fixture_gt_jsonl = Path(args.fixture_gt_jsonl) if args.fixture_gt_jsonl else None
     produces = Path(args.produces)
     steps: dict = {
         "initialize": {"ok": False},
@@ -154,6 +319,13 @@ def main() -> int:
 
     proc: subprocess.Popen | None = None
     try:
+        if fixture_gt_jsonl is not None:
+            if args.tool != "kws_predict":
+                raise ValueError("--fixture-gt-jsonl is only valid with --tool kws_predict")
+            calls = load_kws_fixture(fixture_gt_jsonl)
+        else:
+            assert audio is not None
+            calls = [(audio.stem, audio, None)]
         proc = subprocess.Popen(
             args.server_command,
             stdin=subprocess.PIPE,
@@ -185,41 +357,93 @@ def main() -> int:
         if not steps["tools_list"]["ok"]:
             raise RuntimeError(f"tools/list step failed for tool {args.tool!r}: tools={tools}")
 
-        if _send(
-            proc,
-            {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {"name": args.tool, "arguments": tool_arguments(args.tool, audio)},
-            },
-            deadline,
-        ):
-            ok, payload = _read_response(proc.stdout.fileno(), stdout_buffer, 3, deadline, junk_tail)
-        text = ""
-        if ok:
-            try:
-                content = (payload.get("result") or {}).get("content") or []
-                text = json.loads(str(content[0].get("text") or ""))
-            except (IndexError, KeyError, TypeError, json.JSONDecodeError):
-                text = ""
         primary_field = primary_output_field(args.tool)
-        primary_value = ""
-        if isinstance(text, dict):
-            primary_value = str(text.get(primary_field) or "")
-        output_nonempty = output_is_nonempty(primary_field, primary_value)
+        sample_evidence: list[dict] = []
+        all_calls_ok = True
+        for request_id, (key, call_audio, fixture_row) in enumerate(calls, 3):
+            ok, payload = False, {}
+            if _send(
+                proc,
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": args.tool,
+                        "arguments": tool_arguments(args.tool, call_audio, fixture_row),
+                    },
+                },
+                deadline,
+            ):
+                ok, payload = _read_response(
+                    proc.stdout.fileno(), stdout_buffer, request_id, deadline, junk_tail
+                )
+            parsed: object = None
+            if ok:
+                try:
+                    content = (payload.get("result") or {}).get("content") or []
+                    parsed = json.loads(str(content[0].get("text") or ""))
+                except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                    parsed = None
+            primary_value = parsed.get(primary_field) if isinstance(parsed, dict) else None
+            output_nonempty = output_is_nonempty(primary_field, primary_value)
+            violations = (
+                validate_kws_output(parsed, fixture_row)
+                if args.tool == "kws_predict" and fixture_row is not None
+                else []
+            )
+            call_ok = ok and output_nonempty and not violations
+            all_calls_ok = all_calls_ok and call_ok
+            result_preview = (
+                {
+                    field: parsed.get(field)
+                    for field in ("detected", "keyword", "score")
+                    if field in parsed
+                }
+                if isinstance(parsed, dict) and args.tool == "kws_predict"
+                else primary_value
+            )
+            sample_evidence.append(
+                {
+                    "key": key,
+                    "audio": (
+                        str(fixture_row.get("audio") or fixture_row.get("wav"))
+                        if fixture_row is not None
+                        else call_audio.name
+                    ),
+                    "audio_sha256": sha256_file(call_audio),
+                    "ok": call_ok,
+                    "output_nonempty": output_nonempty,
+                    "result": result_preview,
+                    "violations": violations,
+                }
+            )
+            if not call_ok:
+                break
         steps["tools_call"] = {
-            "ok": ok and output_nonempty,
+            "ok": all_calls_ok and len(sample_evidence) == len(calls),
             "primary_field": primary_field,
-            "output_nonempty": output_nonempty,
-            "text_nonempty": output_nonempty if primary_field == "text" else False,
-            primary_field: primary_value[:500],
+            "output_nonempty": all(
+                bool(sample.get("output_nonempty")) for sample in sample_evidence
+            ) and len(sample_evidence) == len(calls),
+            "text_nonempty": (
+                all(bool(sample.get("output_nonempty")) for sample in sample_evidence)
+                if primary_field == "text"
+                else False
+            ),
+            "num_samples": len(sample_evidence),
+            "expected_samples": len(calls),
+            "samples": sample_evidence,
         }
         if not steps["tools_call"]["ok"]:
-            raise RuntimeError(f"tools/call step failed: {json.dumps(payload, ensure_ascii=False)[:500]}")
+            raise RuntimeError(
+                "tools/call step failed: "
+                f"{json.dumps(sample_evidence[-1] if sample_evidence else payload, ensure_ascii=False)[:500]}"
+            )
 
-        if _send(proc, {"jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": {}}, deadline):
-            ok, payload = _read_response(proc.stdout.fileno(), stdout_buffer, 4, deadline, junk_tail)
+        shutdown_id = 3 + len(calls)
+        if _send(proc, {"jsonrpc": "2.0", "id": shutdown_id, "method": "shutdown", "params": {}}, deadline):
+            ok, payload = _read_response(proc.stdout.fileno(), stdout_buffer, shutdown_id, deadline, junk_tail)
         steps["shutdown"] = {"ok": ok}
         if proc.stdin is not None:
             try:
@@ -249,12 +473,15 @@ def main() -> int:
         "schema": SCHEMA,
         "status": status,
         "tool": args.tool,
-        "audio": str(audio),
+        "audio": audio.name if audio is not None else None,
+        "audio_sha256": sha256_file(audio),
+        "fixture_gt_jsonl": fixture_gt_jsonl.name if fixture_gt_jsonl is not None else None,
+        "fixture_gt_sha256": sha256_file(fixture_gt_jsonl),
         "initialize": steps["initialize"],
         "tools_list": steps["tools_list"],
         "tools_call": steps["tools_call"],
         "shutdown": steps["shutdown"],
-        "server_command": args.server_command,
+        "server_command": portable_server_command(args.server_command),
         "server_stderr_tail": list(server_stderr)[-STDERR_TAIL_LINES:],
         "stdout_junk_count": len(junk_tail),
         "stdout_junk_tail": list(junk_tail)[-STDERR_TAIL_LINES:],

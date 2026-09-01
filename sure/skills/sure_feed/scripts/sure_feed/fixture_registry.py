@@ -8,6 +8,8 @@ from typing import Any
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
 SPEECH_UNDERSTANDING_SUBTASK_ORDER = ("asr", "s2tt", "slu", "ser", "gr", "sd", "sa_asr")
+KWS_POSITIVE_VALUES = {"detect", "detected", "positive", "true", "1", "yes"}
+KWS_NEGATIVE_VALUES = {"reject", "rejected", "negative", "false", "0", "no"}
 
 
 def normalize_task(task: str) -> str:
@@ -15,6 +17,36 @@ def normalize_task(task: str) -> str:
     if value in {"sa_asr", "saasr"}:
         return "sa_asr"
     return value
+
+
+def _kws_expected_detected(sample: dict[str, Any]) -> bool:
+    declared: list[tuple[str, bool]] = []
+    key = sample.get("key") or sample.get("id") or "<unknown>"
+    for field in ("expected", "label", "expected_detected"):
+        if field not in sample:
+            continue
+        value = sample[field]
+        if isinstance(value, bool):
+            parsed = value
+        else:
+            normalized = str(value or "").strip().lower()
+            if normalized in KWS_POSITIVE_VALUES:
+                parsed = True
+            elif normalized in KWS_NEGATIVE_VALUES:
+                parsed = False
+            else:
+                raise ValueError(
+                    f"KWS fixture {key!r} has unsupported {field} value {value!r}"
+                )
+        declared.append((field, parsed))
+    if not declared:
+        raise ValueError(
+            f"KWS fixture {key!r} must declare expected, label, or expected_detected"
+        )
+    if len({parsed for _field, parsed in declared}) != 1:
+        fields = ", ".join(f"{field}={sample[field]!r}" for field, _parsed in declared)
+        raise ValueError(f"KWS fixture {key!r} has conflicting polarity fields: {fields}")
+    return declared[0][1]
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -94,8 +126,12 @@ def _compact_sample(row: dict[str, Any], sample_dir: Path, repo_root: Path) -> d
         "text",
         "label",
         "expected",
+        "expected_detected",
+        "expected_keyword",
         "prompt",
         "keywords",
+        "threshold",
+        "duration",
         "num_speakers",
         "speakers",
         "annotation_format",
@@ -159,9 +195,18 @@ def io_contract_for_task(task: str) -> dict[str, Any]:
             "nonempty_fields": ["audio_path"],
             "json_serializable": True,
         }
+    if normalized == "kws":
+        return {
+            "input_type": "audio_path",
+            "output_type": "keyword_detection",
+            "primary_field": "detected",
+            "required_fields": ["detected", "keyword", "score"],
+            "nonempty_fields": ["detected"],
+            "json_serializable": True,
+        }
     if normalized == "s2tt":
         primary = "translation"
-    elif normalized in {"ser", "gr", "kws"}:
+    elif normalized in {"ser", "gr"}:
         primary = "label"
     elif normalized == "slu":
         primary = "answer"
@@ -201,8 +246,9 @@ def _apply_task_specific_fields(task: str, fixture: dict[str, Any], samples: lis
         elif audios:
             fixture["reference_audio"] = audios[0]
     elif task == "kws":
-        positives = [sample for sample in samples if str(sample.get("label") or sample.get("expected") or "").lower() in {"positive", "detect"}]
-        negatives = [sample for sample in samples if str(sample.get("label") or sample.get("expected") or "").lower() in {"negative", "reject"}]
+        polarities = [(sample, _kws_expected_detected(sample)) for sample in samples]
+        positives = [sample for sample, expected in polarities if expected]
+        negatives = [sample for sample, expected in polarities if not expected]
         if positives and positives[0].get("audio"):
             fixture["audio"] = positives[0]["audio"]
             fixture["positive_audio"] = positives[0]["audio"]
@@ -258,6 +304,16 @@ def select_atomic_fixture(
     if not fixture_root or not samples:
         issues.append(f"missing:fixture.samples.{normalized}")
         return None, io_contract_for_task(normalized), issues
+
+    if normalized == "kws":
+        positive = any(_kws_expected_detected(sample) is True for sample in samples)
+        negative = any(_kws_expected_detected(sample) is False for sample in samples)
+        if not positive:
+            issues.append("missing:fixture.kws.positive")
+        if not negative:
+            issues.append("missing:fixture.kws.negative")
+        if issues:
+            return None, io_contract_for_task(normalized), issues
 
     fixture: dict[str, Any] = {
         "fixture_id": f"{normalized}/{_rel(fixture_root, root).removeprefix(f'fixtures/tasks/{normalized}/')}",

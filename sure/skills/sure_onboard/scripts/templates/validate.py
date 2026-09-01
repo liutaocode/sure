@@ -21,6 +21,7 @@ import argparse
 import dataclasses
 import importlib
 import json
+import math
 import os
 import sys
 import time
@@ -45,6 +46,7 @@ _IO_CONTRACT_JSON = r'''__IO_CONTRACT_JSON__'''
 IO_CONTRACT: dict[str, Any] = (
     {} if _IO_CONTRACT_JSON.startswith("__") else json.loads(_IO_CONTRACT_JSON)
 )
+KWS_OPERATING_THRESHOLD = 0.5
 
 
 def now_iso() -> str:
@@ -137,7 +139,37 @@ def fixture_payloads() -> list[dict[str, Any]]:
         parsed = json.loads(raw_payload)
         if not isinstance(parsed, dict):
             raise ValueError("SURE_VALIDATE_INPUT_JSON must decode to an object.")
-        return [{"input": parsed, "fixture": {}}]
+        keywords = parsed.get("keywords")
+        if (
+            TASK_TYPE.lower().replace("-", "_") == "kws"
+            and keywords is not None
+            and not valid_keywords(keywords)
+        ):
+            raise ValueError("KWS keywords must be non-empty when provided")
+        if (
+            TASK_TYPE.lower().replace("-", "_") == "kws"
+            and "threshold" in parsed
+            and not valid_kws_threshold(parsed["threshold"])
+        ):
+            raise ValueError(f"KWS threshold must equal {KWS_OPERATING_THRESHOLD}")
+        return [
+            {
+                "input": parsed,
+                "fixture": {
+                    field: parsed[field]
+                    for field in (
+                        "key",
+                        "audio",
+                        "text",
+                        "label",
+                        "expected",
+                        "expected_detected",
+                        "expected_keyword",
+                    )
+                    if field in parsed
+                },
+            }
+        ]
 
     fixture_root = MODEL_DIR / "fixture"
     for gt_path in sorted(fixture_root.glob("**/gt.jsonl")):
@@ -161,22 +193,53 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 payload["prompt_text"] = item.get("prompt_text", text)
             if isinstance(item.get("language"), str):
                 payload["language"] = item["language"]
+            if "keywords" in item:
+                payload["keywords"] = item["keywords"]
+            if "threshold" in item:
+                if TASK_TYPE.lower().replace("-", "_") == "kws" and not valid_kws_threshold(
+                    item["threshold"]
+                ):
+                    raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
+                payload["threshold"] = item["threshold"]
             if payload:
+                fixture_metadata: dict[str, Any] = {
+                    "key": item.get("key"),
+                    "audio": item.get("audio"),
+                    "language": item.get("language"),
+                    "dataset": item.get("dataset"),
+                    "ground_truth": item.get("ground_truth"),
+                    "text": item.get("text"),
+                    "keywords": item.get("keywords"),
+                }
+                fixture_metadata.update(
+                    {
+                        field: item[field]
+                        for field in ("label", "expected", "expected_detected", "expected_keyword")
+                        if field in item
+                    }
+                )
                 payloads.append(
                     {
                         "input": payload,
-                        "fixture": {
-                            "key": item.get("key"),
-                            "audio": item.get("audio"),
-                            "language": item.get("language"),
-                            "dataset": item.get("dataset"),
-                            "ground_truth": item.get("ground_truth"),
-                        },
+                        "fixture": fixture_metadata,
                     }
                 )
         if payloads:
             if len(payloads) > 5:
                 raise ValueError(f"Fixture set exceeds the 5-sample validation limit: {gt_path}")
+            if TASK_TYPE.lower().replace("-", "_") == "kws":
+                polarities: list[bool] = []
+                for fixture in payloads:
+                    metadata = fixture["fixture"]
+                    expected = kws_expected_detected(metadata)
+                    polarities.append(expected)
+                    keywords = fixture["input"].get("keywords")
+                    if keywords is not None and not valid_keywords(keywords):
+                        raise ValueError(
+                            f"KWS fixture {metadata.get('key')!r} has invalid keywords"
+                        )
+                if True not in polarities or False not in polarities:
+                    raise ValueError("KWS fixture set must contain at least one positive and one negative sample")
             return payloads
     raise FileNotFoundError(
         "No validation payload found. Set SURE_VALIDATE_INPUT_JSON or provide fixture/**/gt.jsonl."
@@ -222,6 +285,8 @@ def run_predict(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         result = predict(payload)
     except TypeError:
+        if TASK_TYPE.lower().replace("-", "_") == "kws":
+            raise
         if "audio_path" in payload:
             result = predict(payload["audio_path"])
         elif "text" in payload:
@@ -264,6 +329,152 @@ def is_nonempty(value: Any) -> bool:
     if isinstance(value, (list, tuple, dict, set)):
         return len(value) > 0
     return True
+
+
+def valid_keywords(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(keyword, str) and bool(keyword.strip()) for keyword in value)
+    )
+
+
+def valid_kws_threshold(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) == KWS_OPERATING_THRESHOLD
+    )
+
+
+def kws_expected_detected(reference: dict[str, Any]) -> bool:
+    positive_values = {"detect", "detected", "positive", "true", "1", "yes"}
+    negative_values = {"reject", "rejected", "negative", "false", "0", "no"}
+    declared: list[tuple[str, bool]] = []
+    for field in ("expected", "label", "expected_detected"):
+        if field not in reference:
+            continue
+        value = reference[field]
+        if isinstance(value, bool):
+            parsed = value
+        else:
+            normalized = str(value or "").strip().lower()
+            if normalized in positive_values:
+                parsed = True
+            elif normalized in negative_values:
+                parsed = False
+            else:
+                raise ValueError(f"unsupported {field} value {value!r}")
+        declared.append((field, parsed))
+    if not declared:
+        raise ValueError("expected, label, or expected_detected is required")
+    if len({parsed for _field, parsed in declared}) != 1:
+        fields = ", ".join(f"{field}={reference[field]!r}" for field, _parsed in declared)
+        raise ValueError(f"conflicting KWS polarity fields: {fields}")
+    return declared[0][1]
+
+
+def normalized_keyword(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = "".join(value.upper().split())
+    return normalized or None
+
+
+def validate_kws_output(sample: dict[str, Any]) -> list[str]:
+    violations: list[str] = []
+    detected = sample.get("detected")
+    keyword = sample.get("keyword")
+    score = sample.get("score")
+    score_is_finite_number = (
+        not isinstance(score, bool)
+        and isinstance(score, (int, float))
+        and math.isfinite(float(score))
+    )
+    if not isinstance(detected, bool):
+        violations.append("detected must be a boolean")
+    if keyword is not None and not isinstance(keyword, str):
+        violations.append("keyword must be a string or null")
+    if score is not None and not score_is_finite_number:
+        violations.append("score must be a finite number or null")
+    if score_is_finite_number and not 0 <= float(score) <= 1:
+        violations.append("score must be within [0, 1]")
+    if detected is True and normalized_keyword(keyword) is None:
+        violations.append("detected=true requires a non-empty keyword")
+    if detected is True and not score_is_finite_number:
+        violations.append("detected=true requires a finite numeric score")
+    if detected is True and score_is_finite_number and float(score) < KWS_OPERATING_THRESHOLD:
+        violations.append(f"detected=true requires score >= {KWS_OPERATING_THRESHOLD}")
+    if detected is False and keyword is not None:
+        violations.append("detected=false requires keyword=null")
+    if (
+        detected is False
+        and score_is_finite_number
+        and float(score) >= KWS_OPERATING_THRESHOLD
+    ):
+        violations.append(f"detected=false requires score < {KWS_OPERATING_THRESHOLD}")
+    return violations
+
+
+def validate_kws_rows(rows: list[dict[str, Any]], contract: dict[str, Any]) -> list[str]:
+    violations: list[str] = []
+    seen_keys: set[str] = set()
+    positive_seen = False
+    negative_seen = False
+    reference_seen = any(
+        isinstance(row, dict)
+        and any(field in row for field in ("expected", "label", "expected_detected"))
+        for row in rows
+    )
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            violations.append(f"KWS output row {index + 1} must be an object")
+            continue
+        key = row.get("key")
+        prefix = f"KWS output row {index + 1}"
+        if not isinstance(key, str) or not key.strip():
+            violations.append(f"{prefix} requires a non-empty key")
+        elif key in seen_keys:
+            violations.append(f"{prefix} duplicates key {key!r}")
+        else:
+            seen_keys.add(key)
+            prefix = f"KWS output {key!r}"
+        output = row.get("output")
+        if not isinstance(output, dict):
+            violations.append(f"{prefix} result must be an object")
+            continue
+        violations.extend(f"{prefix}: {item}" for item in validate_contract(output, contract))
+        violations.extend(f"{prefix}: {item}" for item in validate_kws_output(output))
+
+        has_reference = any(field in row for field in ("expected", "label", "expected_detected"))
+        if not has_reference:
+            if reference_seen:
+                violations.append(f"{prefix} has no expected KWS polarity")
+            continue
+        try:
+            expected = kws_expected_detected(row)
+        except ValueError as error:
+            violations.append(f"{prefix} has invalid KWS reference: {error}")
+            continue
+        if expected:
+            positive_seen = True
+            if output.get("detected") is not True:
+                violations.append(f"{prefix} must detect the positive fixture")
+            expected_keyword = row.get("expected_keyword") or row.get("text")
+            if expected_keyword is not None and normalized_keyword(output.get("keyword")) != normalized_keyword(
+                expected_keyword
+            ):
+                violations.append(f"{prefix} detected the wrong keyword")
+        else:
+            negative_seen = True
+            if output.get("detected") is not False:
+                violations.append(f"{prefix} must reject the negative fixture")
+    if reference_seen and (not positive_seen or not negative_seen):
+        violations.append("KWS validation requires at least one positive and one negative fixture")
+    return violations
 
 
 def validate_contract(sample: dict[str, Any], contract: dict[str, Any]) -> list[str]:
@@ -333,17 +544,25 @@ def stage_infer() -> bool:
             if not sample:
                 raise AssertionError(f"prediction output is empty for fixture {index}")
             outputs.append(sample)
-            rows.append(
+            row = {
+                "id": index,
+                "key": fixture["fixture"].get("key")
+                or (str(index) if TASK_TYPE.lower().replace("-", "_") == "kws" else None),
+                "audio": fixture["fixture"].get("audio"),
+                "language": fixture["fixture"].get("language") or payload.get("language"),
+                "dataset": fixture["fixture"].get("dataset"),
+                "ground_truth": fixture["fixture"].get("ground_truth"),
+                "text": fixture["fixture"].get("text"),
+                "output": sample,
+            }
+            row.update(
                 {
-                    "id": index,
-                    "key": fixture["fixture"].get("key"),
-                    "audio": fixture["fixture"].get("audio"),
-                    "language": fixture["fixture"].get("language") or payload.get("language"),
-                    "dataset": fixture["fixture"].get("dataset"),
-                    "ground_truth": fixture["fixture"].get("ground_truth"),
-                    "output": sample,
+                    field: fixture["fixture"][field]
+                    for field in ("label", "expected", "expected_detected", "expected_keyword")
+                    if field in fixture["fixture"]
                 }
             )
+            rows.append(row)
         write_json(SAMPLE_OUTPUT, outputs[0])
         write_jsonl(SAMPLE_OUTPUTS, rows)
     except Exception as exc:  # noqa: BLE001
@@ -370,7 +589,17 @@ def stage_contract() -> bool:
         if not isinstance(sample, dict):
             raise ValueError("sample_output.json must be an object")
         contract = load_io_contract()
-        violations = validate_contract(sample, contract)
+        if TASK_TYPE.lower().replace("-", "_") == "kws" and SAMPLE_OUTPUTS.is_file():
+            rows = [
+                json.loads(line)
+                for line in SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            violations = validate_kws_rows(rows, contract)
+        else:
+            violations = validate_contract(sample, contract)
+            if TASK_TYPE.lower().replace("-", "_") == "kws":
+                violations.extend(validate_kws_output(sample))
         if violations:
             raise AssertionError("; ".join(violations))
     except Exception as exc:  # noqa: BLE001

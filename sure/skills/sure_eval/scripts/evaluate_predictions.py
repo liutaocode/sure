@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from sure_eval.core.config import Config
 from sure_eval.core.logging import configure_logging, get_logger
 from sure_eval.datasets import DatasetManager
-from sure_eval.evaluation.rps import RPSManager
+from sure_eval.evaluation.rps import EvaluationRecord, RPSManager
 from sure_eval.evaluation.sure_evaluator import SUREEvaluator
 from sure_eval.reports import SOTAManager
 
@@ -45,6 +45,9 @@ logger = get_logger(__name__)
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 HARNESS_ROOT = Path(__file__).resolve().parents[4]
 SURE_SUITES_ROOT = Path("data/datasets/sure_benchmark/SURE_Test_Suites")
+KWS_POSITIVE_LABELS = {"detect", "detected", "positive", "true", "1", "yes"}
+KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
+KWS_OPERATING_THRESHOLD = 0.5
 
 LOWER_IS_BETTER_METRICS = {
     "wer",
@@ -428,9 +431,170 @@ def _write_external_audio_samples_jsonl(
     return output_path
 
 
+def _kws_reference_fields(sample: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        field: sample[field]
+        for field in (
+            "expected",
+            "label",
+            "expected_detected",
+            "expected_keyword",
+            "text",
+            "txt",
+            "duration",
+        )
+        if field in sample
+    }
+    has_audio_role = False
+    for field in ("audio", "wav"):
+        if sample.get(field) not in (None, ""):
+            fields[field] = sample[field]
+            has_audio_role = True
+    if not has_audio_role and sample.get("path") not in (None, ""):
+        fields["audio"] = sample["path"]
+    return fields
+
+
+def _write_external_kws_role_files(
+    *,
+    samples: list[dict[str, Any]],
+    structured_predictions: dict[str, dict[str, Any]],
+    output_dir: Path,
+    require_scores: bool = False,
+) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reference_path = output_dir / "reference.jsonl"
+    sample_output_path = output_dir / "sample_output.json"
+    reference_rows: list[dict[str, Any]] = []
+    prediction_rows: list[dict[str, Any]] = []
+
+    for sample in samples:
+        key = str(sample.get("key", ""))
+        if not key:
+            raise ValueError("KWS reference sample is missing key")
+        parsed_labels: list[tuple[str, bool]] = []
+        for field in ("expected", "label", "expected_detected"):
+            if field not in sample:
+                continue
+            value = sample[field]
+            if isinstance(value, bool):
+                parsed = value
+            elif isinstance(value, int) and value in {0, 1}:
+                parsed = bool(value)
+            elif isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in KWS_POSITIVE_LABELS:
+                    parsed = True
+                elif normalized in KWS_NEGATIVE_LABELS:
+                    parsed = False
+                else:
+                    raise ValueError(f"KWS reference sample has invalid {field}: {key}")
+            else:
+                raise ValueError(f"KWS reference sample has invalid {field}: {key}")
+            parsed_labels.append((field, parsed))
+        if parsed_labels and any(value != parsed_labels[0][1] for _, value in parsed_labels[1:]):
+            values = ", ".join(f"{field}={sample[field]!r}" for field, _ in parsed_labels)
+            raise ValueError(f"KWS reference sample has conflicting expected labels: {key} ({values})")
+        if not parsed_labels and not any(
+            str(sample.get(field) or "").strip() for field in ("text", "txt")
+        ):
+            raise ValueError(f"KWS reference sample is missing an expected label: {key}")
+
+        structured = structured_predictions.get(key)
+        if structured is None:
+            raise ValueError(f"Missing structured prediction row for KWS sample: {key}")
+        prediction = structured.get("prediction")
+        if not isinstance(prediction, dict):
+            raise ValueError(f"KWS structured prediction must contain a prediction object: {key}")
+        missing_fields = [
+            field for field in ("detected", "keyword", "score") if field not in prediction
+        ]
+        if missing_fields:
+            raise ValueError(
+                f"KWS prediction for {key} is missing direct field(s): {', '.join(missing_fields)}"
+            )
+
+        detected = prediction["detected"]
+        keyword = prediction["keyword"]
+        score = prediction["score"]
+        if not isinstance(detected, bool):
+            raise ValueError(f"KWS prediction detected must be a bool: {key}")
+        if keyword is not None and not isinstance(keyword, str):
+            raise ValueError(f"KWS prediction keyword must be a string or null: {key}")
+        if score is not None and (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+        ):
+            raise ValueError(f"KWS prediction score must be a finite number or null: {key}")
+        if score is not None and not 0.0 <= float(score) <= 1.0:
+            raise ValueError(f"KWS prediction score must be within [0, 1]: {key}")
+        if detected and (not isinstance(keyword, str) or not keyword.strip()):
+            raise ValueError(f"KWS detected prediction keyword must be a non-empty string: {key}")
+        if detected and score is None:
+            raise ValueError(f"KWS detected prediction score must be a finite number: {key}")
+        if detected and float(score) < KWS_OPERATING_THRESHOLD:
+            raise ValueError(
+                f"KWS detected prediction score must be >= {KWS_OPERATING_THRESHOLD}: {key}"
+            )
+        if not detected and keyword is not None:
+            raise ValueError(f"KWS rejected prediction keyword must be null: {key}")
+        if not detected and score is not None and float(score) >= KWS_OPERATING_THRESHOLD:
+            raise ValueError(
+                f"KWS rejected prediction score must be < {KWS_OPERATING_THRESHOLD}: {key}"
+            )
+        if require_scores and score is None:
+            raise ValueError(f"KWS formal score-sweep route requires a score for every sample: {key}")
+        if "events" in prediction and not isinstance(prediction["events"], list):
+            raise ValueError(f"KWS prediction events must be a list when provided: {key}")
+
+        reference_row = {"key": key, **_kws_reference_fields(sample)}
+        result = {
+            "detected": detected,
+            "keyword": keyword,
+            "score": score,
+        }
+        if "events" in prediction:
+            result["events"] = prediction["events"]
+        reference_rows.append(reference_row)
+        prediction_rows.append({"key": key, "result": result})
+
+    with reference_path.open("w", encoding="utf-8") as handle:
+        for row in reference_rows:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+    sample_output_path.write_text(
+        json.dumps(prediction_rows, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return reference_path, sample_output_path
+
+
 def _safe_path_component(value: str) -> str:
     safe = "".join(ch if ch.isalnum() or ch in "._=-" else "_" for ch in value)
-    return safe or "dataset"
+    safe = safe or "dataset"
+    if safe in {".", ".."}:
+        raise ValueError(f"unsafe external evaluation path component: {value!r}")
+    return safe
+
+
+def _external_run_dir(
+    external_runs_dir: Path,
+    dataset: str,
+    metric_or_pipeline: str,
+) -> Path:
+    root = external_runs_dir.expanduser().resolve()
+    run_dir = (
+        root
+        / _safe_path_component(dataset)
+        / _safe_path_component(metric_or_pipeline)
+    ).resolve()
+    try:
+        relative = run_dir.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"external evaluation run directory escapes its root: {run_dir}") from exc
+    if not relative.parts or run_dir == root:
+        raise ValueError(f"external evaluation run directory must stay below its root: {run_dir}")
+    return run_dir
 
 
 def _external_env(engine_root: Path) -> dict[str, str]:
@@ -534,6 +698,26 @@ def _pipeline_uses_samples_jsonl(pipeline: dict[str, Any]) -> bool:
 def _pipeline_uses_text_pair(pipeline: dict[str, Any]) -> bool:
     roles = _pipeline_required_roles(pipeline)
     return {"hyp", "ref"}.issubset(roles)
+
+
+def _pipeline_uses_reference_jsonl_pair(pipeline: dict[str, Any]) -> bool:
+    roles = _pipeline_required_roles(pipeline)
+    return {"reference_jsonl", "sample_output"}.issubset(roles)
+
+
+def _kws_pipeline_requires_scores(pipeline: dict[str, Any]) -> bool:
+    metrics = pipeline.get("metrics") if isinstance(pipeline.get("metrics"), list) else []
+    candidates = [
+        pipeline.get("metric"),
+        pipeline.get("requested_metric"),
+        pipeline.get("pipeline_id"),
+        *metrics,
+    ]
+    normalized = [str(value or "").lower().replace("-", "_") for value in candidates]
+    return any(
+        "macro_recall" in value or "det_curve" in value or value == "det"
+        for value in normalized
+    )
 
 
 def _pipeline_audio_row_required_roles(pipeline: dict[str, Any]) -> set[str]:
@@ -682,8 +866,11 @@ def evaluate_prediction_file_external(
     hyp_file = _write_eval_file([f"{sample.get('key', '')}\t{predictions.get(sample.get('key', ''), '')}" for sample in samples])
     src_file = _write_optional_source_file(samples) if task == "S2TT" else None
 
-    metric_dir_name = _safe_path_component(str(pipeline_id_override or requested_metric or "default"))
-    run_dir = external_runs_dir / _safe_path_component(canonical_name) / metric_dir_name
+    run_dir = _external_run_dir(
+        external_runs_dir,
+        canonical_name,
+        str(pipeline_id_override or requested_metric or "default"),
+    )
     if run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -817,8 +1004,11 @@ def evaluate_audio_prediction_file_external(
         dataset_name=canonical_name,
     )
 
-    metric_dir_name = _safe_path_component(str(pipeline_id_override or requested_metric or "default"))
-    run_dir = external_runs_dir / _safe_path_component(canonical_name) / metric_dir_name
+    run_dir = _external_run_dir(
+        external_runs_dir,
+        canonical_name,
+        str(pipeline_id_override or requested_metric or "default"),
+    )
     if run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -889,6 +1079,160 @@ def evaluate_audio_prediction_file_external(
             "requested_metric_source": (
                 "cli_pipeline_id" if pipeline_id_override else
                 "cli_override" if metric_override else "sota_baseline" if requested_metric else "sure-evaluation_task_manifest"
+            ),
+            "requested_pipeline_id": pipeline_id_override,
+        },
+        "details": {
+            "summary": summary,
+            "report": report,
+            "pipeline": pipeline,
+        },
+    }
+
+
+def evaluate_kws_prediction_file_external(
+    dataset_manager: DatasetManager,
+    sota_manager: SOTAManager,
+    dataset_name: str,
+    prediction_path: Path,
+    *,
+    engine_source: str,
+    engine_root: Path,
+    external_runs_dir: Path,
+    device: str,
+    cache_dir: str | None,
+    timeout: int,
+    metric_override: str | None,
+    pipeline_id_override: str | None = None,
+    task_override: str | None = None,
+) -> dict[str, Any]:
+    canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
+    jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
+    if not jsonl_path.exists():
+        jsonl_path = dataset_manager.download_and_convert(canonical_name)
+
+    all_samples = load_jsonl(jsonl_path)
+    if not all_samples:
+        raise ValueError(f"Dataset has no samples: {canonical_name}")
+    dataset_task = str(all_samples[0].get("task", "")).upper()
+    task = str(task_override or dataset_task).upper()
+    if task != "KWS":
+        raise ExternalEvaluationUnsupported(f"task {task!r} does not use the KWS structured bridge")
+    language = str(all_samples[0].get("language") or "auto")
+    requested_metric = metric_override or _metric_from_sota(
+        sota_manager, canonical_name, fallback_names=_source_fallback_names(jsonl_path)
+    )
+    pipeline = _describe_external_pipeline(
+        engine_root=engine_root,
+        task=task,
+        language=language,
+        metric=None if pipeline_id_override else requested_metric,
+        pipeline_id=pipeline_id_override,
+        timeout=timeout,
+    )
+    if not _pipeline_uses_reference_jsonl_pair(pipeline):
+        raise ExternalEvaluationUnsupported(
+            f"task={task} metric={requested_metric or pipeline.get('metric')} "
+            "does not use reference_jsonl/sample_output"
+        )
+    require_scores = _kws_pipeline_requires_scores(pipeline)
+
+    structured_prediction_path = prediction_path.with_suffix(".jsonl")
+    structured_predictions = load_structured_prediction_map(structured_prediction_path)
+    if not structured_predictions:
+        raise ValueError(
+            f"KWS external evaluation requires structured predictions: {structured_prediction_path}"
+        )
+    samples = _samples_with_predictions(
+        all_samples,
+        set(structured_predictions),
+        dataset_name=canonical_name,
+    )
+
+    run_dir = _external_run_dir(
+        external_runs_dir,
+        canonical_name,
+        str(pipeline_id_override or requested_metric or "default"),
+    )
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    reference_jsonl, sample_output = _write_external_kws_role_files(
+        samples=samples,
+        structured_predictions=structured_predictions,
+        output_dir=run_dir,
+        require_scores=require_scores,
+    )
+
+    external_payload = _run_external_pipeline(
+        engine_root=engine_root,
+        request={
+            "task": task,
+            "language": language if language != "auto" else None,
+            "metric": None if pipeline_id_override else requested_metric,
+            "pipeline_id": pipeline_id_override,
+            "output_dir": str(run_dir.resolve()),
+            "reference_jsonl": str(reference_jsonl.resolve()),
+            "sample_output": str(sample_output.resolve()),
+            "samples_jsonl": None,
+            "device": device,
+            "cache_dir": cache_dir,
+            "pipeline": pipeline,
+        },
+        timeout=timeout,
+    )
+
+    summary = external_payload["summary"]
+    pipeline = external_payload["pipeline"]
+    report = external_payload.get("report") or {}
+    metric = str(summary.get("metric") or pipeline.get("metric") or requested_metric or "")
+    score = summary.get("score", report.get("score", 0.0))
+    rps, rps_status = _calculate_metric_rps(
+        sota_manager,
+        canonical_name,
+        metric,
+        score,
+        fallback_names=_source_fallback_names(jsonl_path),
+    )
+
+    return {
+        "dataset": canonical_name,
+        "jsonl_path": str(jsonl_path),
+        "prediction_path": str(prediction_path),
+        "prediction_jsonl_path": str(structured_prediction_path),
+        "task": task,
+        "language": str(summary.get("language") or language),
+        "metric": metric,
+        "score": score,
+        "rps": rps,
+        "rps_status": rps_status,
+        "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
+        "num_samples": len(samples),
+        "expected_samples": len(all_samples),
+        "provided_predictions": len(samples),
+        "evaluation_backend": "external",
+        "evaluator_version": "sure-evaluation",
+        "pipeline_id": summary.get("pipeline_id") or pipeline.get("pipeline_id"),
+        "evaluation_context": {
+            "backend": "sure-evaluation",
+            "engine_source": engine_source,
+            "engine_root": str(engine_root),
+            "evaluation_runtime": _evaluation_runtime_binding(engine_root),
+            "dataset_task": dataset_task,
+            "pipeline_id": summary.get("pipeline_id") or pipeline.get("pipeline_id"),
+            "route_id": pipeline.get("route_id"),
+            "nodes": [node.get("node_id") for node in pipeline.get("nodes", [])],
+            "node_config_paths": summary.get("node_config_paths", []),
+            "external_output_dir": summary.get("output_dir"),
+            "reference_jsonl": str(reference_jsonl),
+            "sample_output": str(sample_output),
+            "operating_threshold": KWS_OPERATING_THRESHOLD,
+            "all_scores_required": require_scores,
+            "requested_metric_source": (
+                "cli_pipeline_id" if pipeline_id_override else
+                "cli_override" if metric_override else
+                "sota_baseline" if requested_metric else
+                "sure-evaluation_task_manifest"
             ),
             "requested_pipeline_id": pipeline_id_override,
         },
@@ -1091,6 +1435,61 @@ def _source_fallback_names(jsonl_path: str | Path | None) -> list[str]:
     return [str(name)] if name else []
 
 
+def _split_rps_result(
+    value: Any,
+    status: Any = None,
+) -> tuple[float | None, dict[str, Any] | None]:
+    rps_status = dict(status) if isinstance(status, dict) else None
+    if isinstance(value, dict):
+        return None, rps_status or dict(value)
+    if value is None:
+        return None, rps_status
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, rps_status or {"status": "invalid_rps_value", "value": value}
+    if not math.isfinite(float(value)):
+        return None, rps_status or {"status": "unbounded_rps", "value": str(value)}
+    return float(value), rps_status
+
+
+def _calculate_metric_rps(
+    sota_manager: SOTAManager,
+    dataset: str,
+    metric: str,
+    score: Any,
+    *,
+    fallback_names: tuple[str, ...] | list[str] = (),
+) -> tuple[float | None, dict[str, Any] | None]:
+    baseline = sota_manager.get_baseline(dataset, fallback_names=fallback_names)
+    if baseline is None:
+        return _split_rps_result(
+            sota_manager.calculate_rps(dataset, score, fallback_names=fallback_names)
+        )
+    baseline_metric = str(baseline.metric).lower().replace("-", "_")
+    requested_metric = str(metric).lower().replace("-", "_")
+    if baseline_metric != requested_metric:
+        return None, {
+            "status": "missing_metric_baseline",
+            "dataset": dataset,
+            "metric": requested_metric,
+            "available_baseline_metric": baseline_metric,
+            "score": score,
+        }
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+    ):
+        return None, {
+            "status": "score_unavailable",
+            "dataset": dataset,
+            "metric": requested_metric,
+            "score": score,
+        }
+    return _split_rps_result(
+        sota_manager.calculate_rps(dataset, score, fallback_names=fallback_names)
+    )
+
+
 def _dataset_metric_row(result: dict[str, Any]) -> dict[str, Any]:
     report = _result_report(result)
     pipeline = _result_pipeline(result)
@@ -1098,6 +1497,7 @@ def _dataset_metric_row(result: dict[str, Any]) -> dict[str, Any]:
     context = result.get("evaluation_context") if isinstance(result.get("evaluation_context"), dict) else {}
     nodes = context.get("nodes") or [node.get("node_id") for node in pipeline.get("nodes", []) if isinstance(node, dict)]
     pipeline_id = result.get("pipeline_id") or context.get("pipeline_id") or pipeline.get("pipeline_id")
+    rps, rps_status = _split_rps_result(result.get("rps"), result.get("rps_status"))
     return {
         "schema": "sure.eval.payload.dataset_metric.v2",
         "dataset": result.get("dataset"),
@@ -1111,7 +1511,8 @@ def _dataset_metric_row(result: dict[str, Any]) -> dict[str, Any]:
         "evaluation_backend": result.get("evaluation_backend"),
         "evaluator_version": result.get("evaluator_version"),
         "num_samples": result.get("num_samples"),
-        "rps": result.get("rps"),
+        "rps": rps,
+        "rps_status": rps_status,
         "evaluation_context": context,
         "result": _primary_result(metric, result.get("score"), report=report),
         "pipeline": {
@@ -1159,7 +1560,17 @@ def _metric_unit(metric: str) -> str:
     metric_name = str(metric or "").lower()
     if _is_lower_better_metric(metric_name):
         return "fraction"
-    if metric_name in {"accuracy", "acc"}:
+    if metric_name in {
+        "accuracy",
+        "acc",
+        "precision",
+        "recall",
+        "macro_recall",
+        "macro-recall",
+        "f1",
+        "false_reject_rate",
+        "false_alarm_rate",
+    }:
         return "fraction"
     if metric_name.startswith("sim/"):
         return "similarity"
@@ -1206,6 +1617,7 @@ def _standard_report_row_v1(
     score = _metric_score_from_payload_row(row)
     prediction_file = artifacts.get("prediction_file") or inputs.get("prediction_path") or ""
     pipeline_id = row.get("pipeline_id") or pipeline.get("pipeline_id") or context.get("pipeline_id")
+    rps, rps_status = _split_rps_result(row.get("rps"), row.get("rps_status"))
     validation_summary = {
         "expected_samples": validation.get("expected_samples"),
         "provided_predictions": validation.get("provided_predictions"),
@@ -1257,7 +1669,8 @@ def _standard_report_row_v1(
                 "score_key": (row.get("result") or {}).get("score_key") if isinstance(row.get("result"), dict) else "score",
             },
             "baseline": None,
-            "rps": row.get("rps"),
+            "rps": rps,
+            "rps_status": rps_status,
             "pipeline": {
                 "pipeline_id": pipeline_id,
                 "report_path": pipeline.get("report_path") or artifacts.get("report"),
@@ -1878,6 +2291,7 @@ def _write_sample_report(
     samples: list[dict[str, Any]],
     predictions: dict[str, str],
     result: dict[str, Any],
+    structured_predictions: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     metric = str(result.get("metric") or "")
@@ -1893,6 +2307,14 @@ def _write_sample_report(
         except Exception:
             calculator_cls = None
             characterize_fn = None
+    report = _result_report(result)
+    report_details = report.get("details") if isinstance(report.get("details"), dict) else {}
+    report_rows = report_details.get("rows") if isinstance(report_details.get("rows"), list) else []
+    metric_details_by_key = {
+        str(item.get("key", "")): item
+        for item in report_rows
+        if isinstance(item, dict) and item.get("key")
+    }
     with output_path.open("w", encoding="utf-8") as handle:
         for sample in samples:
             key = str(sample.get("key", ""))
@@ -1935,6 +2357,15 @@ def _write_sample_report(
                 row["reference_text"] = _sample_reference_text(sample)
                 row["reference_audio"] = _sample_reference_audio(sample)
                 row["source_audio"] = _sample_source_audio(sample)
+            elif task == "KWS":
+                structured = (structured_predictions or {}).get(key, {})
+                structured_prediction = structured.get("prediction")
+                row["prediction"] = (
+                    dict(structured_prediction) if isinstance(structured_prediction, dict) else {}
+                )
+                row["reference"] = _kws_reference_fields(sample)
+                if key in metric_details_by_key:
+                    row["metric_details"] = metric_details_by_key[key]
             else:
                 row["reference"] = sample.get("target") or sample.get("reference_text") or ""
             handle.write(json.dumps(_to_strict_jsonable(row), ensure_ascii=False) + "\n")
@@ -1986,6 +2417,7 @@ def _legacy_result_from_payload_row(row: dict[str, Any], payload_path: Path) -> 
     metric_artifact_dir = artifacts.get("metric_artifact_dir")
     report_path = pipeline.get("report_path") or artifacts.get("report")
     description_path = pipeline.get("description_path") or artifacts.get("pipeline_description")
+    rps, rps_status = _split_rps_result(row.get("rps"), row.get("rps_status"))
     internal = {
         "dataset": row.get("dataset"),
         "jsonl_path": str(_localize_path(jsonl_path, base_dir)) if jsonl_path else "",
@@ -1994,8 +2426,9 @@ def _legacy_result_from_payload_row(row: dict[str, Any], payload_path: Path) -> 
         "language": row.get("language"),
         "metric": metric,
         "score": score,
-        "rps": row.get("rps"),
-        "rps_is_unbounded": isinstance(row.get("rps"), float) and not math.isfinite(row["rps"]),
+        "rps": rps,
+        "rps_status": rps_status,
+        "rps_is_unbounded": False,
         "num_samples": row.get("num_samples") or metric_result.get("num_samples"),
         "evaluation_backend": row.get("evaluation_backend") or "external",
         "evaluator_version": row.get("evaluator_version") or "sure-evaluation",
@@ -2100,6 +2533,54 @@ def _external_metric_applies_to_task_language(
     return True
 
 
+def _record_evaluation_result(
+    rps_manager: RPSManager,
+    *,
+    tool_name: str,
+    result: dict[str, Any],
+) -> EvaluationRecord | None:
+    metadata = {
+        "num_samples": result["num_samples"],
+        "prediction_path": result["prediction_path"],
+        "details": result["details"],
+    }
+    if str(result.get("task") or "").upper() != "KWS":
+        return rps_manager.evaluate_and_record(
+            tool_name=tool_name,
+            dataset=result["dataset"],
+            score=result["score"],
+            metric=result["metric"],
+            metadata=metadata,
+        )
+
+    score = result.get("score")
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+    ):
+        logger.warning(
+            "Skipping KWS evaluation database record because the selected metric has no score",
+            dataset=result.get("dataset"),
+            metric=result.get("metric"),
+        )
+        return None
+    rps, rps_status = _split_rps_result(result.get("rps"), result.get("rps_status"))
+    if rps_status is not None:
+        metadata["rps_status"] = rps_status
+    record = EvaluationRecord(
+        tool_name=tool_name,
+        model_name=None,
+        dataset=str(result["dataset"]),
+        metric=str(result["metric"]),
+        score=float(score),
+        rps=rps,
+        metadata=metadata,
+    )
+    rps_manager.database.add_record(record)
+    return record
+
+
 def _write_run_artifacts(
     *,
     run_dir: Path,
@@ -2153,13 +2634,28 @@ def _write_run_artifacts(
             sample_report_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(Path(str(source_sample_report)), sample_report_path)
         else:
-            predictions = load_prediction_map(_localize_path(result["prediction_path"]))
+            localized_prediction_path = _localize_path(result["prediction_path"])
+            predictions = load_prediction_map(localized_prediction_path)
+            structured_predictions = load_structured_prediction_map(
+                localized_prediction_path.with_suffix(".jsonl")
+            )
+            prediction_keys = (
+                set(structured_predictions)
+                if str(result.get("task") or "").upper() == "KWS"
+                else set(predictions)
+            )
             samples = _samples_with_predictions(
                 load_jsonl(_localize_path(result["jsonl_path"])),
-                set(predictions),
+                prediction_keys,
                 dataset_name=dataset,
             )
-            _write_sample_report(output_path=sample_report_path, samples=samples, predictions=predictions, result=result)
+            _write_sample_report(
+                output_path=sample_report_path,
+                samples=samples,
+                predictions=predictions,
+                result=result,
+                structured_predictions=structured_predictions,
+            )
 
         row = payload_rows[index] if index < len(payload_rows) and isinstance(payload_rows[index], dict) else _dataset_metric_row(result)
         row = dict(row)
@@ -2555,7 +3051,23 @@ def main() -> int:
                         pipeline_id=pipeline_id_override,
                         timeout=args.evaluation_timeout,
                     )
-                    if _pipeline_uses_samples_jsonl(pipeline):
+                    if effective_task == "KWS":
+                        result = evaluate_kws_prediction_file_external(
+                            dataset_manager,
+                            sota_manager,
+                            canonical_name,
+                            prediction_path,
+                            engine_source=engine_source,
+                            engine_root=engine_root,
+                            external_runs_dir=external_runs_dir,
+                            device=args.evaluation_device,
+                            cache_dir=args.evaluation_cache_dir,
+                            timeout=args.evaluation_timeout,
+                            metric_override=metric_override,
+                            pipeline_id_override=pipeline_id_override,
+                            task_override=effective_task,
+                        )
+                    elif _pipeline_uses_samples_jsonl(pipeline):
                         result = evaluate_audio_prediction_file_external(
                             dataset_manager,
                             sota_manager,
@@ -2608,16 +3120,10 @@ def main() -> int:
             if args.record:
                 if not args.tool_name:
                     raise ValueError("--record requires --tool-name")
-                rps_manager.evaluate_and_record(
+                _record_evaluation_result(
+                    rps_manager,
                     tool_name=args.tool_name,
-                    dataset=result["dataset"],
-                    score=result["score"],
-                    metric=result["metric"],
-                    metadata={
-                        "num_samples": result["num_samples"],
-                        "prediction_path": result["prediction_path"],
-                        "details": result["details"],
-                    },
+                    result=result,
                 )
 
     payload = _to_strict_jsonable(

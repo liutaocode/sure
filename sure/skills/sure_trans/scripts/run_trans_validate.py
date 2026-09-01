@@ -28,6 +28,7 @@ from vc_exec import (
 
 GIB = 1024 ** 3
 RAM_SAFETY_FACTOR = 2
+KWS_OPERATING_THRESHOLD = 0.5
 
 
 PASS_KEYS = {
@@ -199,6 +200,28 @@ def validate_mcp_evidence(evidence_path: Path, tool_name: str) -> str | None:
     smoke_tool = str(protocol.get("tool") or "")
     if tool_name and smoke_tool and smoke_tool != tool_name:
         return f"mcp_smoke tool {smoke_tool!r} does not match declared tool {tool_name!r}"
+    if tool_name == "kws_predict":
+        samples = call.get("samples")
+        if not isinstance(samples, list) or not 2 <= len(samples) <= 5:
+            return "KWS MCP smoke must record 2 to 5 keyed positive/negative samples"
+        if call.get("expected_samples") != len(samples) or call.get("num_samples") != len(samples):
+            return "KWS MCP smoke sample counts do not match"
+        polarities: set[bool] = set()
+        keys: set[str] = set()
+        for sample in samples:
+            if not isinstance(sample, dict) or sample.get("ok") is not True:
+                return "every KWS MCP smoke sample must pass"
+            key = str(sample.get("key") or "")
+            result = sample.get("result")
+            if not key or key in keys or not isinstance(result, dict):
+                return "KWS MCP smoke samples require unique keys and structured results"
+            keys.add(key)
+            detected = result.get("detected")
+            if not isinstance(detected, bool):
+                return "KWS MCP smoke detected values must be boolean"
+            polarities.add(detected)
+        if polarities != {False, True}:
+            return "KWS MCP smoke must prove one positive detection and one negative rejection"
     return None
 
 
@@ -225,6 +248,109 @@ def output_text(path: Path, primary_field: str) -> str:
     raise ValueError(f"{path} is neither a string nor an object holding {primary_field!r}")
 
 
+def kws_equivalence_rows(path: Path) -> dict[str, dict[str, object]]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    rows = value.get("rows") if isinstance(value, dict) else value
+    if not isinstance(rows, list):
+        raise ValueError(f"{path} must contain a KWS rows array")
+    normalized: dict[str, dict[str, object]] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{path} rows[{index}] must be an object")
+        key = str(row.get("key") or "")
+        if not key or key in normalized:
+            raise ValueError(f"{path} has a missing or duplicate KWS key: {key!r}")
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"{path} KWS result for {key} must be an object")
+        for field in ("detected", "keyword", "score"):
+            if field not in result:
+                raise ValueError(f"{path} KWS result for {key} is missing {field}")
+        detected = result["detected"]
+        keyword = result["keyword"]
+        score = result["score"]
+        if not isinstance(detected, bool):
+            raise ValueError(f"{path} KWS detected for {key} must be boolean")
+        if keyword is not None and (not isinstance(keyword, str) or not keyword.strip()):
+            raise ValueError(f"{path} KWS keyword for {key} must be string or null")
+        if score is not None and (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+        ):
+            raise ValueError(f"{path} KWS score for {key} must be finite or null")
+        if score is not None and not 0 <= float(score) <= 1:
+            raise ValueError(f"{path} KWS score for {key} must be within [0, 1]")
+        if detected and (keyword is None or score is None or float(score) < KWS_OPERATING_THRESHOLD):
+            raise ValueError(
+                f"{path} KWS detection for {key} requires keyword and score >= {KWS_OPERATING_THRESHOLD}"
+            )
+        if not detected and (
+            keyword is not None
+            or (score is not None and float(score) >= KWS_OPERATING_THRESHOLD)
+        ):
+            raise ValueError(
+                f"{path} KWS rejection for {key} requires null keyword and score below {KWS_OPERATING_THRESHOLD}"
+            )
+        normalized[key] = {
+            "detected": detected,
+            "keyword": "".join(keyword.upper().split()) if isinstance(keyword, str) else None,
+            "score": float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
+        }
+    return normalized
+
+
+def compare_kws_equivalence(
+    baseline_path: Path,
+    adapter_path: Path,
+    policy: str,
+) -> tuple[dict, str | None]:
+    baseline = kws_equivalence_rows(baseline_path)
+    adapter = kws_equivalence_rows(adapter_path)
+    missing = sorted(set(baseline) - set(adapter))
+    extra = sorted(set(adapter) - set(baseline))
+    mismatches: dict[str, dict[str, object]] = {}
+    for key in sorted(set(baseline) & set(adapter)):
+        expected = baseline[key]
+        actual = adapter[key]
+        fields: list[str] = []
+        if expected["detected"] is not actual["detected"]:
+            fields.append("detected")
+        if expected["keyword"] != actual["keyword"]:
+            fields.append("keyword")
+        expected_score = expected["score"]
+        actual_score = actual["score"]
+        scores_match = expected_score is None and actual_score is None
+        if isinstance(expected_score, float) and isinstance(actual_score, float):
+            scores_match = math.isclose(expected_score, actual_score, rel_tol=1e-6, abs_tol=1e-8)
+        if not scores_match:
+            fields.append("score")
+        if fields:
+            mismatches[key] = {
+                "fields": fields,
+                "baseline": expected,
+                "adapter": actual,
+            }
+    match = not missing and not extra and not mismatches
+    evidence = {
+        "policy": policy,
+        "comparison": "keyed_kws_detected_keyword_score",
+        "primary_field": "detected",
+        "baseline_rows": baseline,
+        "adapter_rows": adapter,
+        "missing_keys": missing,
+        "extra_keys": extra,
+        "mismatches": mismatches,
+        "match": match,
+    }
+    if match:
+        return evidence, None
+    return evidence, (
+        "baseline and adapter KWS outputs differ: "
+        f"missing={missing}, extra={extra}, mismatched={sorted(mismatches)}"
+    )
+
+
 def adapter_primary_field(run_dir: Path) -> str:
     manifest = run_dir / "artifacts" / "adapter_manifest.json"
     if not manifest.is_file():
@@ -248,8 +374,7 @@ def compare_equivalence_outputs(run_dir: Path, data: dict) -> tuple[dict | None,
         return None, (
             f"comparison_policy must be one of {list(EQUIVALENCE_POLICIES)}; got {policy!r}"
         )
-    primary_field = adapter_primary_field(run_dir)
-    texts: dict[str, str] = {}
+    paths: dict[str, Path] = {}
     for key in ("baseline_output", "adapter_output"):
         raw = str(data.get(key) or "")
         path = Path(raw)
@@ -258,6 +383,29 @@ def compare_equivalence_outputs(run_dir: Path, data: dict) -> tuple[dict | None,
                 f"{key} must be the path of the recorded output file, not the transcript itself; "
                 f"got {raw!r}. Point it at the JSON or text file the run wrote."
             )
+        paths[key] = path
+    resolved_path = run_dir / "artifacts" / "trans_input_resolved.json"
+    resolved = read_object(resolved_path) if resolved_path.is_file() else {}
+    task_type = str(resolved.get("task_type") or "").lower().replace("-", "_")
+    if not task_type:
+        manifest_path = run_dir / "artifacts" / "adapter_manifest.json"
+        manifest = read_object(manifest_path) if manifest_path.is_file() else {}
+        contract = manifest.get("io_contract") if isinstance(manifest.get("io_contract"), dict) else {}
+        if contract.get("output_type") == "keyword_detection":
+            task_type = "kws"
+    if task_type == "kws":
+        try:
+            return compare_kws_equivalence(
+                paths["baseline_output"],
+                paths["adapter_output"],
+                policy,
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            return None, str(error)
+
+    primary_field = adapter_primary_field(run_dir)
+    texts: dict[str, str] = {}
+    for key, path in paths.items():
         try:
             texts[key] = output_text(path, primary_field)
         except ValueError as error:

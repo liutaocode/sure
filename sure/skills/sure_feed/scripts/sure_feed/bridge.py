@@ -185,12 +185,14 @@ def _default_tool_name(task_type: str) -> str:
         "gr": "gender_recognize",
         "ser": "emotion_recognize",
         "tts": "tts_synthesize",
+        "kws": "kws_predict",
     }
     return mapping.get(task_type.lower(), f"{task_type.lower()}_predict")
 
 
 def _io_contract_for_task(task_type: str) -> dict[str, Any]:
-    if task_type.lower() == "tts":
+    task = task_type.lower()
+    if task == "tts":
         return {
             "input_field": "text",
             "input_type": "text",
@@ -199,6 +201,15 @@ def _io_contract_for_task(task_type: str) -> dict[str, Any]:
             "required_fields": ["audio_path"],
             "nonempty_fields": ["audio_path"],
         }
+    if task == "kws":
+        return {
+            "input_field": "audio_path",
+            "input_type": "audio_path",
+            "output_type": "keyword_detection",
+            "primary_field": "detected",
+            "required_fields": ["detected", "keyword", "score"],
+            "nonempty_fields": ["detected"],
+        }
     return {
         "input_field": "audio_path",
         "input_type": "audio_path",
@@ -206,6 +217,38 @@ def _io_contract_for_task(task_type: str) -> dict[str, Any]:
         "primary_field": "text",
         "required_fields": ["text"],
         "nonempty_fields": ["text"],
+    }
+
+
+def _tool_input_schema_for_task(task_type: str) -> dict[str, Any]:
+    task = task_type.lower()
+    if task == "kws":
+        return {
+            "type": "object",
+            "properties": {
+                "audio_path": {"type": "string"},
+                "keywords": {
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {"type": "string", "minLength": 1},
+                        },
+                    ]
+                },
+                "threshold": {"type": "number", "const": 0.5},
+            },
+            "required": ["audio_path"],
+        }
+    input_field = "text" if task == "tts" else "audio_path"
+    return {
+        "type": "object",
+        "properties": {
+            input_field: {"type": "string"},
+            "language": {"type": "string", "default": "auto"},
+        },
+        "required": [input_field],
     }
 
 
@@ -297,6 +340,23 @@ def _default_config_yaml(
     io_contract = _io_contract_for_task(task_type)
     input_field = io_contract["input_field"]
     input_description = "Text to synthesize" if input_field == "text" else "Path to an audio file"
+    if task_type == "kws":
+        input_schema_block = (
+            "    input_schema: "
+            + json.dumps(_tool_input_schema_for_task(task_type), ensure_ascii=False, separators=(",", ":"))
+        )
+    else:
+        input_schema_block = f"""    input_schema:
+      type: object
+      properties:
+        {input_field}:
+          type: string
+          description: \"{input_description}\"
+        language:
+          type: string
+          description: \"Language hint\"
+          default: \"auto\"
+      required: [{_yaml_string(input_field)}]"""
     model_path = str(source["id"])
     if weights_manifest:
         model_path = _path_for_spec(weights_manifest.get("resolved_local_model_path"), model_root) or model_path
@@ -324,17 +384,7 @@ server:
 tools:
   - name: {_yaml_string(tool_name)}
     description: "Run {sure_task} inference through the model-local wrapper"
-    input_schema:
-      type: object
-      properties:
-        {input_field}:
-          type: string
-          description: "{input_description}"
-        language:
-          type: string
-          description: "Language hint"
-          default: "auto"
-      required: [{_yaml_string(input_field)}]
+{input_schema_block}
 
 resources:
   memory_gb: 24
@@ -408,6 +458,37 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         if not self.model_loaded:
             self.load()
         raise NotImplementedError("SURE tool-agent must implement TTS inference.")'''
+        result_fields = '''    text: str = ""
+    audio_path: str = ""
+    language: str = "auto"
+    raw: dict[str, Any] | None = None'''
+    elif task_type == "kws":
+        predict_body = '''        if not isinstance(input_data, dict):
+            raise ValueError("KWS input must contain audio_path")
+        audio_path = input_data.get("audio_path")
+        keywords = input_data.get("keywords")
+        if not audio_path:
+            raise ValueError("audio_path is required")
+        if not Path(str(audio_path)).exists():
+            raise FileNotFoundError(str(audio_path))
+        if keywords is not None:
+            if isinstance(keywords, str):
+                keywords_valid = bool(keywords.strip())
+            else:
+                keywords_valid = (
+                    isinstance(keywords, list)
+                    and bool(keywords)
+                    and all(isinstance(keyword, str) and bool(keyword.strip()) for keyword in keywords)
+                )
+            if not keywords_valid:
+                raise ValueError("keywords must be a non-empty string or list of strings when provided")
+        if not self.model_loaded:
+            self.load()
+        raise NotImplementedError("SURE tool-agent must implement KWS inference.")'''
+        result_fields = '''    detected: bool = False
+    keyword: str | None = None
+    score: float | None = None
+    raw: dict[str, Any] | None = None'''
     else:
         predict_body = '''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
         if not audio_path:
@@ -417,6 +498,10 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         if not self.model_loaded:
             self.load()
         raise NotImplementedError("SURE tool-agent must implement inference.")'''
+        result_fields = '''    text: str = ""
+    audio_path: str = ""
+    language: str = "auto"
+    raw: dict[str, Any] | None = None'''
     return f'''"""SURE model wrapper scaffold for {source["id"]}.
 
 This file is generated by sure_feed so the SURE model tool-agent can
@@ -434,10 +519,7 @@ from typing import Any
 
 @dataclass
 class PredictionResult:
-    text: str = ""
-    audio_path: str = ""
-    language: str = "auto"
-    raw: dict[str, Any] | None = None
+{result_fields}
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -471,8 +553,15 @@ class ModelWrapper:
 def _default_server_py(task_type: str) -> str:
     tool_name = _default_tool_name(task_type)
     io_contract = _io_contract_for_task(task_type)
-    input_field = io_contract["input_field"]
     content_field = io_contract["primary_field"]
+    input_schema = json.dumps(
+        _tool_input_schema_for_task(task_type), ensure_ascii=False, separators=(",", ":")
+    )
+    content_value = (
+        "json.dumps(result, ensure_ascii=False)"
+        if task_type.lower() == "kws"
+        else f'str(result.get("{content_field}", ""))'
+    )
     return f'''#!/usr/bin/env python3
 """Minimal MCP-style server scaffold generated by sure_feed."""
 
@@ -491,14 +580,7 @@ class MCPServer:
         self._tools = [{{
             "name": "{tool_name}",
             "description": "Run model-local inference",
-            "inputSchema": {{
-                "type": "object",
-                "properties": {{
-                    "{input_field}": {{"type": "string"}},
-                    "language": {{"type": "string", "default": "auto"}},
-                }},
-                "required": ["{input_field}"],
-            }},
+            "inputSchema": {input_schema},
         }}]
 
     def _load_model(self):
@@ -534,7 +616,7 @@ class MCPServer:
                 return {{
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "result": {{"content": [{{"type": "text", "text": result.get("{content_field}", "")}}], "raw": result}},
+                    "result": {{"content": [{{"type": "text", "text": {content_value}}}], "raw": result}},
                 }}
             except Exception as exc:
                 return {{

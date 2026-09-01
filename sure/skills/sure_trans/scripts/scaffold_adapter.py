@@ -289,6 +289,25 @@ def tool_contract(task_type: str) -> tuple[str, dict]:
         }
     if task_type == "s2tt":
         return "translate_audio", {"type": "object", "properties": {"audio_path": {"type": "string"}}, "required": ["audio_path"]}
+    if task_type == "kws":
+        return "kws_predict", {
+            "type": "object",
+            "properties": {
+                "audio_path": {"type": "string"},
+                "keywords": {
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                        },
+                    ]
+                },
+                "threshold": {"type": "number", "const": 0.5},
+            },
+            "required": ["audio_path"],
+        }
     return "transcribe_audio", {"type": "object", "properties": {"audio_path": {"type": "string"}}, "required": ["audio_path"]}
 
 
@@ -313,6 +332,25 @@ def io_contract_for(task_type: str) -> dict:
             "primary_field": "audio_path",
             "required_fields": ["audio_path"],
             "nonempty_fields": ["audio_path"],
+            "json_serializable": True,
+        }
+    if task_type == "kws":
+        return {
+            "input_type": "audio_path",
+            "output_type": "keyword_detection",
+            "input": {
+                "audio_path": "string",
+                "keywords": "optional string|string[]",
+                "threshold": "optional number",
+            },
+            "output": {
+                "detected": "boolean",
+                "keyword": "string|null",
+                "score": "number|null",
+            },
+            "primary_field": "detected",
+            "required_fields": ["detected", "keyword", "score"],
+            "nonempty_fields": ["detected"],
             "json_serializable": True,
         }
     return {

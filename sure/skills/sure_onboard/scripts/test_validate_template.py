@@ -1,7 +1,9 @@
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -117,6 +119,191 @@ class ValidateTemplateTest(unittest.TestCase):
         self.assertEqual(len(fixtures), 1)
         self.assertEqual(fixtures[0]["fixture"]["key"], "arabic-1")
         self.assertEqual(fixtures[0]["fixture"]["ground_truth"], "النص المرجعي")
+
+    def test_kws_fixture_payloads_preserve_keywords_and_require_both_polarities(self):
+        model_dir = Path(self.temp_dir.name) / "model"
+        fixture_dir = model_dir / "fixture" / "kws" / "smoke"
+        fixture_dir.mkdir(parents=True)
+        (fixture_dir / "positive.wav").write_bytes(b"wav")
+        (fixture_dir / "negative.wav").write_bytes(b"wav")
+        rows = [
+            {
+                "key": "positive",
+                "audio": "positive.wav",
+                "keywords": ["你好问问", "嗨小问"],
+                "expected": "detect",
+                "label": "positive",
+                "expected_detected": True,
+                "text": "嗨小问",
+            },
+            {
+                "key": "negative",
+                "audio": "negative.wav",
+                "keywords": ["你好问问", "嗨小问"],
+                "expected": "reject",
+                "label": "negative",
+                "expected_detected": False,
+            },
+        ]
+        (fixture_dir / "gt.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        self.module.MODEL_DIR = model_dir
+        self.module.TASK_TYPE = "kws"
+
+        fixtures = self.module.fixture_payloads()
+
+        self.assertEqual(len(fixtures), 2)
+        self.assertEqual(fixtures[0]["input"]["keywords"], ["你好问问", "嗨小问"])
+        self.assertEqual(fixtures[0]["fixture"]["expected"], "detect")
+        self.assertEqual(fixtures[1]["fixture"]["expected"], "reject")
+
+        rows[0]["label"] = "negative"
+        (fixture_dir / "gt.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "conflicting KWS polarity fields"):
+            self.module.fixture_payloads()
+
+        rows[0]["label"] = "maybe"
+        (fixture_dir / "gt.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported label value"):
+            self.module.fixture_payloads()
+
+        rows[0]["label"] = "positive"
+        for row in rows:
+            row.pop("keywords")
+        (fixture_dir / "gt.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        fixed_keyword_fixtures = self.module.fixture_payloads()
+        self.assertNotIn("keywords", fixed_keyword_fixtures[0]["input"])
+
+    def test_kws_contract_checks_every_positive_and_negative_output(self):
+        contract = {
+            "output_type": "keyword_detection",
+            "primary_field": "detected",
+            "required_fields": ["detected", "keyword", "score"],
+            "nonempty_fields": ["detected"],
+            "json_serializable": True,
+        }
+        fixtures = [
+            {
+                "input": {"audio_path": "positive.wav", "keywords": ["嗨小问"]},
+                "fixture": {
+                    "key": "positive",
+                    "audio": "positive.wav",
+                    "expected": "detect",
+                    "text": "嗨小问",
+                },
+            },
+            {
+                "input": {"audio_path": "negative.wav", "keywords": ["嗨小问"]},
+                "fixture": {
+                    "key": "negative",
+                    "audio": "negative.wav",
+                    "expected": "reject",
+                },
+            },
+        ]
+        calls = []
+        self.module.TASK_TYPE = "kws"
+        self.module.IO_CONTRACT = contract
+        self.module.load_wrapper = lambda: object()
+        self.module.fixture_payloads = lambda: fixtures
+
+        def predict(_wrapper, payload):
+            calls.append(payload)
+            if payload["audio_path"] == "positive.wav":
+                return {"detected": True, "keyword": "嗨小问", "score": 0.9}
+            return {"detected": False, "keyword": None, "score": None}
+
+        self.module.run_predict = predict
+        self.assertTrue(self.module.stage_infer())
+        self.assertTrue(self.module.stage_contract())
+        self.assertEqual([call["keywords"] for call in calls], [["嗨小问"], ["嗨小问"]])
+
+        output_rows = [
+            json.loads(line)
+            for line in self.module.SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
+        ]
+        output_rows[1]["output"] = {"detected": True, "keyword": "嗨小问", "score": 0.8}
+        self.module.write_jsonl(self.module.SAMPLE_OUTPUTS, output_rows)
+        self.assertFalse(self.module.stage_contract())
+        result = json.loads((self.module.ARTIFACTS_DIR / "contract_result.json").read_text(encoding="utf-8"))
+        self.assertIn("must reject the negative fixture", result["error"])
+
+    def test_kws_single_output_contract_accepts_false_and_rejects_non_finite_score(self):
+        self.assertEqual(
+            self.module.validate_kws_output(
+                {"detected": False, "keyword": None, "score": None}
+            ),
+            [],
+        )
+        violations = self.module.validate_kws_output(
+            {"detected": False, "keyword": None, "score": float("nan")}
+        )
+        self.assertIn("score must be a finite number or null", violations)
+        self.assertIn(
+            "detected=true requires score >= 0.5",
+            self.module.validate_kws_output(
+                {"detected": True, "keyword": "嗨小问", "score": 0.4}
+            ),
+        )
+        self.assertIn(
+            "detected=false requires score < 0.5",
+            self.module.validate_kws_output(
+                {"detected": False, "keyword": None, "score": 0.6}
+            ),
+        )
+        positive_without_score = self.module.validate_kws_output(
+            {"detected": True, "keyword": "嗨小问", "score": None}
+        )
+        self.assertIn("detected=true requires a finite numeric score", positive_without_score)
+
+    def test_kws_single_input_preserves_optional_keywords(self):
+        self.module.TASK_TYPE = "kws"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SURE_VALIDATE_INPUT_JSON": json.dumps(
+                    {
+                        "audio_path": "negative.wav",
+                        "keywords": ["嗨小问"],
+                    },
+                    ensure_ascii=False,
+                )
+            },
+            clear=False,
+        ):
+            fixtures = self.module.fixture_payloads()
+        self.assertEqual(fixtures[0]["input"]["keywords"], ["嗨小问"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"SURE_VALIDATE_INPUT_JSON": json.dumps({"audio_path": "negative.wav"})},
+            clear=False,
+        ):
+            fixtures = self.module.fixture_payloads()
+        self.assertNotIn("keywords", fixtures[0]["input"])
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SURE_VALIDATE_INPUT_JSON": json.dumps(
+                    {"audio_path": "negative.wav", "keywords": []}
+                )
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "keywords"):
+                self.module.fixture_payloads()
 
     def test_sample_outputs_jsonl_is_staged(self):
         stage_model_artifacts = load_stage_model_artifacts()

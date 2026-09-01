@@ -722,6 +722,7 @@ def _derive_fixture_and_contract(
 
     fixture, registry_contract, fixture_issues, registry_evidence = select_fixture_for_task(task_type, candidate)
     field_evidence.extend(registry_evidence)
+    missing_or_weak.extend(fixture_issues)
     if fixture:
         if provider_fixture_hint:
             fixture["provider_fixture_hint"] = provider_fixture_hint
@@ -736,7 +737,8 @@ def _derive_fixture_and_contract(
                 )
             )
     else:
-        missing_or_weak.extend(fixture_issues or ["missing:fixture"])
+        if not fixture_issues:
+            missing_or_weak.append("missing:fixture")
         fixture = {
             "fixture_source": "unresolved",
             "task_specific": True,

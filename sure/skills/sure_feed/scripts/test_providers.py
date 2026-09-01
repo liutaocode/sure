@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sure_feed.providers.huggingface as hf_module  # noqa: E402
+import sure_feed.providers.base as base_module  # noqa: E402
 from sure_feed.fixture_registry import select_fixture_for_task  # noqa: E402
 from sure_feed.providers.base import ProviderNetworkError, ProviderRequest, infer_task, synthesize_model_input, to_yaml  # noqa: E402
 from sure_feed.providers.huggingface import HuggingFaceProvider  # noqa: E402
@@ -248,6 +252,119 @@ pip install sherpa-onnx
         self.assertIn("fixtures/tasks/asr/qwen3_asr_smoke/asr_en/", fixture["audio"])
         self.assertEqual(io_contract["primary_field"], "text")
         self.assertIn("fixture", {item.get("model_input_field") for item in evidence})
+
+    def test_fixture_registry_selects_kws_positive_and_negative_contract(self) -> None:
+        fixture, io_contract, issues, evidence = select_fixture_for_task(
+            "kws",
+            {"model_id": "owner/kws", "description": "keyword spotting wake word"},
+        )
+        self.assertEqual(issues, [])
+        self.assertIsNotNone(fixture)
+        assert fixture is not None
+        self.assertEqual(fixture["sample_count"], 2)
+        self.assertTrue(fixture["positive_audio"].endswith("positive_nihao_wenwen.wav"))
+        self.assertTrue(fixture["negative_audio"].endswith("negative_mobvoi.wav"))
+        self.assertEqual(fixture["keywords"], ["你好问问", "嗨小问"])
+        self.assertEqual(io_contract["output_type"], "keyword_detection")
+        self.assertEqual(io_contract["primary_field"], "detected")
+        self.assertEqual(io_contract["required_fields"], ["detected", "keyword", "score"])
+        self.assertEqual(io_contract["nonempty_fields"], ["detected"])
+        self.assertIn("io_contract", {item.get("model_input_field") for item in evidence})
+
+    def test_fixture_registry_rejects_conflicting_and_unknown_kws_polarities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture_dir = root / "fixtures" / "tasks" / "kws" / "smoke"
+            fixture_dir.mkdir(parents=True)
+            (fixture_dir.parent / "README.md").write_text("# KWS\n", encoding="utf-8")
+            (fixture_dir / "positive.wav").write_bytes(b"wav")
+            (fixture_dir / "negative.wav").write_bytes(b"wav")
+            negative = {
+                "key": "negative",
+                "audio": "negative.wav",
+                "keywords": ["wake word"],
+                "expected": "reject",
+                "label": "negative",
+                "expected_detected": False,
+            }
+            invalid_cases = (
+                (
+                    {
+                        "key": "conflict",
+                        "audio": "positive.wav",
+                        "keywords": ["wake word"],
+                        "expected": "detect",
+                        "label": "negative",
+                        "expected_detected": True,
+                    },
+                    "conflicting polarity fields",
+                ),
+                (
+                    {
+                        "key": "unknown",
+                        "audio": "positive.wav",
+                        "keywords": ["wake word"],
+                        "expected": "detect",
+                        "label": "maybe",
+                    },
+                    "unsupported label value",
+                ),
+            )
+            for positive, message in invalid_cases:
+                with self.subTest(message=message):
+                    (fixture_dir / "gt.jsonl").write_text(
+                        "".join(
+                            json.dumps(row) + "\n"
+                            for row in (positive, negative)
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        select_fixture_for_task("kws", repo_root=root)
+
+    def test_provider_propagates_single_polarity_kws_fixture_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture_dir = root / "fixtures" / "tasks" / "kws" / "smoke"
+            fixture_dir.mkdir(parents=True)
+            (fixture_dir.parent / "README.md").write_text("# KWS\n", encoding="utf-8")
+            (fixture_dir / "sample.wav").write_bytes(b"wav")
+            cases = (
+                ("detect", "positive", "missing:fixture.kws.negative"),
+                ("reject", "negative", "missing:fixture.kws.positive"),
+            )
+            for expected, label, missing in cases:
+                with self.subTest(expected=expected):
+                    (fixture_dir / "gt.jsonl").write_text(
+                        json.dumps(
+                            {
+                                "key": label,
+                                "audio": "sample.wav",
+                                "expected": expected,
+                                "label": label,
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    with mock.patch.object(
+                        base_module,
+                        "select_fixture_for_task",
+                        side_effect=lambda task, candidate: select_fixture_for_task(
+                            task, candidate, repo_root=root
+                        ),
+                    ):
+                        model_input, missing_or_weak, _evidence = base_module.synthesize_model_input(
+                            {
+                                "source": "manual",
+                                "model_id": "owner/kws",
+                                "repo": "https://example.invalid/owner/kws",
+                                "description": "keyword spotting model",
+                            },
+                            "kws",
+                        )
+                    self.assertIn(missing, missing_or_weak)
+                    self.assertEqual(model_input["fixture"]["fixture_source"], "unresolved")
 
     def test_fixture_registry_routes_speech_understanding_to_atomic_fixtures(self) -> None:
         fixture, io_contract, issues, _evidence = select_fixture_for_task(

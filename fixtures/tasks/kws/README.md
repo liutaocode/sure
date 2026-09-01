@@ -37,8 +37,10 @@ sure/models/<model>/fixture/kws/
     └── negative_*.wav
 ```
 
-`gt.jsonl` should include the audio path, expected label, keyword, and whether
-the sample is positive or negative.
+`gt.jsonl` must contain 2 to 5 rows with unique `key` values, safe relative
+audio paths, a non-empty `keywords` string/list, and an explicit positive or
+negative annotation. The staged form records boolean `expected_detected`,
+`expected_keyword` (`null` for negatives), and positive finite `duration`.
 
 ## Validation Metrics
 
@@ -48,8 +50,22 @@ Task-formatted namespace:
 src/sure_eval/evaluation/tasks/kws/
 ```
 
-No shared KWS metric has been moved in this phase. Use existing task-local
-validation scripts for phase-1 checks.
+Formal evaluation uses the standalone `sure-evaluation` KWS route with
+`reference_jsonl + sample_output`. `sample_output` is a JSON array, or an
+object with a `rows` array, whose entries have this shape:
+
+```json
+{"key":"sample-id","result":{"detected":false,"keyword":null,"score":null}}
+```
+
+The model adapter must emit the direct `detected`, `keyword`, and `score`
+summary. An untyped event list is evidence only and is not converted into a
+detection by the Harness.
+
+The formal operating threshold is `0.5`. Scores, when present, must be finite
+values in `[0,1]`, and `detected` must agree with `score >= 0.5`. Accuracy-only
+evaluation accepts a correctly rejected sample with `score: null`; macro-recall
+and DET evaluation require a score for every sample.
 
 Validation should include at least one positive and one negative sample.
 

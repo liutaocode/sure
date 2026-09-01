@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import socket
 import subprocess
@@ -36,6 +37,7 @@ logger = get_logger(__name__)
 
 SURE_SUITES_ROOT = Path("data/datasets/sure_benchmark/SURE_Test_Suites")
 PREDICTION_SNAPSHOT_INTERVAL = 25
+KWS_OPERATING_THRESHOLD = 0.5
 
 
 def _utc_now() -> str:
@@ -218,6 +220,14 @@ def _split_metrics(value: str | None) -> list[str]:
     return out
 
 
+def _kws_metrics_require_scores(metrics: list[str]) -> bool:
+    normalized = [str(metric).lower().replace("-", "_") for metric in metrics]
+    return any(
+        "macro_recall" in metric or "det_curve" in metric or metric == "det"
+        for metric in normalized
+    )
+
+
 def _metric_task_hint(metrics: list[str]) -> str:
     hinted: list[str] = []
     for metric in metrics:
@@ -275,6 +285,22 @@ def _sample_reference_audio_path(repo_root: Path, sample: dict[str, Any], fallba
         or sample.get("prompt_wav")
     )
     return _resolve_audio_field_path(repo_root, value) or fallback
+
+
+def _validate_kws_threshold(value: Any, *, source: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(f"KWS {source} threshold must be a finite number")
+    threshold = float(value)
+    if threshold != KWS_OPERATING_THRESHOLD:
+        raise ValueError(
+            f"KWS {source} threshold must equal the formal operating threshold "
+            f"{KWS_OPERATING_THRESHOLD}"
+        )
+    return threshold
 
 
 def _build_tool_arguments(
@@ -342,6 +368,29 @@ def _build_tool_arguments(
         if prompt_text:
             arguments["prompt_text"] = str(prompt_text)
             arguments["ref_text"] = str(prompt_text)
+        if tool_args:
+            arguments.update(tool_args)
+        return arguments
+
+    if task_name == "KWS":
+        arguments = {argument_name: str(audio_path)}
+        if "keywords" in sample:
+            keywords = sample["keywords"]
+            valid_keywords = (
+                isinstance(keywords, str) and bool(keywords.strip())
+            ) or (
+                isinstance(keywords, list)
+                and bool(keywords)
+                and all(isinstance(keyword, str) and bool(keyword.strip()) for keyword in keywords)
+            )
+            if not valid_keywords:
+                raise ValueError("KWS sample keywords must be a non-empty string or list of strings")
+            arguments["keywords"] = keywords
+        if "threshold" in sample:
+            _validate_kws_threshold(sample["threshold"], source="sample")
+            arguments["threshold"] = sample["threshold"]
+        if tool_args and "threshold" in tool_args:
+            _validate_kws_threshold(tool_args["threshold"], source="tool argument")
         if tool_args:
             arguments.update(tool_args)
         return arguments
@@ -424,7 +473,7 @@ SAFE_ENV_VALUE_KEYS = {
     "SURE_HARNESS_RUNTIME_ROOT",
 }
 PATH_ARGUMENT_HINTS = ("audio", "path", "file", "dir", "jsonl")
-TEXT_ARGUMENT_HINTS = ("text", "prompt", "reference", "target")
+TEXT_ARGUMENT_HINTS = ("text", "prompt", "reference", "target", "keyword", "threshold")
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -672,7 +721,12 @@ def _extract_response_payload(response: dict[str, Any]) -> Any:
         return text
 
 
-def _normalize_prediction_payload(payload: Any, *, task: str) -> tuple[str, dict[str, Any]]:
+def _normalize_prediction_payload(
+    payload: Any,
+    *,
+    task: str,
+    kws_require_score: bool = False,
+) -> tuple[str, dict[str, Any]]:
     task_name = task.upper()
     if isinstance(payload, dict):
         prediction = dict(payload.get("prediction") or {})
@@ -721,11 +775,57 @@ def _normalize_prediction_payload(payload: Any, *, task: str) -> tuple[str, dict
             value = prediction.get("annotation_path") or prediction.get("annotation") or payload.get("text") or ""
             return str(value), {"annotation": value}
         if task_name == "KWS":
-            value = prediction.get("score") if prediction.get("score") is not None else payload.get("score", "")
-            normalized = {"score": value}
-            if prediction.get("events") is not None:
-                normalized["events"] = prediction["events"]
-            return str(value), normalized
+            required_fields = ("detected", "keyword", "score")
+            missing_fields = [field for field in required_fields if field not in prediction]
+            if missing_fields:
+                raise ValueError(
+                    "KWS prediction payload is missing direct field(s): " + ", ".join(missing_fields)
+                )
+            detected = prediction["detected"]
+            keyword = prediction["keyword"]
+            score = prediction["score"]
+            if not isinstance(detected, bool):
+                raise ValueError("KWS prediction detected must be a bool")
+            if keyword is not None and not isinstance(keyword, str):
+                raise ValueError("KWS prediction keyword must be a string or null")
+            if score is not None and (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+            ):
+                raise ValueError("KWS prediction score must be a finite number or null")
+            if score is not None and not 0.0 <= float(score) <= 1.0:
+                raise ValueError("KWS prediction score must be within [0, 1]")
+            if detected and (not isinstance(keyword, str) or not keyword.strip()):
+                raise ValueError("KWS detected prediction keyword must be a non-empty string")
+            if detected and score is None:
+                raise ValueError("KWS detected prediction score must be a finite number")
+            if detected and float(score) < KWS_OPERATING_THRESHOLD:
+                raise ValueError(
+                    f"KWS detected prediction score must be >= {KWS_OPERATING_THRESHOLD}"
+                )
+            if not detected and keyword is not None:
+                raise ValueError("KWS rejected prediction keyword must be null")
+            if not detected and score is not None and float(score) >= KWS_OPERATING_THRESHOLD:
+                raise ValueError(
+                    f"KWS rejected prediction score must be < {KWS_OPERATING_THRESHOLD}"
+                )
+            if kws_require_score and score is None:
+                raise ValueError("KWS formal score-sweep generation requires a score for every sample")
+            normalized = {
+                "detected": detected,
+                "keyword": keyword,
+                "score": score,
+            }
+            if "events" in prediction:
+                events = prediction["events"]
+                if not isinstance(events, list):
+                    raise ValueError("KWS prediction events must be a list when provided")
+                normalized["events"] = events
+            return (
+                json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+                normalized,
+            )
         value = payload.get("text", "")
         return str(value), {"text": str(value)}
 
@@ -740,7 +840,7 @@ def _normalize_prediction_payload(payload: Any, *, task: str) -> tuple[str, dict
     if task_name in {"SD", "SA-ASR"}:
         return value, {"annotation": value}
     if task_name == "KWS":
-        return value, {"score": value}
+        raise ValueError("KWS prediction payload must be a JSON object with detected, keyword, and score")
     return value, {"text": value}
 
 
@@ -1054,10 +1154,13 @@ def main() -> int:
     sample_language = str(samples[0].get("language", "")) if samples else ""
 
     model_cfg = _load_yaml(model_dir / "config.yaml")
+    generation_metrics = _split_metrics(
+        os.environ.get("SURE_EVAL_METRICS") or os.environ.get("METRICS")
+    )
     sample_task = _effective_generation_task(
         sample_task,
         model_cfg,
-        _split_metrics(os.environ.get("SURE_EVAL_METRICS") or os.environ.get("METRICS")),
+        generation_metrics,
     )
     runtime_inventory_document = _load_runtime_inventory(model_dir)
     server_cfg = model_cfg.get("server", {})
@@ -1302,7 +1405,11 @@ def main() -> int:
                     raw_response_types.add(type(raw_payload).__name__)
                     if isinstance(raw_payload, dict):
                         raw_response_keys.update(str(key) for key in raw_payload)
-                    prediction, normalized_prediction = _normalize_prediction_payload(raw_payload, task=sample_task)
+                    prediction, normalized_prediction = _normalize_prediction_payload(
+                        raw_payload,
+                        task=sample_task,
+                        kws_require_score=_kws_metrics_require_scores(generation_metrics),
+                    )
                     prediction_map[key] = prediction
                     structured_map[key] = {
                         "key": key,

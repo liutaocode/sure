@@ -11,7 +11,7 @@
 | Digest 固定 | 所有交接引用使用 `image@sha256:...`,禁止可变 tag;registry push 后必须按 digest 精确 pull 并复验。 |
 | 站点解析交付 | source/adapter 仓库由活动站点策略统一解析,agent 不拼接 namespace;解析结果和策略身份写入 `trans_input_resolved.json`。 |
 | Container-only | Eval 运行时完全在容器内:`host_python_fallback=false`、`image_override_allowed=false`,模型 payload 以只读方式挂载。 |
-| IO contract | `input_type=audio_path` 到 `output_type=json`,`primary_field=text`,`required_fields=["text"]`、`nonempty_fields=["text"]`、`json_serializable=true`,由 `validate.py --stage contract` 对 `sample_output.json` 校验。 |
+| IO contract | 按任务生成。ASR 使用 `text`;KWS 使用 `kws_predict` 和 `detected/keyword/score`,正式阈值固定为 `0.5`,`score` 范围为 `[0,1]`。accuracy-only 负例允许 `false/null/null`;macro-recall/DET 要求每条都有 score。`validate.py --stage contract` 对结构与任务语义一起校验。 |
 | 模型 bundle | 最终交接目录 `sure/models/<model_name>/`:wrapper 五件套 + `Dockerfile.sure` + 模型 payload + `fixture/<task>/` + `artifacts/` terminal sidecar。`/sure_eval` 只挂载该目录,外部绝对路径不是可执行交接。 |
 
 ## 参数
@@ -28,7 +28,7 @@
 | `build_context` | 否 | 默认取 Dockerfile 父目录。 |
 | `image_tar` | 否 | 显式指定镜像 tar,必须位于 `build_context` 内。 |
 | `model_name` | 是 | 必须使用 `<组织>__<模型名称>` 格式；后续 bundle、镜像和 registry 命名均使用此值。 |
-| `fixture` | 否 | 冒烟输入绝对路径,否则自动选择 build context 下无歧义的 `examples/smoke.*`。 |
+| `fixture` | 否 | 冒烟输入绝对路径。普通任务使用音频 + 同名 `.expected.json`;KWS 使用 fixture 目录或 `gt.jsonl`,必须含 2-5 条带唯一 key 的样本,并同时覆盖正例和负例。 |
 | `device` | 否 | `auto`(默认)/`cuda`/`cpu`。`cpu` 只用本地 Docker;`cuda` 和 `auto` 先通过 VC 做 GPU 验证,符合条件的 `auto` 才可回退本地 CPU。 |
 | `vc_partition` | 否 | GPU 验证分区;默认取活动站点策略的 `execution.vc_default_partition`。 |
 | `vc_memory_gb` / `vc_gpus` | 否 | GPU 验证资源覆盖;默认 32 GiB、1 GPU。 |
@@ -41,6 +41,12 @@
 
 ```text
 /sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/infer.py framework=pytorch model_framework=transformers model_name=organization__model task_type=asr source_image_policy=auto
+```
+
+KWS 示例:
+
+```text
+/sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/kws.py framework=pytorch model_framework=custom model_name=organization__wakeword task_type=kws fixture=/path/to/fixture/kws
 ```
 
 `examples/minimal-input.json` 是同一组参数的 JSON 形式。
@@ -108,7 +114,7 @@ sure/models/<model_name>/
 │   ├── artifact_manifest.json
 │   ├── runtime_inventory.json                     # container-only Eval binding
 │   └── deployment_ready.json                      # terminal immutable readiness marker
-└── fixture/<task>/                                 # 冒烟音频 + gt.jsonl
+└── fixture/<task>/                                 # 冒烟音频 + gt.jsonl;KWS 保留 audio/ 子目录
 ```
 
 对齐要点:
@@ -119,7 +125,7 @@ sure/models/<model_name>/
 - `deployment_ready.json` 使用 `sure.onboard.deployment_ready.v1`,与 run 目录逐字节一致;ready bundle 必须声明 `integrity_profile=manifest-complete-v1`,`required_artifact_sha256` 覆盖 wrapper、Dockerfile、fixture、sample output、全部模型 payload 与 required sidecar,`bundle_identity_sha256` 为哈希表的摘要,四个 portable sidecar 不允许残留宿主机共享存储的绝对路径。
 - `check_artifact.py --kind deployment_ready` 与 `/sure_onboard` 的 `check_finalized_bundle.py` 执行同一组校验:bundle 与 run 双写一致、哈希复验、bundle identity 重算、portable manifest、Dockerfile 哈希、执行策略与 digest 固定引用。
 
-模型 payload(权重等文件)落在 bundle 根目录,与 `model.py`、`model.spec.yaml` 同级;`fixture/<task>/` 下是冒烟音频与 `gt.jsonl`,每行 `{audio, task_type, text}`。
+模型 payload(权重等文件)落在 bundle 根目录,与 `model.py`、`model.spec.yaml` 同级。普通任务的 `fixture/<task>/gt.jsonl` 记录音频与参考标注;KWS 每行记录 `{key,audio,keywords,expected_detected,expected_keyword,duration}`,并递归保留 `audio/`。
 
 ### Gate 校验点
 
@@ -127,6 +133,7 @@ sure/models/<model_name>/
 
 - `input`:`dockerfile`/`build_context`/`model_path`/`inference_entrypoint` 必须为存在的绝对路径；`framework=pytorch` 和非空 `model_framework` 必须同时存在；`model_dir` 必须精确等于 `<repo>/sure/models/<model_name>` 且不能是目录软链,对齐 `check_model_input.py`。
 - `framework`:静态分析必须检测到 PyTorch；Transformers 是推荐项而非硬门槛，其他模型框架必须写入架构澄清。
+- `fixture`:KWS 必须同时含正负样本、唯一 key、安全的相对音频路径和逐文件 SHA256;不能从模型输出反推 reference。
 - `model_payload`:`destination` 必须等于 harness 拥有的 bundle 目录,外部路径复用被阻塞。
 - `adapter`:`model.py`/`__init__.py`/`validate.py`/`server.py`/`config.yaml`/`model.spec.yaml`/`dockerfile` 七类文件必须全部存在,`model.py` 不允许残留 `NotImplementedError`/`TODO`。
 - `registry`:`status=passed`、`pull_verified=true`,`target_image_ref` 与 digest 必须 digest 固定。

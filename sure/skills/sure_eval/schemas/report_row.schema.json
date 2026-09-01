@@ -34,6 +34,7 @@
 		},
 		"baseline": { "type": ["object", "null"], "additionalProperties": true },
 		"rps": { "type": ["number", "null"] },
+		"rps_status": { "type": ["object", "null"], "additionalProperties": true },
 		"pipeline": {
 			"type": "object",
 			"required": ["pipeline_id", "nodes", "conversion_steps"],

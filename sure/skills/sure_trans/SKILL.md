@@ -21,7 +21,7 @@ Convert an existing model delivery into the same Eval-ready contract produced by
 | `image_tar` | no | Explicit image archive absolute path. It must be inside `build_context`. |
 | `model_name` | yes | Must use `<organization>__<model-name>`; all bundle and image names use this value. |
 | `task_type` | no | Infer from evidence; require an explicit value when ambiguous. |
-| `fixture` | no | Absolute smoke input path. A same-stem `.expected.json` with a non-empty reference annotation is required; otherwise select an unambiguous `examples/smoke.*` file from the build context. |
+| `fixture` | no | Absolute smoke input path. Most tasks require one audio file plus a same-stem `.expected.json`. KWS requires a fixture directory or `gt.jsonl` containing 2 to 5 keyed samples with at least one positive and one negative. |
 | `device` | no | `auto` (default), `cuda`, or `cpu`. `cpu` validates with local Docker only; `cuda` and GPU-capable `auto` submit VC jobs to the dedicated partition `<vc_default_partition>`. |
 | `model_mount_target` | no | Default to `/models/<model_name>`. |
 | `model_stage_policy` | no | `auto` (default), `copy`, or `hardlink`; materialize the model payload into the final bundle. |
@@ -35,6 +35,12 @@ Example:
 
 ```text
 /sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/infer.py framework=pytorch model_framework=transformers model_name=organization__model task_type=asr
+```
+
+KWS example:
+
+```text
+/sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/kws.py framework=pytorch model_framework=custom model_name=organization__wakeword task_type=kws fixture=/path/to/fixture/kws
 ```
 
 ## Boundaries
@@ -119,7 +125,7 @@ Inspect the static dependency closure:
 
 `detect_framework.py` blocks only when static evidence cannot establish PyTorch as the primary computation framework. A non-Transformers PyTorch model remains `status=ready`; the script writes `architecture_clarification` and any detected architecture signals, and the final verdict carries the same review information.
 
-`prepare_fixture.py` copies both the selected audio and its same-stem `.expected.json`, writes `gt.jsonl` before the fixture gate runs, and records SHA256 for all three. Model predictions and equivalence baselines are never accepted as ground truth.
+`prepare_fixture.py` copies both the selected audio and its same-stem `.expected.json`, writes `gt.jsonl` before the fixture gate runs, and records SHA256 for all three. For KWS it copies only `gt.jsonl` and its referenced nested audio paths, requires unique keys and explicit polarity, normalizes `expected_detected` / `expected_keyword`, derives WAV duration when needed, and records each file hash plus a fixture-tree identity. Model predictions and equivalence baselines are never accepted as ground truth.
 
 Materialize the source image with the resolved policy:
 
@@ -186,9 +192,11 @@ class ModelWrapper:
 
 Keep `server.py` protocol-only. Use stdin/stdout JSON-RPC, write logs to stderr, and expose the task tool declared in `config.yaml`. For ASR, expose `transcribe_audio` with `audio_path` and return a JSON-serializable object containing non-empty `text`.
 
-The adapter image always bakes `/opt/sure_trans/mcp_smoke.py` (copied by `scaffold_adapter.py`). All MCP protocol verification runs that deterministic driver: it spawns `server.py`, drives `initialize` / `tools/list` / `tools/call` / `shutdown` over stdin with bounded deadlines, and writes `mcp_smoke.json` evidence. Never write ad-hoc MCP test scripts, and never start the server bare without driving requests — a bare server waits on stdin forever. The MCP stdout channel must stay a pure JSON-RPC stream: the generated `server.py` redirects model-library stdout to stderr during `tools/call`, and `mcp_smoke.py` skips stray non-JSON stdout lines while reading responses (recording them as `stdout_junk_*` evidence) — model loading progress prints must never corrupt the protocol.
+For KWS, expose `kws_predict` with `audio_path`, optional `keywords` (`string` or `string[]`), and optional `threshold`, whose only formal value is `0.5`. Return all three direct summary fields: `detected: boolean`, `keyword: string|null`, and `score: number|null`. Scores are confidence values in `[0,1]`; `detected` must agree with `score >= 0.5`. A negative result may use `{detected: false, keyword: null, score: null}` for accuracy-only smoke, or a score below `0.5`. Macro-recall and DET evaluation require scores for every sample. False and null are valid values, not empty output. A positive result requires the expected keyword and a score at least `0.5`. Do not make Eval infer these fields from an untyped event list.
 
-Equivalence is decided by the gate, not by the command. Write `equivalence_result.json` with `baseline_output` and `adapter_output` as the **paths** of the two recorded output files (the original inference output and the adapter's `sample_output.json`), never the transcript text itself. The gate opens both, reads the adapter `io_contract` primary field out of each (falling back to the whole file when it is not JSON), compares them under `comparison_policy` (`normalized_whitespace` by default, or `exact`), and records what it read as `comparison_evidence`. An exit code alone never proves equivalence: a `/bin/true` command once carried this gate to passed while neither file was opened.
+The adapter image always bakes `/opt/sure_trans/mcp_smoke.py` (copied by `scaffold_adapter.py`). All MCP protocol verification runs that deterministic driver: it spawns `server.py`, drives `initialize` / `tools/list` / `tools/call` / `shutdown` over stdin with bounded deadlines, and writes `mcp_smoke.json` evidence. KWS runs it with `--fixture-gt-jsonl <fixture>/gt.jsonl --tool kws_predict`; the driver calls every bounded row, passes `keywords` and `threshold`, and proves both a positive detection and a negative rejection. Evidence records portable fixture-relative names and SHA256 values rather than host audio paths; finalization also projects run/model/repository roots out of `mcp_result.json`. Never write ad-hoc MCP test scripts, and never start the server bare without driving requests — a bare server waits on stdin forever. The MCP stdout channel must stay a pure JSON-RPC stream: the generated `server.py` redirects model-library stdout to stderr during `tools/call`, and `mcp_smoke.py` skips stray non-JSON stdout lines while reading responses (recording them as `stdout_junk_*` evidence) — model loading progress prints must never corrupt the protocol.
+
+Equivalence is decided by the gate, not by the command. Write `equivalence_result.json` with `baseline_output` and `adapter_output` as the **paths** of the two recorded output files (the original inference output and the adapter's `sample_output.json`), never the transcript text itself. The gate opens both, reads the adapter `io_contract` primary field out of each (falling back to the whole file when it is not JSON), compares them under `comparison_policy` (`normalized_whitespace` by default, or `exact`), and records what it read as `comparison_evidence`. KWS files must use `{rows: [{key, result: {detected, keyword, score}}]}`; the gate aligns every key and compares all three summary fields, using only a small numeric tolerance for scores. An exit code alone never proves equivalence: a `/bin/true` command once carried this gate to passed while neither file was opened.
 
 ## Image Packaging
 
@@ -222,6 +230,8 @@ GPU-touching work never runs `docker run --gpus all` on the login node. Gates su
   --log-dir <run_dir>/artifacts/vc_logs/post_pull_smoke \
   --produces <run_dir>/artifacts/vc_logs/post_pull_smoke.json
 ```
+
+For KWS, replace the smoke command's `--audio ...` with `--fixture-gt-jsonl /fixture/kws/gt.jsonl --tool kws_predict`. A single KWS audio cannot satisfy the positive/negative gate.
 
 - `vc submit` takes `repo:tag` only: it answers `镜像不存在` to every `repo@sha256:...` reference, however well that digest pulls with docker. Submit the tag and pass `--expect-digest`; `vc_exec.py` pulls the tag, reads back the manifest digest the registry serves for it, and refuses to submit when it is not the pinned one. It records `image_ref` and `resolved_digest`, which is what the registry gate checks against `target_image_digest`. Copy both into `docker_registry_result.json` under `post_pull_smoke`. Never hand a digest-pinned reference to `vc submit`, and never write `resolved_digest` by hand.
 - Defaults: 1 GPU, 32 GiB, 8 CPUs, 1800 s poll timeout. `vc_memory_gb` and `vc_gpus` from the slash command override the memory/GPU defaults; the partition defaults to `<vc_default_partition>`.
@@ -281,7 +291,7 @@ Write a successful `verdict.json`, then run:
 
 This seals the already-staged model payload, adapter, and small evidence under `sure/models/<model_name>/`. The sealed bundle matches the `/sure_onboard` product layout: wrapper set plus `Dockerfile.sure` at the bundle root, `fixture/<task>/` with `gt.jsonl`, and `artifacts/` carrying `package_gate.json` (`sure.onboard.package_gate.v2`), `artifact_manifest.json` (`sure.onboard.artifact_manifest.v1`), `runtime_inventory.json`, `verdict.json`, `docker_registry_result.json`, and `deployment_ready.json` (`sure.onboard.deployment_ready.v1`, written identically to the run directory). Ready bundles declare `integrity_profile=manifest-complete-v1` and `weights_integrity=bundled`; the deployment hashes cover every required wrapper, fixture, evidence file, generated sample output, and staged payload file. The terminal gate re-verifies the payload manifest, terminal timeline, hashes, bundle identity, portable paths, Dockerfile hash, and digest-pinned execution policy.
 
-The generated `validate.py` keeps the same CLI contract as `/sure_onboard`: `--stage import|load|infer|contract|all`, writing `<stage>_result.json` and, during infer, `sample_output.json` into `SURE_VALIDATE_ARTIFACTS_DIR`, then validating that sample against the filled `io_contract` in the contract stage — from the same directory. For `tts` and `vc`, the generated audio that `sample_output.audio_path` points at must be written below `$SURE_VALIDATE_ARTIFACTS_DIR/outputs`, because finalization only promotes generated audio from there into the bundle. The adapter image embeds the locked Harness Runtime; `runtime_inventory.harness_runtime.required=true`, so `/sure_eval` uses the image binding and does not mount the repository Harness Runtime into the model container.
+The generated `validate.py` keeps the same CLI contract as `/sure_onboard`: `--stage import|load|infer|contract|all`, writing `<stage>_result.json` and, during infer, `sample_output.json` into `SURE_VALIDATE_ARTIFACTS_DIR`, then validating that sample against the filled `io_contract` in the contract stage — from the same directory. KWS inference evaluates every fixture row and writes `{rows: [{key, result}...]}`; the contract stage rejects missing/duplicate keys, malformed types, wrong polarity, wrong keyword, or a fixture without both polarities. For `tts` and `vc`, the generated audio that `sample_output.audio_path` points at must be written below `$SURE_VALIDATE_ARTIFACTS_DIR/outputs`, because finalization only promotes generated audio from there into the bundle. The adapter image embeds the locked Harness Runtime; `runtime_inventory.harness_runtime.required=true`, so `/sure_eval` uses the image binding and does not mount the repository Harness Runtime into the model container.
 
 After completion, run evaluation locally or through VC without changing the model protocol:
 
@@ -322,6 +332,7 @@ what you recorded.
 - Block when original inference cannot load the supplied model.
 - Block when the primary computation framework is not PyTorch.
 - Block when the adapter reloads a large model for every sample without explicit acceptance.
+- Block KWS when the fixture lacks unique keyed positive and negative samples, or when any result omits/mistypes `detected`, `keyword`, or `score`.
 - Block when MCP output differs from original inference on the fixture: the equivalence gate compares the two recorded output files itself and fails on a mismatch even when the command exited 0.
 - Block when the MCP gate has no `mcp_smoke.json` protocol evidence (initialize/tools/list/tools/call all passed with a non-empty task primary output; a `*_path` output must name a file the smoke can stat); placeholder `run_command` values such as `/bin/true` or `print(...)` are rejected.
 - Block when registry push, digest resolution, exact pull, or post-pull MCP validation fails.

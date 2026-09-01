@@ -4,12 +4,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import shutil
+import wave
 from pathlib import Path
+from typing import Any
 
 
 AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 ANNOTATION_FIELDS = ("ground_truth", "target_text", "text", "segments", "label", "intent")
+KWS_OPERATING_THRESHOLD = 0.5
 
 
 def read_object(path: Path) -> dict:
@@ -27,14 +31,29 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def choose_fixture(resolved: dict) -> Path:
+def choose_fixture(resolved: dict, task: str) -> Path:
     explicit = resolved.get("fixture_path")
     if explicit:
         path = Path(str(explicit))
-        if path.is_file():
+        if task == "kws" and (path.is_dir() or (path.is_file() and path.name == "gt.jsonl")):
             return path
-        raise ValueError(f"fixture must be a file: {path}")
+        if task != "kws" and path.is_file():
+            return path
+        expected = "a directory or gt.jsonl" if task == "kws" else "a file"
+        raise ValueError(f"fixture must be {expected}: {path}")
     build_context = Path(str(resolved["build_context"]))
+    if task == "kws":
+        kws_candidates = [
+            build_context / "examples" / "kws" / "gt.jsonl",
+            build_context / "fixture" / "kws" / "gt.jsonl",
+            build_context / "fixtures" / "kws" / "gt.jsonl",
+        ]
+        matches = [candidate for candidate in kws_candidates if candidate.is_file()]
+        if len(matches) == 1:
+            return matches[0]
+        raise ValueError(
+            "KWS fixture could not be selected unambiguously; pass fixture=/absolute/path/to/gt.jsonl"
+        )
     preferred = [
         build_context / "examples" / "smoke.wav",
         build_context / "examples" / "smoke.flac",
@@ -56,6 +75,248 @@ def has_annotation_value(value: object) -> bool:
     if isinstance(value, list):
         return bool(value)
     return value is not None
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid JSON in {path}:{line_number}: {error}") from error
+        if not isinstance(row, dict):
+            raise ValueError(f"KWS fixture row must be an object: {path}:{line_number}")
+        rows.append(row)
+    return rows
+
+
+def kws_expected_detected(row: dict[str, Any], *, key: str) -> bool:
+    positive = {"detect", "detected", "positive", "true", "1", "yes"}
+    negative = {"reject", "rejected", "negative", "false", "0", "no"}
+    values: list[bool] = []
+    for field in ("expected", "label", "expected_detected"):
+        if field not in row:
+            continue
+        value = row[field]
+        if isinstance(value, bool):
+            values.append(value)
+            continue
+        normalized = str(value).strip().lower()
+        if normalized in positive:
+            values.append(True)
+        elif normalized in negative:
+            values.append(False)
+        else:
+            raise ValueError(f"KWS fixture {key} has unsupported {field}: {value!r}")
+    if not values:
+        raise ValueError(
+            f"KWS fixture {key} must declare expected, label, or expected_detected explicitly"
+        )
+    if len(set(values)) != 1:
+        raise ValueError(f"KWS fixture {key} has conflicting positive/negative annotations")
+    return values[0]
+
+
+def kws_keywords(value: Any, *, key: str) -> list[str]:
+    if isinstance(value, str):
+        keywords = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        keywords = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if len(keywords) != len(value):
+            raise ValueError(f"KWS fixture {key} keywords must contain non-empty strings")
+    else:
+        keywords = []
+    if not keywords:
+        raise ValueError(f"KWS fixture {key} requires at least one keyword")
+    return keywords
+
+
+def normalized_keyword(value: str) -> str:
+    return "".join(value.upper().split())
+
+
+def wav_duration(path: Path) -> float | None:
+    if path.suffix.lower() != ".wav":
+        return None
+    try:
+        with wave.open(str(path), "rb") as handle:
+            frame_rate = handle.getframerate()
+            return handle.getnframes() / frame_rate if frame_rate > 0 else None
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
+def kws_duration(row: dict[str, Any], audio_path: Path, *, key: str) -> float:
+    value = row.get("duration", row.get("duration_sec"))
+    if value is None:
+        value = wav_duration(audio_path)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise ValueError(
+            f"KWS fixture {key} requires a positive finite duration or a readable WAV header"
+        )
+    return float(value)
+
+
+def fixture_tree_identity(staged_dir: Path, relative_files: list[Path]) -> str:
+    hashes = {
+        relative.as_posix(): sha256(staged_dir / relative)
+        for relative in sorted(relative_files, key=lambda item: item.as_posix())
+    }
+    return hashlib.sha256(
+        json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def prepare_kws_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str, Any]:
+    source_dir = (source.parent if source.is_file() else source).resolve()
+    source_gt = source if source.is_file() else source_dir / "gt.jsonl"
+    if source_gt.name != "gt.jsonl" or not source_gt.is_file():
+        raise ValueError(f"KWS fixture must contain gt.jsonl: {source_dir}")
+    rows = read_jsonl(source_gt)
+    if not 2 <= len(rows) <= 5:
+        raise ValueError("KWS smoke fixture must contain 2 to 5 bounded samples")
+
+    staged_dir = run_dir / "fixture" / "kws"
+    clear_directory(staged_dir, run_dir / "fixture")
+    seen_keys: set[str] = set()
+    polarities: set[bool] = set()
+    staged_rows: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    relative_files: list[Path] = []
+
+    for index, row in enumerate(rows, 1):
+        raw_audio = row.get("audio") or row.get("wav")
+        if not isinstance(raw_audio, str) or not raw_audio.strip():
+            raise ValueError(f"KWS fixture row {index} requires a non-empty audio or wav field")
+        relative_audio = Path(raw_audio)
+        if relative_audio.is_absolute() or ".." in relative_audio.parts:
+            raise ValueError(f"KWS fixture audio path must stay inside the fixture directory: {raw_audio}")
+        raw_audio_source = source_dir / relative_audio
+        current = source_dir
+        has_symlink = False
+        for part in relative_audio.parts:
+            current = current / part
+            if current.is_symlink():
+                has_symlink = True
+                break
+        audio_source = raw_audio_source.resolve()
+        if (
+            not audio_source.is_relative_to(source_dir)
+            or not audio_source.is_file()
+            or has_symlink
+            or audio_source.suffix.lower() not in AUDIO_SUFFIXES
+        ):
+            raise ValueError(f"KWS fixture audio is missing or unsafe: {raw_audio}")
+        key = str(row.get("key") or "").strip()
+        if not key:
+            raise ValueError(f"KWS fixture row {index} requires a non-empty key")
+        if key in seen_keys:
+            raise ValueError(f"KWS fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        expected_detected = kws_expected_detected(row, key=key)
+        polarities.add(expected_detected)
+        keywords = kws_keywords(row.get("keywords"), key=key)
+        expected_keyword_value = row.get("expected_keyword")
+        if expected_keyword_value is None and expected_detected:
+            expected_keyword_value = row.get("text", row.get("txt"))
+        if expected_detected:
+            if not isinstance(expected_keyword_value, str) or not expected_keyword_value.strip():
+                raise ValueError(f"positive KWS fixture {key} requires expected_keyword or text")
+            expected_keyword = expected_keyword_value.strip()
+            if normalized_keyword(expected_keyword) not in {
+                normalized_keyword(keyword) for keyword in keywords
+            }:
+                raise ValueError(f"positive KWS fixture {key} expected keyword is not in keywords")
+        else:
+            if expected_keyword_value not in (None, ""):
+                raise ValueError(f"negative KWS fixture {key} must not declare expected_keyword")
+            expected_keyword = None
+        duration = kws_duration(row, audio_source, key=key)
+        if "threshold" in row and (
+            isinstance(row["threshold"], bool)
+            or not isinstance(row["threshold"], (int, float))
+            or not math.isfinite(float(row["threshold"]))
+            or float(row["threshold"]) != KWS_OPERATING_THRESHOLD
+        ):
+            raise ValueError(f"KWS fixture {key} threshold must equal {KWS_OPERATING_THRESHOLD}")
+
+        destination = staged_dir / relative_audio
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            raise ValueError(f"KWS fixture destination must not be a symlink: {destination}")
+        shutil.copy2(audio_source, destination)
+        relative_files.append(relative_audio)
+        staged_row = {
+            **row,
+            "key": key,
+            "audio": relative_audio.as_posix(),
+            "expected_detected": expected_detected,
+            "expected_keyword": expected_keyword,
+            "duration": duration,
+        }
+        staged_rows.append(staged_row)
+        annotation_fields = [
+            field
+            for field in ("expected", "label", "expected_detected", "text", "txt")
+            if field in staged_row and has_annotation_value(staged_row[field])
+        ]
+        samples.append(
+            {
+                "key": key,
+                "audio": relative_audio.as_posix(),
+                "audio_path": str(destination),
+                "annotation_fields": annotation_fields,
+                "expected_detected": expected_detected,
+                "expected_keyword": expected_keyword,
+                "keywords": row.get("keywords"),
+                "duration": duration,
+                "sha256": sha256(destination),
+                "size_bytes": destination.stat().st_size,
+            }
+        )
+
+    if polarities != {False, True}:
+        raise ValueError("KWS smoke fixture must contain at least one positive and one negative sample")
+
+    gt_jsonl = staged_dir / "gt.jsonl"
+    with gt_jsonl.open("w", encoding="utf-8") as handle:
+        for row in staged_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    relative_files.append(Path("gt.jsonl"))
+    total_bytes = sum((staged_dir / relative).stat().st_size for relative in relative_files)
+    return {
+        "schema": "sure.trans.fixture_manifest.v1",
+        "status": "ready",
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(run_dir),
+        "task_type": "kws",
+        "source_dir": str(source_dir),
+        "staged_dir": str(staged_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": samples,
+        "source_path": str(source_dir),
+        "staged_path": str(staged_dir),
+        "sha256": fixture_tree_identity(staged_dir, relative_files),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": total_bytes,
+        "sample_count": len(samples),
+        "link_policy": "copy",
+        "annotation_source": {
+            "type": "fixture_gt_jsonl",
+            "source_path": str(source_gt.resolve()),
+            "staged_path": str(gt_jsonl),
+            "fallback": False,
+        },
+    }
 
 
 def clear_directory(path: Path, controlled_root: Path) -> None:
@@ -82,8 +343,14 @@ def main() -> int:
     run_dir = Path(args.run_dir).resolve()
     artifacts = run_dir / "artifacts"
     resolved = read_object(artifacts / "trans_input_resolved.json")
-    source = choose_fixture(resolved).resolve()
     task = str(resolved["task_type"]).replace("-", "_").lower()
+    source = choose_fixture(resolved, task).resolve()
+    if task == "kws":
+        payload = prepare_kws_fixture(resolved, source, run_dir)
+        output = artifacts / "fixture_manifest.json"
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(output)
+        return 0
     staged_dir = run_dir / "fixture" / task
     clear_directory(staged_dir, run_dir / "fixture")
     destination = staged_dir / source.name

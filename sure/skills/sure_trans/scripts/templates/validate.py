@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -41,6 +42,7 @@ _IO_CONTRACT_JSON = r'''__IO_CONTRACT_JSON__'''
 IO_CONTRACT: dict[str, Any] = (
     {} if _IO_CONTRACT_JSON.startswith("__") else json.loads(_IO_CONTRACT_JSON)
 )
+KWS_OPERATING_THRESHOLD = 0.5
 
 
 def now_iso() -> str:
@@ -140,6 +142,123 @@ def first_fixture_payload() -> dict[str, Any]:
     )
 
 
+def kws_fixture_rows() -> list[tuple[Path, dict[str, Any]]]:
+    rows: list[tuple[Path, dict[str, Any]]] = []
+    for gt_path in sorted((MODEL_DIR / "fixture" / "kws").glob("**/gt.jsonl")):
+        for line_number, line in enumerate(gt_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"{gt_path}:{line_number} must be a JSON object")
+            rows.append((gt_path, row))
+    if not 2 <= len(rows) <= 5:
+        raise ValueError("KWS validation requires 2 to 5 positive/negative fixture rows")
+    return rows
+
+
+def kws_fixture_payload(gt_path: Path, row: dict[str, Any]) -> dict[str, Any]:
+    audio = row.get("audio") or row.get("wav")
+    if not isinstance(audio, str) or not audio:
+        raise ValueError("KWS fixture row requires a non-empty audio or wav field")
+    payload: dict[str, Any] = {"audio_path": str((gt_path.parent / audio).resolve())}
+    keywords = row.get("keywords")
+    if isinstance(keywords, (str, list)):
+        payload["keywords"] = keywords
+    threshold = row.get("threshold")
+    if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+        if not math.isfinite(float(threshold)) or float(threshold) != KWS_OPERATING_THRESHOLD:
+            raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
+        payload["threshold"] = threshold
+    elif threshold is not None:
+        raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
+    return payload
+
+
+def normalized_keyword(value: str) -> str:
+    return "".join(value.upper().split())
+
+
+def validate_kws_result(result: Any, reference: dict[str, Any]) -> list[str]:
+    if not isinstance(result, dict):
+        return ["result must be an object"]
+    violations: list[str] = []
+    for field in ("detected", "keyword", "score"):
+        if field not in result:
+            violations.append(f"missing required field: {field}")
+    detected = result.get("detected")
+    keyword = result.get("keyword")
+    score = result.get("score")
+    if not isinstance(detected, bool):
+        violations.append("detected must be a boolean")
+    if keyword is not None and (not isinstance(keyword, str) or not keyword.strip()):
+        violations.append("keyword must be a non-empty string or null")
+    if score is not None and (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(float(score))
+    ):
+        violations.append("score must be a finite number or null")
+    elif isinstance(score, (int, float)) and not isinstance(score, bool) and not 0 <= float(score) <= 1:
+        violations.append("score must be within [0, 1]")
+    if detected is True:
+        if not isinstance(keyword, str) or not keyword.strip():
+            violations.append("detected=true requires a keyword")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+            violations.append("detected=true requires a finite numeric score")
+        elif float(score) < KWS_OPERATING_THRESHOLD:
+            violations.append(f"detected=true requires score >= {KWS_OPERATING_THRESHOLD}")
+    elif detected is False and keyword is not None:
+        violations.append("detected=false requires keyword=null")
+    elif (
+        detected is False
+        and isinstance(score, (int, float))
+        and not isinstance(score, bool)
+        and math.isfinite(float(score))
+        and float(score) >= KWS_OPERATING_THRESHOLD
+    ):
+        violations.append(f"detected=false requires score < {KWS_OPERATING_THRESHOLD}")
+
+    expected_detected = reference.get("expected_detected")
+    if not isinstance(expected_detected, bool):
+        violations.append("fixture expected_detected must be a boolean")
+    elif isinstance(detected, bool) and detected is not expected_detected:
+        violations.append(
+            f"detection disagrees with fixture: expected {expected_detected}, got {detected}"
+        )
+    expected_keyword = reference.get("expected_keyword")
+    if expected_detected is True and isinstance(keyword, str):
+        if not isinstance(expected_keyword, str) or (
+            normalized_keyword(keyword) != normalized_keyword(expected_keyword)
+        ):
+            violations.append(
+                f"keyword disagrees with fixture: expected {expected_keyword!r}, got {keyword!r}"
+            )
+    return violations
+
+
+def run_kws_fixture(wrapper: Any) -> dict[str, Any]:
+    output_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    polarities: set[bool] = set()
+    for gt_path, reference in kws_fixture_rows():
+        key = str(reference.get("key") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"KWS fixture key is missing or duplicated: {key!r}")
+        seen.add(key)
+        expected_detected = reference.get("expected_detected")
+        if isinstance(expected_detected, bool):
+            polarities.add(expected_detected)
+        result = run_predict(wrapper, kws_fixture_payload(gt_path, reference), scalar_fallback=False)
+        violations = validate_kws_result(result, reference)
+        if violations:
+            raise AssertionError(f"KWS sample {key}: {'; '.join(violations)}")
+        output_rows.append({"key": key, "result": result})
+    if polarities != {False, True}:
+        raise ValueError("KWS validation requires at least one positive and one negative fixture")
+    return {"rows": output_rows}
+
+
 def to_plain(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return to_plain(value.to_dict())
@@ -154,13 +273,20 @@ def to_plain(value: Any) -> Any:
     return {"type": type(value).__name__, "repr": repr(value)[:500]}
 
 
-def run_predict(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def run_predict(
+    wrapper: Any,
+    payload: dict[str, Any],
+    *,
+    scalar_fallback: bool = True,
+) -> dict[str, Any]:
     predict = getattr(wrapper, "predict", None)
     if predict is None:
         raise AttributeError("Wrapper has no 'predict' method.")
     try:
         result = predict(payload)
     except TypeError:
+        if not scalar_fallback:
+            raise
         if "audio_path" in payload:
             result = predict(payload["audio_path"])
         elif "text" in payload:
@@ -214,6 +340,47 @@ def validate_contract(sample: dict[str, Any], contract: dict[str, Any]) -> list[
     return violations
 
 
+def validate_kws_output_document(sample: dict[str, Any], contract: dict[str, Any]) -> list[str]:
+    output_rows = sample.get("rows")
+    if not isinstance(output_rows, list):
+        return ["KWS sample_output.json must be an object with a rows array"]
+    references: dict[str, dict[str, Any]] = {}
+    for _, reference in kws_fixture_rows():
+        key = str(reference.get("key") or "")
+        if not key or key in references:
+            return [f"KWS fixture key is missing or duplicated: {key!r}"]
+        references[key] = reference
+    predictions: dict[str, dict[str, Any]] = {}
+    violations: list[str] = []
+    for index, output in enumerate(output_rows):
+        if not isinstance(output, dict):
+            violations.append(f"rows[{index}] must be an object")
+            continue
+        key = str(output.get("key") or "")
+        if not key:
+            violations.append(f"rows[{index}] requires a non-empty key")
+            continue
+        if key in predictions:
+            violations.append(f"duplicate KWS output key: {key}")
+            continue
+        result = output.get("result")
+        if not isinstance(result, dict):
+            violations.append(f"KWS output {key} result must be an object")
+            continue
+        predictions[key] = result
+    missing = sorted(set(references) - set(predictions))
+    extra = sorted(set(predictions) - set(references))
+    if missing:
+        violations.append(f"missing KWS output keys: {', '.join(missing)}")
+    if extra:
+        violations.append(f"unexpected KWS output keys: {', '.join(extra)}")
+    for key in sorted(set(references) & set(predictions)):
+        result_violations = validate_contract(predictions[key], contract)
+        result_violations.extend(validate_kws_result(predictions[key], references[key]))
+        violations.extend(f"KWS output {key}: {violation}" for violation in result_violations)
+    return violations
+
+
 def stage_import() -> bool:
     started = time.time()
     try:
@@ -244,8 +411,11 @@ def stage_infer() -> bool:
     started = time.time()
     try:
         wrapper = load_wrapper()
-        payload = first_fixture_payload()
-        sample = run_predict(wrapper, payload)
+        if TASK_TYPE.lower().replace("-", "_") == "kws":
+            sample = run_kws_fixture(wrapper)
+        else:
+            payload = first_fixture_payload()
+            sample = run_predict(wrapper, payload)
         if not sample:
             raise AssertionError("prediction output is empty")
         write_json(SAMPLE_OUTPUT, sample)
@@ -281,7 +451,10 @@ def stage_contract() -> bool:
         if not isinstance(sample, dict):
             raise ValueError("sample_output.json must be an object")
         contract = load_io_contract()
-        violations = validate_contract(sample, contract)
+        if TASK_TYPE.lower().replace("-", "_") == "kws":
+            violations = validate_kws_output_document(sample, contract)
+        else:
+            violations = validate_contract(sample, contract)
         if violations:
             raise AssertionError("; ".join(violations))
     except Exception as exc:  # noqa: BLE001

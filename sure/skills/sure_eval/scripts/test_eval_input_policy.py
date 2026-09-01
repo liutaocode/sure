@@ -44,6 +44,34 @@ class DatasetInputPolicyTests(unittest.TestCase):
         self.assertIn("sure_reval", message)
 
 
+class TaskCompatibilityPolicyTests(unittest.TestCase):
+    def test_kws_model_rejects_asr_dataset(self) -> None:
+        with self.assertRaisesRegex(resolve_eval_input.EvalInputError, "Task mismatch"):
+            resolve_eval_input._check_task_compatibility(
+                {"name": "kws-model", "declared_task": "KWS"},
+                [{"name": "asr-dataset", "task": "ASR"}],
+            )
+
+    def test_asr_model_rejects_kws_dataset(self) -> None:
+        with self.assertRaisesRegex(resolve_eval_input.EvalInputError, "Task mismatch"):
+            resolve_eval_input._check_task_compatibility(
+                {"name": "asr-model", "declared_task": "ASR"},
+                [{"name": "kws-dataset", "task": "KWS"}],
+            )
+
+    def test_kws_model_accepts_kws_dataset(self) -> None:
+        resolve_eval_input._check_task_compatibility(
+            {"name": "kws-model", "declared_task": "KWS"},
+            [{"name": "kws-dataset", "task": "KWS"}],
+        )
+
+    def test_other_non_synthesis_tasks_keep_existing_compatibility(self) -> None:
+        resolve_eval_input._check_task_compatibility(
+            {"name": "asr-model", "declared_task": "ASR"},
+            [{"name": "ser-dataset", "task": "SER"}],
+        )
+
+
 class RunIdPolicyTests(unittest.TestCase):
     def test_safe_single_segment_passes(self) -> None:
         self.assertEqual(

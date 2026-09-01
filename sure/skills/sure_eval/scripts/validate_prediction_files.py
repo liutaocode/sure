@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,9 @@ from sure_eval.datasets import DatasetManager
 configure_logging(level="INFO")
 logger = get_logger(__name__)
 REPO_ROOT = Path(__file__).resolve().parent.parent
+KWS_POSITIVE_LABELS = {"detect", "detected", "positive", "true", "1", "yes"}
+KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
+KWS_OPERATING_THRESHOLD = 0.5
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -105,11 +109,37 @@ def _resolve_audio_path(value: Any, base_dir: Path | None) -> Path:
     return path
 
 
+def _kws_reference_contract_violation(sample: dict[str, Any]) -> bool:
+    labels: list[bool] = []
+    for field in ("expected", "label", "expected_detected"):
+        if field not in sample:
+            continue
+        value = sample[field]
+        if isinstance(value, bool):
+            labels.append(value)
+        elif isinstance(value, int) and value in {0, 1}:
+            labels.append(bool(value))
+        elif isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in KWS_POSITIVE_LABELS:
+                labels.append(True)
+            elif normalized in KWS_NEGATIVE_LABELS:
+                labels.append(False)
+            else:
+                return True
+        else:
+            return True
+    if labels:
+        return any(label != labels[0] for label in labels[1:])
+    return not any(str(sample.get(field) or "").strip() for field in ("text", "txt"))
+
+
 def _task_contract_violations(
     samples: list[dict[str, Any]],
     structured: dict[str, dict[str, Any]],
     *,
     base_dir: Path | None = None,
+    kws_require_score: bool = False,
 ) -> list[str]:
     violations: list[str] = []
     sample_by_key = {str(sample.get("key", "")): sample for sample in samples}
@@ -130,8 +160,47 @@ def _task_contract_violations(
             violations.append(key)
         elif task in {"SD", "SA-ASR"} and not (prediction.get("segments") or prediction.get("annotation") or normalized):
             violations.append(key)
-        elif task == "KWS" and not (prediction.get("score") is not None or prediction.get("events") or normalized):
-            violations.append(key)
+        elif task == "KWS":
+            if _kws_reference_contract_violation(sample) or not {
+                "detected",
+                "keyword",
+                "score",
+            }.issubset(prediction):
+                violations.append(key)
+                continue
+            detected = prediction["detected"]
+            keyword = prediction["keyword"]
+            score = prediction["score"]
+            events = prediction.get("events")
+            if (
+                not isinstance(detected, bool)
+                or (keyword is not None and not isinstance(keyword, str))
+                or (
+                    score is not None
+                    and (
+                        isinstance(score, bool)
+                        or not isinstance(score, (int, float))
+                        or not math.isfinite(float(score))
+                    )
+                )
+                or ("events" in prediction and not isinstance(events, list))
+                or (detected and (not isinstance(keyword, str) or not keyword.strip()))
+                or (detected and score is None)
+                or (not detected and keyword is not None)
+                or (score is not None and not 0.0 <= float(score) <= 1.0)
+                or (
+                    detected
+                    and score is not None
+                    and float(score) < KWS_OPERATING_THRESHOLD
+                )
+                or (
+                    not detected
+                    and score is not None
+                    and float(score) >= KWS_OPERATING_THRESHOLD
+                )
+                or (kws_require_score and score is None)
+            ):
+                violations.append(key)
     return sorted(set(violations))
 
 
@@ -154,6 +223,7 @@ def validate_prediction_file(
     prediction_path: Path,
     require_nonempty: bool,
     max_samples: int = 0,
+    kws_require_score: bool = False,
 ) -> dict[str, Any]:
     canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
     jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
@@ -179,7 +249,12 @@ def validate_prediction_file(
     structured_missing_keys = sorted(expected_key_set - structured_key_set) if structured_path.exists() else []
     structured_extra_keys = sorted(structured_key_set - expected_key_set) if structured_path.exists() else []
     contract_violation_keys = (
-        _task_contract_violations(samples, structured_predictions, base_dir=structured_path.parent)
+        _task_contract_violations(
+            samples,
+            structured_predictions,
+            base_dir=structured_path.parent,
+            kws_require_score=kws_require_score,
+        )
         if structured_path.exists()
         else []
     )

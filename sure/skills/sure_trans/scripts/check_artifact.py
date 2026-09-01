@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,8 @@ from vc_exec import default_partition
 
 LEGACY_PATH = re.compile(r"/(?:mnt/cloudstorfs|hpc_stor\d+|hpc_\d+)/")
 ANNOTATION_FIELDS = ("ground_truth", "target_text", "text", "segments", "label", "intent")
+KWS_ANNOTATION_FIELDS = ("expected", "label", "expected_detected", "text", "txt")
+KWS_OPERATING_THRESHOLD = 0.5
 TRANS_RESERVED_ROOTS = {
     "model.py",
     "server.py",
@@ -65,6 +68,161 @@ def has_annotation_value(value: object) -> bool:
     return value is not None
 
 
+def normalized_keyword(value: str) -> str:
+    return "".join(value.upper().split())
+
+
+def kws_keywords(value: object, key: str) -> list[str]:
+    if isinstance(value, str):
+        keywords = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        keywords = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        require(len(keywords) == len(value), f"KWS fixture {key} keywords must be non-empty strings")
+    else:
+        keywords = []
+    require(bool(keywords), f"KWS fixture {key} requires at least one keyword")
+    return keywords
+
+
+def fixture_tree_identity(staged_dir: Path, relative_files: set[Path]) -> str:
+    hashes = {
+        relative.as_posix(): sha256_file(staged_dir / relative)
+        for relative in sorted(relative_files, key=lambda item: item.as_posix())
+    }
+    return hashlib.sha256(
+        json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_kws_fixture_manifest(
+    value: dict,
+    *,
+    model_dir: Path,
+    staged_dir: Path,
+    gt_jsonl: Path,
+) -> None:
+    require(staged_dir.is_relative_to(model_dir / "fixture"), "fixture staged_dir must stay under model_dir/fixture")
+    require(Path(str(value.get("staged_path") or "")).resolve() == staged_dir, "KWS staged_path must equal staged_dir")
+    require(gt_jsonl.is_file() and gt_jsonl.parent == staged_dir, "KWS gt_jsonl must exist directly inside staged_dir")
+    require(value.get("gt_sha256") == sha256_file(gt_jsonl), "KWS fixture ground-truth checksum changed")
+    require(value.get("expected_sha256") == sha256_file(gt_jsonl), "KWS reference checksum changed")
+
+    rows: list[dict] = []
+    for line_number, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"KWS fixture gt_jsonl line {line_number} is invalid JSON: {error}") from error
+        require(isinstance(row, dict), f"KWS fixture gt_jsonl line {line_number} must be an object")
+        rows.append(row)
+    require(2 <= len(rows) <= 5, "KWS smoke fixture must contain 2 to 5 samples")
+    samples = value.get("samples")
+    require(isinstance(samples, list) and len(samples) == len(rows), "KWS samples must mirror gt_jsonl rows")
+    require(value.get("sample_count") == len(rows), "KWS sample_count must match gt_jsonl")
+
+    seen_keys: set[str] = set()
+    polarities: set[bool] = set()
+    relative_files = {Path("gt.jsonl")}
+    for index, (row, sample) in enumerate(zip(rows, samples)):
+        require(isinstance(sample, dict), f"KWS fixture sample {index} must be an object")
+        key = row.get("key")
+        require(isinstance(key, str) and bool(key.strip()), f"KWS fixture row {index} requires a non-empty key")
+        require(key not in seen_keys, f"KWS fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        require(sample.get("key") == key, f"KWS fixture sample {key} does not mirror gt_jsonl key")
+        audio = row.get("audio") or row.get("wav")
+        require(isinstance(audio, str) and bool(audio.strip()), f"KWS fixture {key} requires audio or wav")
+        relative_audio = Path(audio)
+        require(
+            not relative_audio.is_absolute() and ".." not in relative_audio.parts,
+            f"KWS fixture {key} audio path must be relative and contained",
+        )
+        audio_path = staged_dir / relative_audio
+        require(
+            audio_path.is_file() and not audio_path.is_symlink() and audio_path.resolve().is_relative_to(staged_dir),
+            f"KWS fixture {key} audio is missing or unsafe",
+        )
+        require(sample.get("audio") == relative_audio.as_posix(), f"KWS fixture sample {key} audio path changed")
+        require(
+            Path(str(sample.get("audio_path") or "")).resolve() == audio_path.resolve(),
+            f"KWS fixture sample {key} audio_path changed",
+        )
+        require(sample.get("sha256") == sha256_file(audio_path), f"KWS fixture sample {key} checksum changed")
+        require(sample.get("size_bytes") == audio_path.stat().st_size, f"KWS fixture sample {key} size changed")
+        relative_files.add(relative_audio)
+
+        expected_detected = row.get("expected_detected")
+        require(isinstance(expected_detected, bool), f"KWS fixture {key} requires boolean expected_detected")
+        require(sample.get("expected_detected") is expected_detected, f"KWS sample {key} polarity changed")
+        polarities.add(expected_detected)
+        keywords = kws_keywords(row.get("keywords"), key)
+        require(sample.get("keywords") == row.get("keywords"), f"KWS sample {key} keywords changed")
+        expected_keyword = row.get("expected_keyword")
+        if expected_detected:
+            require(
+                isinstance(expected_keyword, str) and bool(expected_keyword.strip()),
+                f"positive KWS fixture {key} requires expected_keyword",
+            )
+            require(
+                normalized_keyword(expected_keyword) in {normalized_keyword(keyword) for keyword in keywords},
+                f"positive KWS fixture {key} expected_keyword is not in keywords",
+            )
+            require(sample.get("expected_keyword") == expected_keyword, f"KWS sample {key} expected_keyword changed")
+        else:
+            require(expected_keyword is None, f"negative KWS fixture {key} must have null expected_keyword")
+            require(sample.get("expected_keyword") is None, f"negative KWS sample {key} expected_keyword changed")
+        duration = row.get("duration")
+        require(
+            not isinstance(duration, bool)
+            and isinstance(duration, (int, float))
+            and math.isfinite(float(duration))
+            and float(duration) > 0,
+            f"KWS fixture {key} duration must be positive and finite",
+        )
+        require(sample.get("duration") == duration, f"KWS sample {key} duration changed")
+        if "threshold" in row:
+            threshold = row["threshold"]
+            require(
+                not isinstance(threshold, bool)
+                and isinstance(threshold, (int, float))
+                and math.isfinite(float(threshold))
+                and float(threshold) == KWS_OPERATING_THRESHOLD,
+                f"KWS fixture {key} threshold must equal {KWS_OPERATING_THRESHOLD}",
+            )
+        declared_annotations = sample.get("annotation_fields")
+        actual_annotations = [
+            field for field in KWS_ANNOTATION_FIELDS if field in row and has_annotation_value(row[field])
+        ]
+        require(actual_annotations, f"KWS fixture {key} has no explicit reference annotation")
+        require(declared_annotations == actual_annotations, f"KWS sample {key} annotation_fields changed")
+
+    require(polarities == {False, True}, "KWS smoke fixture must contain positive and negative samples")
+    actual_files: set[Path] = set()
+    for path in staged_dir.rglob("*"):
+        require(not path.is_symlink(), f"KWS fixture tree must not contain symlinks: {path}")
+        if path.is_file():
+            actual_files.add(path.relative_to(staged_dir))
+    require(actual_files == relative_files, "KWS fixture tree must contain only gt.jsonl and referenced audio")
+    require(value.get("sha256") == fixture_tree_identity(staged_dir, relative_files), "KWS fixture tree checksum changed")
+    require(
+        value.get("size_bytes") == sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "KWS fixture tree size changed",
+    )
+    annotation_source = value.get("annotation_source")
+    require(isinstance(annotation_source, dict), "KWS fixture annotation_source must be an object")
+    require(
+        annotation_source.get("type") == "fixture_gt_jsonl"
+        and annotation_source.get("fallback") is False,
+        "KWS ground truth must come from fixture gt.jsonl",
+    )
+    require(
+        Path(str(annotation_source.get("staged_path") or "")).resolve() == gt_jsonl,
+        "KWS annotation_source staged_path must match gt_jsonl",
+    )
+
+
 def validate_fixture_manifest(value: dict) -> None:
     require(value.get("status") == "ready", "fixture manifest is not ready")
     for key in ("model_dir", "staged_dir", "gt_jsonl", "samples", "annotation_source"):
@@ -73,8 +231,17 @@ def validate_fixture_manifest(value: dict) -> None:
     staged_dir = Path(str(value["staged_dir"])).resolve()
     staged = Path(str(value.get("staged_path", ""))).resolve()
     gt_jsonl = Path(str(value["gt_jsonl"])).resolve()
+    task = str(value.get("task_type") or "").replace("-", "_").lower()
     require(model_dir.is_dir(), "fixture model_dir is missing")
     require(staged_dir.is_dir(), "fixture staged_dir is missing")
+    if task == "kws":
+        validate_kws_fixture_manifest(
+            value,
+            model_dir=model_dir,
+            staged_dir=staged_dir,
+            gt_jsonl=gt_jsonl,
+        )
+        return
     require(staged_dir.is_relative_to(model_dir / "fixture"), "fixture staged_dir must stay under model_dir/fixture")
     require(staged.is_file(), "staged fixture is missing")
     require(staged.parent == staged_dir, "staged fixture must be directly inside staged_dir")
@@ -97,7 +264,6 @@ def validate_fixture_manifest(value: dict) -> None:
     except json.JSONDecodeError as error:
         raise ValueError(f"fixture gt_jsonl is invalid JSON: {error}") from error
     require(isinstance(row, dict), "fixture gt_jsonl row must be an object")
-    task = str(value.get("task_type") or "").replace("-", "_").lower()
     audio_field = "reference_audio" if task in {"tts", "vc"} else "audio"
     require(row.get(audio_field) == staged.name, f"fixture gt_jsonl {audio_field} must mirror staged_path")
     declared_annotations = sample.get("annotation_fields")
@@ -306,6 +472,34 @@ def main() -> int:
                 or bool((protocol.get("tools_call") or {}).get("text_nonempty")),
                 "post-pull MCP smoke must return a non-empty primary output from tools/call",
             )
+            if protocol.get("tool") == "kws_predict":
+                call = protocol.get("tools_call") if isinstance(protocol.get("tools_call"), dict) else {}
+                samples = call.get("samples")
+                require(
+                    isinstance(samples, list) and 2 <= len(samples) <= 5,
+                    "post-pull KWS MCP smoke must cover 2 to 5 samples",
+                )
+                keys: set[str] = set()
+                polarities: set[bool] = set()
+                for sample in samples:
+                    require(
+                        isinstance(sample, dict) and sample.get("ok") is True,
+                        "every post-pull KWS MCP smoke sample must pass",
+                    )
+                    key = str(sample.get("key") or "")
+                    result = sample.get("result")
+                    require(
+                        bool(key) and key not in keys and isinstance(result, dict),
+                        "post-pull KWS MCP smoke samples require unique keys and results",
+                    )
+                    keys.add(key)
+                    detected = result.get("detected")
+                    require(isinstance(detected, bool), "post-pull KWS detected must be boolean")
+                    polarities.add(detected)
+                require(
+                    polarities == {False, True},
+                    "post-pull KWS MCP smoke must prove positive and negative behavior",
+                )
     elif kind == "model_payload":
         require(value.get("status") == "ready", "model payload was not staged")
         require(Path(str(value.get("destination", ""))).is_dir(), "staged model directory is missing")
@@ -422,6 +616,22 @@ def main() -> int:
             and config["server"].get("command") == server_command,
             "adapter config server.command must match adapter manifest",
         )
+        resolved_input_path = run_dir / "artifacts" / "trans_input_resolved.json"
+        resolved_input = read_object(resolved_input_path) if resolved_input_path.is_file() else {}
+        if str(resolved_input.get("task_type") or "").lower() == "kws":
+            contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
+            require(
+                contract.get("output_type") == "keyword_detection"
+                and contract.get("primary_field") == "detected"
+                and contract.get("required_fields") == ["detected", "keyword", "score"]
+                and contract.get("nonempty_fields") == ["detected"],
+                "KWS adapter io_contract must require detected/keyword/score with detected as primary",
+            )
+            tools = config.get("tools") if isinstance(config.get("tools"), list) else []
+            require(
+                any(isinstance(tool, dict) and tool.get("name") == "kws_predict" for tool in tools),
+                "KWS adapter config must expose kws_predict",
+            )
         require(
             "COPY --from=sure_harness_runtime" in dockerfile_text,
             "adapter Dockerfile must copy the locked Harness Runtime with the sure_harness_runtime build context",
@@ -609,7 +819,13 @@ def main() -> int:
             )
         portable = [
             read_object(model_dir / "artifacts" / name)
-            for name in ("runtime_inventory.json", "package_gate.json", "artifact_manifest.json", "deployment_ready.json")
+            for name in (
+                "runtime_inventory.json",
+                "package_gate.json",
+                "artifact_manifest.json",
+                "deployment_ready.json",
+                "mcp_result.json",
+            )
         ]
         require(
             not LEGACY_PATH.search(json.dumps(portable, ensure_ascii=False)),
