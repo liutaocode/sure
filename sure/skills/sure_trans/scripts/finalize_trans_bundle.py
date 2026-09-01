@@ -65,7 +65,7 @@ TERMINAL_FILES = (
     "artifact_manifest.json",
     "deployment_ready.json",
 )
-HOST_SHARED_PATH = re.compile(r"/(?:mnt/cloudstorfs|hpc_stor\d+|hpc_\d+)/")
+HOST_SHARED_PATH = re.compile(r"/(?:mnt/cloudstorfs|hpc_stor\d+|hpc_\d+|shared-storage)/")
 KWS_OPERATING_THRESHOLD = 0.5
 
 

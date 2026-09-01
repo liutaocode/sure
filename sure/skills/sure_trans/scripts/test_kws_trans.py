@@ -442,7 +442,7 @@ class KwsTransTests(unittest.TestCase):
             self.assertIn("/opt/sure_trans/server.py", projected_text)
 
             source.write_text(
-                json.dumps({"status": "passed", "log_path": "/hpc_stor99/private/log.txt"}),
+                json.dumps({"status": "passed", "log_path": "/shared-storage/private/log.txt"}),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "shared-storage"):
