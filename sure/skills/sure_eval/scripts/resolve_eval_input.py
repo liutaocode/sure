@@ -59,6 +59,7 @@ TEXT_DEFAULT_METRICS = {
     "SD": "der",
     "SA-ASR": "cpwer",
     "KWS": "accuracy",
+    "SE": "si-sdr",
     "SER": "accuracy",
     "GR": "accuracy",
     "SLU": "accuracy",
@@ -205,9 +206,11 @@ def _check_task_compatibility(model: dict[str, Any], datasets: list[dict[str, An
     mismatched = []
     for item in datasets:
         task = _normalize_task(item.get("task"))
-        kws_mismatch = (model_task == "KWS" or task == "KWS") and task != model_task
+        exact_task_mismatch = (
+            model_task in {"KWS", "SE"} or task in {"KWS", "SE"}
+        ) and task != model_task
         synth_mismatch = (task in SYNTH_TASKS) != model_synth
-        if task and task != "UNKNOWN" and (kws_mismatch or synth_mismatch):
+        if task and task != "UNKNOWN" and (exact_task_mismatch or synth_mismatch):
             mismatched.append(f"dataset '{item.get('name')}' has task {_task_label(task)}")
     if not mismatched:
         return
@@ -638,6 +641,8 @@ def _fallback_default_metrics(task: str, language: str) -> list[str]:
 
 def _default_metrics(task: str, language: str, engine_root: Path | None) -> list[str]:
     task_upper = task.upper()
+    if task_upper == "SE":
+        return ["si-sdr"]
     if engine_root is not None:
         try:
             if task_upper in {"TTS", "VC"}:

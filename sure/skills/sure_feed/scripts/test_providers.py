@@ -13,7 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sure_feed.providers.huggingface as hf_module  # noqa: E402
 import sure_feed.providers.base as base_module  # noqa: E402
 from sure_feed.fixture_registry import select_fixture_for_task  # noqa: E402
-from sure_feed.providers.base import ProviderNetworkError, ProviderRequest, infer_task, synthesize_model_input, to_yaml  # noqa: E402
+from sure_feed.providers.base import (  # noqa: E402
+    ProviderNetworkError,
+    ProviderRequest,
+    canonical_task,
+    infer_task,
+    synthesize_model_input,
+    to_yaml,
+)
 from sure_feed.providers.huggingface import HuggingFaceProvider  # noqa: E402
 from sure_feed_online_discover import parse_model_url  # noqa: E402
 
@@ -270,6 +277,174 @@ pip install sherpa-onnx
         self.assertEqual(io_contract["required_fields"], ["detected", "keyword", "score"])
         self.assertEqual(io_contract["nonempty_fields"], ["detected"])
         self.assertIn("io_contract", {item.get("model_input_field") for item in evidence})
+
+    def test_se_aliases_and_audio_to_audio_narrowing_require_explicit_semantics(self) -> None:
+        for alias in (
+            "se",
+            "speech_enhancement",
+            "speech-enhancement",
+            "acoustic-noise-suppression",
+        ):
+            with self.subTest(alias=alias):
+                self.assertEqual(canonical_task(alias), "se")
+
+        candidate = {
+            "source": "huggingface",
+            "model_id": "example/denoise",
+            "pipeline_tag": "audio-to-audio",
+            "tasks": ["audio-to-audio"],
+            "tags": ["speech-enhancement"],
+            "model_card_text": "Speech enhancement and acoustic noise suppression model.",
+        }
+        matched, task_type, score, evidence, match_source = infer_task(candidate, "auto")
+        self.assertTrue(matched)
+        self.assertEqual(task_type, "se")
+        self.assertEqual(match_source, "research_narrowing")
+        self.assertGreaterEqual(score, 0.9)
+        self.assertIn("task_narrowing.final_task", {item.get("field") for item in evidence})
+
+        generic = {
+            "source": "huggingface",
+            "model_id": "example/audio-transform",
+            "pipeline_tag": "audio-to-audio",
+            "tasks": ["audio-to-audio"],
+        }
+        generic_matched, generic_task, *_ = infer_task(generic, "auto")
+        self.assertFalse(generic_matched)
+        self.assertEqual(generic_task, "auto")
+
+        asr_with_denoising = {
+            "source": "huggingface",
+            "model_id": "example/asr-denoise",
+            "pipeline_tag": "automatic-speech-recognition",
+            "tasks": ["audio-to-audio"],
+            "model_card_text": "ASR transcription with front-end noise suppression.",
+        }
+        asr_matched, asr_task, *_ = infer_task(asr_with_denoising, "auto")
+        self.assertTrue(asr_matched)
+        self.assertEqual(asr_task, "asr")
+
+    def test_fixture_registry_preserves_paired_se_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture_dir = root / "fixtures" / "tasks" / "se" / "smoke"
+            fixture_dir.mkdir(parents=True)
+            (fixture_dir.parent / "README.md").write_text("# SE\n", encoding="utf-8")
+            (fixture_dir / "noisy.wav").write_bytes(b"noisy")
+            (fixture_dir / "clean.wav").write_bytes(b"clean")
+            (fixture_dir / "gt.jsonl").write_text(
+                json.dumps(
+                    {
+                        "key": "sample",
+                        "audio": "noisy.wav",
+                        "reference_audio": "clean.wav",
+                        "task": "SE",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            fixture, io_contract, issues, evidence = select_fixture_for_task(
+                "speech-enhancement", repo_root=root
+            )
+
+            self.assertEqual(issues, [])
+            self.assertIsNotNone(fixture)
+            assert fixture is not None
+            self.assertTrue(fixture["audio"].endswith("noisy.wav"))
+            self.assertTrue(fixture["reference_audio"].endswith("clean.wav"))
+            self.assertEqual(fixture["samples"][0]["reference_audio"], fixture["reference_audio"])
+            self.assertEqual(io_contract["input_type"], "audio_path")
+            self.assertEqual(io_contract["output_type"], "audio")
+            self.assertEqual(io_contract["primary_field"], "audio_path")
+            self.assertIn("fixture", {item.get("model_input_field") for item in evidence})
+
+            (fixture_dir / "gt.jsonl").write_text(
+                json.dumps({"key": "sample", "audio": "noisy.wav", "task": "SE"}) + "\n",
+                encoding="utf-8",
+            )
+            missing_fixture, _, missing_issues, _ = select_fixture_for_task(
+                "se", repo_root=root
+            )
+            self.assertIsNone(missing_fixture)
+            self.assertEqual(missing_issues, ["missing:fixture.se.reference_audio"])
+
+    def test_repository_se_fixture_is_discoverable(self) -> None:
+        fixture, io_contract, issues, _ = select_fixture_for_task(
+            "se",
+            {"description": "speech enhancement and noise suppression"},
+        )
+        self.assertEqual(issues, [])
+        self.assertIsNotNone(fixture)
+        assert fixture is not None
+        self.assertTrue(fixture["audio"].endswith("fleurs_noise_smoke/noisy.wav"))
+        self.assertTrue(
+            fixture["reference_audio"].endswith("fleurs_noise_smoke/clean.wav")
+        )
+        self.assertEqual(io_contract["output_type"], "audio")
+
+    def test_synthesizes_complete_se_model_input_from_explicit_model_card(self) -> None:
+        readme = """# Speech enhancement
+
+CPU speech denoising and acoustic noise suppression are supported.
+
+```bash
+pip install sample-enhancer
+```
+```python
+from sample_enhancer import Enhancer
+import soundfile as sf
+
+model = Enhancer.from_pretrained("example/enhancer")
+enhanced = model.enhance(audio_path="noisy.wav")
+sf.write("output.wav", enhanced, 16000)
+```
+"""
+        model_input, weak_fields, evidence = synthesize_model_input(
+            {
+                "source": "huggingface",
+                "model_id": "example/enhancer",
+                "repo": "https://huggingface.co/example/enhancer",
+                "commit": "abc123",
+                "weights_source": "huggingface",
+                "library_name": "sample_enhancer",
+                "pipeline_tag": "audio-to-audio",
+                "tags": ["speech-enhancement", "noise-suppression"],
+                "model_card_url": "https://huggingface.co/example/enhancer/blob/main/README.md",
+                "model_card_text": readme,
+            },
+            "speech_enhancement",
+        )
+
+        self.assertEqual(weak_fields, [])
+        self.assertEqual(model_input["task_type"], "se")
+        self.assertEqual(model_input["fixture"]["audio"].split("/")[-1], "noisy.wav")
+        self.assertEqual(
+            model_input["fixture"]["reference_audio"].split("/")[-1],
+            "clean.wav",
+        )
+        self.assertEqual(
+            model_input["io_contract"],
+            {
+                "input_type": "audio_path",
+                "output_type": "audio",
+                "primary_field": "audio_path",
+                "required_fields": ["audio_path"],
+                "nonempty_fields": ["audio_path"],
+                "json_serializable": True,
+            },
+        )
+        covered = {item.get("model_input_field") for item in evidence}
+        self.assertTrue(
+            {
+                "entrypoints.import_test",
+                "entrypoints.load_test",
+                "entrypoints.infer_test",
+                "fixture",
+                "io_contract",
+            }.issubset(covered)
+        )
 
     def test_fixture_registry_rejects_conflicting_and_unknown_kws_polarities(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

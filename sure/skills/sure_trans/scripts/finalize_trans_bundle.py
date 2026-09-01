@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -280,11 +281,140 @@ def stage_kws_fixture(
     validate_fixture_manifest(finalized_manifest)
 
 
+def stage_se_fixture(
+    run_dir: Path,
+    model_dir: Path,
+    resolved: dict,
+    fixture_manifest: dict,
+) -> None:
+    samples = fixture_manifest.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("SE fixture manifest must declare samples")
+    declared_staged_dir = Path(str(fixture_manifest["staged_dir"])).resolve()
+    source_candidates = (run_dir / "fixture" / "se", declared_staged_dir)
+    staged_dir = next(
+        (candidate.resolve() for candidate in source_candidates if (candidate / "gt.jsonl").is_file()),
+        None,
+    )
+    if staged_dir is None:
+        raise ValueError("prepared SE fixture source is missing")
+    source_samples: list[dict] = []
+    relative_files = {Path("gt.jsonl")}
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("SE fixture samples must be objects")
+        relative_noisy = Path(str(sample.get("noisy_audio") or ""))
+        relative_clean = Path(str(sample.get("reference_audio") or ""))
+        for role, relative in (("noisy_audio", relative_noisy), ("reference_audio", relative_clean)):
+            if not str(relative) or relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"SE fixture {role} path must be portable: {relative}")
+            relative_files.add(relative)
+        noisy_path = staged_dir / relative_noisy
+        clean_path = staged_dir / relative_clean
+        source_samples.append(
+            {
+                **sample,
+                "audio": relative_noisy.as_posix(),
+                "audio_path": str(noisy_path),
+                "noisy_audio": relative_noisy.as_posix(),
+                "noisy_audio_path": str(noisy_path),
+                "reference_audio": relative_clean.as_posix(),
+                "reference_audio_path": str(clean_path),
+                "sha256": sha256(noisy_path),
+                "reference_sha256": sha256(clean_path),
+                "size_bytes": noisy_path.stat().st_size,
+                "reference_size_bytes": clean_path.stat().st_size,
+            }
+        )
+    annotation_source = fixture_manifest.get("annotation_source")
+    if not isinstance(annotation_source, dict):
+        raise ValueError("SE fixture manifest is missing annotation_source")
+    source_manifest = {
+        **fixture_manifest,
+        "model_dir": str(run_dir if staged_dir.is_relative_to(run_dir) else model_dir),
+        "staged_dir": str(staged_dir),
+        "staged_path": str(staged_dir),
+        "gt_jsonl": str(staged_dir / "gt.jsonl"),
+        "samples": source_samples,
+        "sha256": fixture_tree_identity(staged_dir, relative_files),
+        "gt_sha256": sha256(staged_dir / "gt.jsonl"),
+        "expected_sha256": sha256(staged_dir / "gt.jsonl"),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(source_samples),
+        "annotation_source": {
+            **annotation_source,
+            "staged_path": str(staged_dir / "gt.jsonl"),
+        },
+    }
+    validate_fixture_manifest(source_manifest)
+
+    fixture_dir = model_dir / "fixture" / "se"
+    clear_directory(fixture_dir, model_dir / "fixture")
+    for source in sorted(staged_dir.rglob("*")):
+        if source.is_symlink():
+            raise ValueError(f"SE fixture tree must not contain symlinks: {source}")
+        relative = source.relative_to(staged_dir)
+        destination = fixture_dir / relative
+        if source.is_dir():
+            ensure_safe_bundle_parent(model_dir, destination / ".fixture-placeholder")
+            continue
+        if not source.is_file():
+            raise ValueError(f"SE fixture tree contains an unsupported entry: {source}")
+        ensure_safe_bundle_parent(model_dir, destination)
+        shutil.copy2(source, destination)
+
+    finalized_samples: list[dict] = []
+    for sample in source_samples:
+        noisy_path = fixture_dir / str(sample["noisy_audio"])
+        clean_path = fixture_dir / str(sample["reference_audio"])
+        finalized_samples.append(
+            {
+                **sample,
+                "audio_path": str(noisy_path),
+                "noisy_audio_path": str(noisy_path),
+                "reference_audio_path": str(clean_path),
+                "sha256": sha256(noisy_path),
+                "reference_sha256": sha256(clean_path),
+                "size_bytes": noisy_path.stat().st_size,
+                "reference_size_bytes": clean_path.stat().st_size,
+            }
+        )
+    finalized_manifest = {
+        **fixture_manifest,
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(model_dir),
+        "task_type": "se",
+        "staged_dir": str(fixture_dir),
+        "staged_path": str(fixture_dir),
+        "gt_jsonl": str(fixture_dir / "gt.jsonl"),
+        "samples": finalized_samples,
+        "sha256": fixture_tree_identity(fixture_dir, relative_files),
+        "gt_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "expected_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "size_bytes": sum((fixture_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(finalized_samples),
+        "annotation_source": {
+            **annotation_source,
+            "staged_path": str(fixture_dir / "gt.jsonl"),
+            "bundled_path": str(fixture_dir / "gt.jsonl"),
+        },
+    }
+    write_identical(
+        run_dir / "artifacts" / "fixture_manifest.json",
+        json_bytes(finalized_manifest),
+    )
+    validate_fixture_manifest(finalized_manifest)
+
+
 def stage_fixture(run_dir: Path, model_dir: Path, resolved: dict) -> None:
     fixture_manifest = read_object(run_dir / "artifacts" / "fixture_manifest.json")
     task = str(resolved.get("task_type") or "asr").lower()
     if task == "kws":
         stage_kws_fixture(run_dir, model_dir, resolved, fixture_manifest)
+        return
+    if task == "se":
+        stage_se_fixture(run_dir, model_dir, resolved, fixture_manifest)
         return
     annotation_source_value = fixture_manifest.get("annotation_source")
     if not isinstance(annotation_source_value, dict):
@@ -478,7 +608,92 @@ def validate_kws_sample_output(sample: dict, contract: dict, fixture_manifest: d
             raise ValueError(f"KWS sample_output keyword disagrees with fixture for {key}")
 
 
-def promote_generated_audio(artifacts: Path, raw_path: str) -> str:
+def validate_se_sample_output(sample: dict, contract: dict, fixture_manifest: dict) -> None:
+    rows = sample.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("SE sample_output.json must be an object with a rows array")
+    fixture_samples = fixture_manifest.get("samples")
+    if not isinstance(fixture_samples, list):
+        raise ValueError("SE fixture manifest has no samples")
+    references = {
+        str(item.get("key") or ""): item
+        for item in fixture_samples
+        if isinstance(item, dict) and item.get("key")
+    }
+    if len(references) != len(fixture_samples):
+        raise ValueError("SE fixture manifest keys must be non-empty and unique")
+    outputs: dict[str, dict] = {}
+    required = contract.get("required_fields") if isinstance(contract.get("required_fields"), list) else []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"SE sample_output rows[{index}] must be an object")
+        key = str(row.get("key") or row.get("sample_id") or "")
+        if not key or key in outputs:
+            raise ValueError(f"SE sample_output key is missing or duplicated: {key!r}")
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"SE sample_output result for {key} must be an object")
+        for field in required:
+            if isinstance(field, str) and field not in result:
+                raise ValueError(f"SE sample_output result for {key} is missing {field}")
+        audio_path = result.get("audio_path")
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            raise ValueError(f"SE sample_output result for {key} requires audio_path")
+        outputs[key] = result
+    missing = sorted(set(references) - set(outputs))
+    extra = sorted(set(outputs) - set(references))
+    if missing or extra:
+        raise ValueError(f"SE sample_output key mismatch: missing={missing}, extra={extra}")
+
+
+def se_fixture_input_paths(fixture_manifest: dict) -> tuple[Path, ...]:
+    samples = fixture_manifest.get("samples")
+    if not isinstance(samples, list):
+        raise ValueError("SE fixture manifest has no samples")
+    inputs: list[Path] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("SE fixture samples must be objects")
+        for field in ("noisy_audio_path", "reference_audio_path"):
+            path = Path(str(sample.get(field) or ""))
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"SE fixture {field} is missing or unsafe")
+            inputs.append(path.resolve())
+        if inputs[-2].samefile(inputs[-1]):
+            raise ValueError("SE noisy and clean fixture audio must be independent files")
+    return tuple(inputs)
+
+
+def validate_se_pcm_wav(path: Path, *, label: str) -> None:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"{label} must be a real non-empty file")
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                raise ValueError(f"{label} must be a non-empty PCM WAV")
+    except (EOFError, OSError, wave.Error) as error:
+        raise ValueError(f"{label} must be a readable PCM WAV: {error}") from error
+
+
+def expected_se_validation_output(artifacts: Path, key: str, index: int) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return artifacts / "adapter_validation" / "outputs" / f"{index:02d}-{digest}.wav"
+
+
+def promote_generated_audio(
+    artifacts: Path,
+    raw_path: str,
+    *,
+    expected_source: Path | None = None,
+    require_pcm_wav: bool = False,
+    forbidden_inputs: tuple[Path, ...] = (),
+) -> str:
     declared = Path(raw_path)
     candidates: list[Path] = []
     if declared.is_absolute():
@@ -500,6 +715,20 @@ def promote_generated_audio(artifacts: Path, raw_path: str) -> str:
     artifact_outputs = (artifacts / "outputs").resolve()
     if not source.is_relative_to(validation_outputs) and not source.is_relative_to(artifact_outputs):
         raise ValueError("generated audio must stay below artifacts/adapter_validation/outputs")
+    if expected_source is not None and (
+        source_candidate.absolute() != expected_source.absolute()
+        or source != expected_source.resolve()
+    ):
+        raise ValueError("generated audio must equal the harness-assigned output_path")
+    if require_pcm_wav:
+        validate_se_pcm_wav(source, label="SE generated audio")
+    for input_path in forbidden_inputs:
+        try:
+            aliases_input = source.samefile(input_path)
+        except OSError:
+            aliases_input = False
+        if aliases_input:
+            raise ValueError("SE generated audio must not alias noisy or clean input audio")
     relative = source.relative_to(validation_outputs if source.is_relative_to(validation_outputs) else artifact_outputs)
     destination = artifact_outputs / relative
     ensure_safe_bundle_parent(artifacts, destination)
@@ -529,6 +758,22 @@ def promote_sample_output(run_dir: Path) -> None:
             contract,
             read_object(artifacts / "fixture_manifest.json"),
         )
+        write_identical(artifacts / "sample_output.json", json_bytes(sample))
+        return
+    fixture_manifest = read_object(artifacts / "fixture_manifest.json")
+    if fixture_manifest.get("task_type") == "se":
+        validate_se_sample_output(sample, contract, fixture_manifest)
+        forbidden_inputs = se_fixture_input_paths(fixture_manifest)
+        for index, row in enumerate(sample["rows"], 1):
+            result = row["result"]
+            key = str(row.get("key") or row.get("sample_id") or "")
+            result["audio_path"] = promote_generated_audio(
+                artifacts,
+                result["audio_path"],
+                expected_source=expected_se_validation_output(artifacts, key, index),
+                require_pcm_wav=True,
+                forbidden_inputs=forbidden_inputs,
+            )
         write_identical(artifacts / "sample_output.json", json_bytes(sample))
         return
     required = contract.get("required_fields") if isinstance(contract.get("required_fields"), list) else []
@@ -636,6 +881,15 @@ def stage_artifacts(run_dir: Path, model_dir: Path) -> dict[str, str]:
         unsafe = next((path for path in outputs.rglob("*") if path.is_symlink()), None)
         if unsafe is not None:
             raise ValueError(f"generated outputs must not contain symlinks: {unsafe}")
+        if str(resolved.get("task_type") or "").lower().replace("-", "_") == "se":
+            fixture_manifest = read_object(artifacts / "fixture_manifest.json")
+            forbidden_inputs = se_fixture_input_paths(fixture_manifest)
+            for output in sorted(path for path in outputs.rglob("*") if path.is_file()):
+                if not output.resolve().is_relative_to(outputs.resolve()):
+                    raise ValueError(f"SE generated output escapes its controlled root: {output}")
+                validate_se_pcm_wav(output, label="SE generated output")
+                if any(output.samefile(input_path) for input_path in forbidden_inputs):
+                    raise ValueError("SE generated output must not alias noisy or clean input audio")
         destination = model_artifacts / "outputs"
         if destination.is_symlink():
             raise ValueError(f"model artifact outputs directory must not be a symlink: {destination}")

@@ -61,8 +61,13 @@ def canonical_task(task: str) -> str:
         "text-to-speech": "tts",
         "speech-synthesis": "tts",
         "voice-conversion": "vc",
+        "audio-to-audio": "vc",
         "keyword-spotting": "kws",
         "wake-word": "kws",
+        "speech-enhancement": "se",
+        "speech enhancement": "se",
+        "acoustic-noise-suppression": "se",
+        "acoustic noise suppression": "se",
         "emotion-recognition": "ser",
         "speech-emotion-recognition": "ser",
         "speaker-diarization": "sd",
@@ -106,6 +111,17 @@ TASK_KEYWORDS: dict[str, tuple[str, ...]] = {
     "tts": ("tts", "text-to-speech", "text to speech", "speech synthesis"),
     "vc": ("voice conversion", "voice-conversion", "timbre conversion", "speech conversion"),
     "kws": ("kws", "keyword spotting", "wake word", "wake-word"),
+    "se": (
+        "speech enhancement",
+        "speech-enhancement",
+        "speech_enhancement",
+        "acoustic noise suppression",
+        "acoustic-noise-suppression",
+        "noise suppression",
+        "noise-suppression",
+        "speech denoising",
+        "speech-denoising",
+    ),
 }
 
 
@@ -118,7 +134,7 @@ PIPELINE_TO_TASK = {
     "audio-to-audio": "vc",
 }
 
-BROAD_PIPELINE_TASKS = {"speech_understanding"}
+BROAD_PIPELINE_TASKS = {"speech_understanding", "audio_to_audio"}
 
 COMMON_IMPORT_PREFIXES = (
     "from dataclasses",
@@ -244,12 +260,29 @@ def _narrow_task_from_research(
     has_transcription = _contains_any(combined, transcription_terms)
     has_diarization = _contains_any(combined, diarization_terms)
     has_speaker_attribution = _contains_any(combined, speaker_attributed_terms)
+    enhancement_terms = TASK_KEYWORDS["se"]
+    voice_conversion_terms = TASK_KEYWORDS["vc"]
+    has_enhancement = _contains_any(combined, enhancement_terms)
+    has_voice_conversion = _contains_any(combined, voice_conversion_terms)
 
     ev: list[dict[str, Any]] = []
     if broad_task in BROAD_PIPELINE_TASKS:
         pipeline_tag = str(candidate.get("pipeline_tag") or "")
         ev.append(evidence(source, "pipeline_tag", pipeline_tag, "strong", url))
         ev.append(evidence(source, "task_narrowing.broad_task", broad_task, "strong", url))
+
+    if broad_task == "audio_to_audio":
+        if has_transcription and target in {"auto", "asr"}:
+            ev.append(evidence(source, "task_narrowing.final_task", "asr", "strong", url))
+            return "asr", 0.96, ev, "research_narrowing"
+        if has_enhancement and (target == "se" or (target == "auto" and not has_voice_conversion)):
+            ev.append(evidence(source, "task_narrowing.final_task", "se", "strong", url))
+            return "se", 0.96, ev, "research_narrowing"
+        if has_voice_conversion and (target == "vc" or (target == "auto" and not has_enhancement)):
+            ev.append(evidence(source, "task_narrowing.final_task", "vc", "strong", url))
+            return "vc", 0.96, ev, "research_narrowing"
+        ev.append(evidence(source, "task_narrowing.no_narrower_task", True, "medium", url))
+        return None, 0.0, ev, None
 
     if has_transcription and (has_diarization or has_speaker_attribution):
         if target in {"auto", "sa_asr", "speech_understanding"}:
@@ -292,6 +325,23 @@ def infer_task(candidate: dict[str, Any], requested_task: str) -> tuple[bool, st
 
     pipeline_tag = str(candidate.get("pipeline_tag") or "")
     pipeline_task = PIPELINE_TO_TASK.get(pipeline_tag)
+    task_values = [str(value) for value in candidate.get("tasks") or []]
+    has_broad_audio_tag = pipeline_tag == "audio-to-audio" or any(
+        value.strip().lower().replace("_", "-") == "audio-to-audio"
+        for value in task_values
+    )
+    if has_broad_audio_tag:
+        narrowed, score, narrowing_ev, match_source = _narrow_task_from_research(
+            candidate,
+            "audio_to_audio",
+            target,
+            source,
+            url,
+        )
+        if narrowed:
+            return True, narrowed, score, narrowing_ev, match_source or "research_narrowing"
+        if target == "auto" and pipeline_tag in {"", "audio-to-audio"}:
+            return False, "auto", 0.0, narrowing_ev, ""
     if pipeline_task in BROAD_PIPELINE_TASKS:
         narrowed, score, narrowing_ev, match_source = _narrow_task_from_research(candidate, pipeline_task, target, source, url)
         if narrowed:
@@ -369,6 +419,18 @@ def task_defaults(task: str) -> dict[str, Any]:
                 "'fixtures/tasks/vc/seed_vc_zh_smoke/zh/ZH_B00001_S00000_W000000.mp3', "
                 "'fixtures/tasks/vc/seed_vc_zh_smoke/zh/ZH_B00000_S00000_W000002.mp3')"
             ),
+        }
+    if normalized == "se":
+        return {
+            "io_contract": {
+                "input_type": "audio_path",
+                "output_type": "audio",
+                "primary_field": "audio_path",
+                "required_fields": ["audio_path"],
+                "nonempty_fields": ["audio_path"],
+                "json_serializable": True,
+            },
+            "infer_test": "model.enhance('fixtures/tasks/se/fleurs_noise_smoke/noisy.wav')",
         }
     return {
         "io_contract": {
@@ -569,7 +631,18 @@ def _derive_entrypoints(
     )
     infer_test = explicit_hints.get("infer_test") or _first_python_statement(
         blocks,
-        (".generate(", "generate_transcription(", ".synthesize(", ".transcribe(", "transcribe(", ".convert(", ".infer(", "pipeline("),
+        (
+            ".generate(",
+            "generate_transcription(",
+            ".synthesize(",
+            ".transcribe(",
+            "transcribe(",
+            ".convert(",
+            ".enhance(",
+            ".denoise(",
+            ".infer(",
+            "pipeline(",
+        ),
     )
     if infer_test and load_test and infer_test == load_test:
         infer_test = None
@@ -750,13 +823,15 @@ def _derive_fixture_and_contract(
     normalized_task = canonical_task(task_type)
     if normalized_task in {"sd", "sa_asr"}:
         io_contract = registry_contract
-    elif outputs_audio or normalized_task in {"tts", "vc"}:
+    elif outputs_audio or normalized_task in {"tts", "vc", "se"}:
         input_type = "text_with_reference_audio" if fixture.get("text") and fixture.get("reference_audio") else "text"
         if normalized_task == "vc":
             input_type = "audio_pair"
+        elif normalized_task == "se":
+            input_type = "audio_path"
         io_contract = {
             "input_type": input_type,
-            "output_type": "json",
+            "output_type": "audio" if normalized_task == "se" else "json",
             "primary_field": "audio_path",
             "required_fields": ["audio_path"],
             "nonempty_fields": ["audio_path"],

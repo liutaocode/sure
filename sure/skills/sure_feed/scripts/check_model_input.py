@@ -20,6 +20,7 @@ TASK_TYPES = {
     "s2tt",
     "sd",
     "ser",
+    "se",
     "tts",
     "vc",
     "kws",

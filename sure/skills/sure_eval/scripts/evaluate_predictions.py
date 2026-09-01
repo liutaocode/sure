@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import wave
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -368,6 +369,61 @@ def _sample_source_audio(sample: dict[str, Any]) -> str:
     )
 
 
+def _sample_noisy_audio(sample: dict[str, Any]) -> str:
+    return str(
+        sample.get("noisy_audio")
+        or sample.get("input_audio")
+        or sample.get("audio")
+        or sample.get("path")
+        or ""
+    )
+
+
+def _sample_clean_reference_audio(sample: dict[str, Any]) -> str:
+    return str(
+        sample.get("reference_audio")
+        or sample.get("clean_audio")
+        or sample.get("clean_audio_path")
+        or sample.get("target_audio")
+        or sample.get("target_audio_path")
+        or ""
+    )
+
+
+def _se_external_prediction_audio(value: Any, structured_prediction_path: Path) -> str:
+    root = (structured_prediction_path.parent / "audio").expanduser().absolute()
+    path = Path(str(value)).expanduser()
+    path = path.absolute() if path.is_absolute() else (structured_prediction_path.parent / path).absolute()
+    if root.is_symlink() or root.resolve() != root:
+        raise ValueError("SE prediction audio root must not traverse a symlink")
+    if path.resolve() != path:
+        raise ValueError(f"SE prediction audio must not traverse a symlink or parent component: {path}")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"SE prediction audio escapes the run-local audio root: {path}") from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"SE prediction audio must not traverse a symlink: {path}")
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"SE prediction audio file is missing or empty: {path}")
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                raise ValueError(f"SE prediction audio must be a readable non-empty PCM WAV: {path}")
+    except (EOFError, OSError, wave.Error) as exc:
+        raise ValueError(f"SE prediction audio must be a readable non-empty PCM WAV: {path}") from exc
+    return str(path)
+
+
 def _write_external_audio_samples_jsonl(
     *,
     task: str,
@@ -387,10 +443,18 @@ def _write_external_audio_samples_jsonl(
         if structured is None:
             raise ValueError(f"Missing structured prediction row for {task_upper} sample: {key}")
         prediction = structured.get("prediction") if isinstance(structured.get("prediction"), dict) else {}
-        audio_path = prediction.get("audio_path") or structured.get("normalized_prediction")
+        audio_path = (
+            prediction.get("audio_path")
+            or prediction.get("enhanced_audio")
+            or structured.get("normalized_prediction")
+        )
         if not audio_path:
             raise ValueError(f"Missing prediction audio_path for {task_upper} sample: {key}")
-        generated_audio = _resolve_existing_prediction_path(audio_path, structured_prediction_path.parent)
+        generated_audio = (
+            _se_external_prediction_audio(audio_path, structured_prediction_path)
+            if task_upper == "SE"
+            else _resolve_existing_prediction_path(audio_path, structured_prediction_path.parent)
+        )
         language = str(sample.get("language") or structured.get("language") or "en")
         if task_upper == "TTS":
             row = {
@@ -416,6 +480,37 @@ def _write_external_audio_samples_jsonl(
                 "metadata": {
                     "dataset": structured.get("dataset"),
                     "task": "VC",
+                    "source_key": key,
+                },
+            }
+        elif task_upper == "SE":
+            if Path(generated_audio).stat().st_size <= 0:
+                raise ValueError(f"SE prediction audio file is empty: {key}")
+            noisy_audio = _localize_sample_audio_path(
+                _sample_noisy_audio(sample), dataset_jsonl_path
+            )
+            if not noisy_audio or not Path(noisy_audio).is_file():
+                raise ValueError(f"SE sample {key} is missing noisy input audio")
+            clean_reference = _localize_sample_audio_path(
+                _sample_clean_reference_audio(sample), dataset_jsonl_path
+            )
+            if clean_reference and not Path(clean_reference).is_file():
+                raise ValueError(f"SE sample {key} clean reference audio does not exist")
+            if clean_reference and Path(clean_reference).samefile(noisy_audio):
+                raise ValueError(f"SE sample {key} noisy and clean reference audio must differ")
+            if Path(generated_audio).samefile(noisy_audio) or (
+                clean_reference and Path(generated_audio).samefile(clean_reference)
+            ):
+                raise ValueError(f"SE sample {key} enhanced audio must not alias an input audio file")
+            row = {
+                "sample_id": key,
+                "enhanced_audio": generated_audio,
+                "noisy_audio": noisy_audio,
+                "reference_audio": clean_reference,
+                "language": language or "n/a",
+                "metadata": {
+                    "dataset": structured.get("dataset"),
+                    "task": "SE",
                     "source_key": key,
                 },
             }
@@ -726,6 +821,17 @@ def _pipeline_audio_row_required_roles(pipeline: dict[str, Any]) -> set[str]:
     return {str(role) for role in run_args if role not in ignored}
 
 
+def _se_pipeline_requires_reference(pipeline: dict[str, Any]) -> bool:
+    metrics = pipeline.get("metrics") if isinstance(pipeline.get("metrics"), list) else []
+    candidates = [pipeline.get("metric"), pipeline.get("pipeline_id"), *metrics]
+    normalized = [str(value or "").lower().replace("_", "-") for value in candidates]
+    return any(
+        metric in {"si-sdr", "stoi", "pesq"}
+        or any(f".{name}." in metric for name in ("si-sdr", "stoi", "pesq"))
+        for metric in normalized
+    )
+
+
 def _run_external_pipeline(
     *,
     engine_root: Path,
@@ -981,6 +1087,8 @@ def evaluate_audio_prediction_file_external(
     requested_metric = metric_override or _metric_from_sota(
         sota_manager, canonical_name, fallback_names=_source_fallback_names(jsonl_path)
     )
+    if task == "SE" and not requested_metric and not pipeline_id_override:
+        requested_metric = "si-sdr"
     pipeline = _describe_external_pipeline(
         engine_root=engine_root,
         task=task,
@@ -1012,6 +1120,12 @@ def evaluate_audio_prediction_file_external(
     if run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    row_required_roles = _pipeline_audio_row_required_roles(pipeline)
+    if task == "SE":
+        row_required_roles.add("enhanced_audio")
+        row_required_roles.add("noisy_audio")
+        if _se_pipeline_requires_reference(pipeline):
+            row_required_roles.add("reference_audio")
     samples_jsonl = _write_external_audio_samples_jsonl(
         task=task,
         dataset_jsonl_path=jsonl_path,
@@ -1019,7 +1133,7 @@ def evaluate_audio_prediction_file_external(
         structured_predictions=structured_predictions,
         structured_prediction_path=structured_prediction_path,
         output_path=run_dir / "samples.jsonl",
-        required_roles=_pipeline_audio_row_required_roles(pipeline),
+        required_roles=row_required_roles,
     )
 
     external_payload = _run_external_pipeline(
@@ -1043,9 +1157,19 @@ def evaluate_audio_prediction_file_external(
     report = external_payload.get("report") or {}
     metric = str(summary.get("metric") or pipeline.get("metric") or requested_metric or "")
     score = summary.get("score", report.get("score", 0.0))
-    rps = sota_manager.calculate_rps(
-        canonical_name, score, fallback_names=_source_fallback_names(jsonl_path)
-    )
+    if task == "SE":
+        rps, rps_status = _calculate_se_rps(
+            sota_manager,
+            canonical_name,
+            metric,
+            score,
+            fallback_names=_source_fallback_names(jsonl_path),
+        )
+    else:
+        rps = sota_manager.calculate_rps(
+            canonical_name, score, fallback_names=_source_fallback_names(jsonl_path)
+        )
+        rps_status = None
 
     return {
         "dataset": canonical_name,
@@ -1057,6 +1181,7 @@ def evaluate_audio_prediction_file_external(
         "metric": metric,
         "score": score,
         "rps": rps,
+        "rps_status": rps_status,
         "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
         "num_samples": len(samples),
         "expected_samples": len(all_samples),
@@ -1490,6 +1615,32 @@ def _calculate_metric_rps(
     )
 
 
+def _calculate_se_rps(
+    sota_manager: SOTAManager,
+    dataset: str,
+    metric: str,
+    score: Any,
+    *,
+    fallback_names: tuple[str, ...] | list[str] = (),
+) -> tuple[float | None, dict[str, Any] | None]:
+    normalized_metric = str(metric).lower().replace("-", "_")
+    if normalized_metric in {"si_sdr", "sisdr"}:
+        return None, {
+            "status": "rps_undefined_for_db_metric",
+            "dataset": dataset,
+            "metric": "si_sdr",
+            "score": score,
+            "unit": "dB",
+        }
+    return _calculate_metric_rps(
+        sota_manager,
+        dataset,
+        metric,
+        score,
+        fallback_names=fallback_names,
+    )
+
+
 def _dataset_metric_row(result: dict[str, Any]) -> dict[str, Any]:
     report = _result_report(result)
     pipeline = _result_pipeline(result)
@@ -1558,6 +1709,8 @@ def _is_lower_better_metric(metric: str) -> bool:
 
 def _metric_unit(metric: str) -> str:
     metric_name = str(metric or "").lower()
+    if metric_name in {"si_sdr", "si-sdr", "sisdr"}:
+        return "dB"
     if _is_lower_better_metric(metric_name):
         return "fraction"
     if metric_name in {
@@ -2311,9 +2464,9 @@ def _write_sample_report(
     report_details = report.get("details") if isinstance(report.get("details"), dict) else {}
     report_rows = report_details.get("rows") if isinstance(report_details.get("rows"), list) else []
     metric_details_by_key = {
-        str(item.get("key", "")): item
+        str(item.get("key") or item.get("sample_id")): item
         for item in report_rows
-        if isinstance(item, dict) and item.get("key")
+        if isinstance(item, dict) and (item.get("key") or item.get("sample_id"))
     }
     with output_path.open("w", encoding="utf-8") as handle:
         for sample in samples:
@@ -2364,6 +2517,18 @@ def _write_sample_report(
                     dict(structured_prediction) if isinstance(structured_prediction, dict) else {}
                 )
                 row["reference"] = _kws_reference_fields(sample)
+                if key in metric_details_by_key:
+                    row["metric_details"] = metric_details_by_key[key]
+            elif task == "SE":
+                structured = (structured_predictions or {}).get(key, {})
+                structured_prediction = structured.get("prediction")
+                row["prediction"] = (
+                    dict(structured_prediction) if isinstance(structured_prediction, dict) else {}
+                )
+                row["reference"] = {
+                    "noisy_audio": _sample_noisy_audio(sample),
+                    "reference_audio": _sample_clean_reference_audio(sample),
+                }
                 if key in metric_details_by_key:
                     row["metric_details"] = metric_details_by_key[key]
             else:
@@ -2544,7 +2709,8 @@ def _record_evaluation_result(
         "prediction_path": result["prediction_path"],
         "details": result["details"],
     }
-    if str(result.get("task") or "").upper() != "KWS":
+    task = str(result.get("task") or "").upper()
+    if task not in {"KWS", "SE"}:
         return rps_manager.evaluate_and_record(
             tool_name=tool_name,
             dataset=result["dataset"],
@@ -2560,7 +2726,7 @@ def _record_evaluation_result(
         or not math.isfinite(float(score))
     ):
         logger.warning(
-            "Skipping KWS evaluation database record because the selected metric has no score",
+            "Skipping structured evaluation database record because the selected metric has no score",
             dataset=result.get("dataset"),
             metric=result.get("metric"),
         )
@@ -2641,7 +2807,7 @@ def _write_run_artifacts(
             )
             prediction_keys = (
                 set(structured_predictions)
-                if str(result.get("task") or "").upper() == "KWS"
+                if str(result.get("task") or "").upper() in {"KWS", "SE"}
                 else set(predictions)
             )
             samples = _samples_with_predictions(

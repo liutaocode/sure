@@ -308,6 +308,15 @@ def tool_contract(task_type: str) -> tuple[str, dict]:
             },
             "required": ["audio_path"],
         }
+    if task_type == "se":
+        return "enhance_speech", {
+            "type": "object",
+            "properties": {
+                "audio_path": {"type": "string"},
+                "output_path": {"type": "string"},
+            },
+            "required": ["audio_path"],
+        }
     return "transcribe_audio", {"type": "object", "properties": {"audio_path": {"type": "string"}}, "required": ["audio_path"]}
 
 
@@ -351,6 +360,20 @@ def io_contract_for(task_type: str) -> dict:
             "primary_field": "detected",
             "required_fields": ["detected", "keyword", "score"],
             "nonempty_fields": ["detected"],
+            "json_serializable": True,
+        }
+    if task_type == "se":
+        return {
+            "input_type": "audio_path",
+            "output_type": "audio",
+            "input": {
+                "audio_path": "string",
+                "output_path": "optional string",
+            },
+            "output": {"audio_path": "string"},
+            "primary_field": "audio_path",
+            "required_fields": ["audio_path"],
+            "nonempty_fields": ["audio_path"],
             "json_serializable": True,
         }
     return {

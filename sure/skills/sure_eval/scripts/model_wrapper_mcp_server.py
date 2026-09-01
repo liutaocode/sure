@@ -101,6 +101,7 @@ def _tool_names(config: dict[str, Any]) -> list[str]:
         "S2TT": "translate_audio",
         "TTS": "synthesize_speech",
         "VC": "convert_voice",
+        "SE": "enhance_speech",
     }
     return [defaults.get(_model_task(config), "predict")]
 
@@ -123,6 +124,12 @@ def _tool_schema(task: str) -> dict[str, Any]:
         properties = {
             "text": {"type": "string"},
             "prompt_audio_path": {"type": "string"},
+            "output_path": {"type": "string"},
+        }
+    elif task == "SE":
+        required = ["audio_path", "output_path"]
+        properties = {
+            "audio_path": {"type": "string"},
             "output_path": {"type": "string"},
         }
     else:

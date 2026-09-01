@@ -15,7 +15,10 @@ def load_json(path: Path) -> Any:
 
 
 def canonical_task(task: str) -> str:
-    return task.replace("-", "_").lower()
+    normalized = task.replace("-", "_").lower()
+    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
+    return normalized
 
 
 def is_relative_child(path: Path, parent: Path) -> bool:
@@ -109,15 +112,48 @@ def main() -> int:
             return fail(f"{gt_jsonl}:{line_no} audio path escapes staged_dir: {audio}")
         if not resolved_audio.exists():
             return fail(f"{gt_jsonl}:{line_no} referenced audio does not exist: {audio}")
+        reference_audio = row.get("reference_audio")
+        if task == "se":
+            if not isinstance(reference_audio, str) or not reference_audio:
+                return fail(f"{gt_jsonl}:{line_no} task se requires reference_audio")
+            reference_path = Path(reference_audio)
+            if reference_path.is_absolute() or ".." in reference_path.parts:
+                return fail(
+                    f"{gt_jsonl}:{line_no} reference_audio path must be relative and stay inside staged_dir"
+                )
+            resolved_reference = (gt_jsonl.parent / reference_path).resolve()
+            if not is_relative_child(resolved_reference, staged_dir):
+                return fail(
+                    f"{gt_jsonl}:{line_no} reference_audio path escapes staged_dir: {reference_audio}"
+                )
+            if not resolved_reference.is_file():
+                return fail(
+                    f"{gt_jsonl}:{line_no} referenced reference_audio does not exist: {reference_audio}"
+                )
+            if resolved_reference.samefile(resolved_audio):
+                return fail(
+                    f"{gt_jsonl}:{line_no} task se audio and reference_audio must be independent files"
+                )
+            if len(samples) <= len(parsed_rows):
+                return fail("samples array has fewer entries than gt.jsonl")
+            manifest_sample = samples[len(parsed_rows)]
+            if not isinstance(manifest_sample, dict):
+                return fail(f"samples[{len(parsed_rows)}] must be an object")
+            if manifest_sample.get("reference_audio") != reference_audio:
+                return fail("SE manifest samples must preserve reference_audio")
+            if Path(str(manifest_sample.get("reference_audio_path") or "")).resolve() != resolved_reference:
+                return fail("SE manifest samples must preserve resolved reference_audio_path")
         annotation_fields = [
             field
             for field in ("ground_truth", "target_text", "text", "segments", "label", "intent")
             if field in row and annotation_is_nonempty(row[field])
         ]
+        if task == "se" and annotation_is_nonempty(reference_audio):
+            annotation_fields.append("reference_audio")
         if not annotation_fields:
             return fail(
                 f"{gt_jsonl}:{line_no} must contain at least one annotation field "
-                "(ground_truth, target_text, text, segments, label, or intent)"
+                "(ground_truth, target_text, text, segments, label, intent, or reference_audio)"
             )
         if task == "sa_asr" and "segments" not in row:
             return fail(f"{gt_jsonl}:{line_no} task sa_asr requires speaker-attributed segments")

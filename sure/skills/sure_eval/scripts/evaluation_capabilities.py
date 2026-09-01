@@ -16,6 +16,8 @@ TASK_TO_ENGINE_TASK = {
     "SA-ASR": "sa-asr",
     "SA_ASR": "sa-asr",
     "KWS": "kws",
+    "SE": "se",
+    "SPEECH_ENHANCEMENT": "se",
     "SER": "ser",
     "GR": "gr",
     "CLASSIFICATION": "classification",
@@ -81,6 +83,32 @@ def discover_engine_capabilities(engine_root: Path, task: str, language: str) ->
     """Return current engine-supported metrics and route choices for a task/language."""
 
     engine_task = normalize_engine_task(task)
+    catalog_entries = _catalog_entries(engine_root, task, language)
+    if engine_task == "se":
+        route_choices = [
+            {
+                "pipeline_id": row.get("pipeline_id"),
+                "language": row.get("language"),
+                "metric": row.get("metric"),
+                "nodes": list(row.get("nodes") or []),
+                "computation_node_ids": list(row.get("computation_node_ids") or []),
+            }
+            for row in catalog_entries
+        ]
+        supported_metrics = [
+            str(metric)
+            for row in catalog_entries
+            for metric in [row.get("metric"), *(row.get("execution_metrics") or [])]
+            if metric
+        ]
+        return {
+            "task": engine_task,
+            "language": language,
+            "default_metrics": ["si-sdr"],
+            "supported_metrics": _dedupe(supported_metrics),
+            "route_choices": route_choices,
+            "catalog_entries": catalog_entries,
+        }
     _insert_engine_src(engine_root)
     from sure_eval.evaluation.agent_plan import build_agent_plan
     from sure_eval.evaluation.cli_adapters import build_pipeline_spec
@@ -106,7 +134,7 @@ def discover_engine_capabilities(engine_root: Path, task: str, language: str) ->
     except Exception:
         route_choices = []
 
-    for row in _catalog_entries(engine_root, task, language):
+    for row in catalog_entries:
         metric = str(row.get("metric") or "").strip()
         if metric:
             supported_metrics.append(metric)
@@ -117,7 +145,7 @@ def discover_engine_capabilities(engine_root: Path, task: str, language: str) ->
         "default_metrics": default_metrics,
         "supported_metrics": _dedupe(supported_metrics or default_metrics),
         "route_choices": route_choices,
-        "catalog_entries": _catalog_entries(engine_root, task, language),
+        "catalog_entries": catalog_entries,
     }
 
 

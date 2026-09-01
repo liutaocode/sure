@@ -43,6 +43,7 @@ TASK_TYPES = {
     "s2tt",
     "sd",
     "ser",
+    "se",
     "tts",
     "vc",
     "kws",
@@ -63,6 +64,7 @@ ALL_TASK_PLAYBOOKS = [
     "references/task_playbooks/TTS.md",
     "references/task_playbooks/VC.md",
     "references/task_playbooks/KWS.md",
+    "references/task_playbooks/SE.md",
 ]
 ALL_ENV_PLAYBOOKS = [
     "references/playbooks/env_uv.md",
@@ -236,6 +238,14 @@ def normalize_required_string(value: Any, field: str) -> str:
     return text
 
 
+def canonical_task_type(value: str) -> str:
+    raw = value.strip().lower()
+    normalized = raw.replace("-", "_")
+    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
+    return raw
+
+
 def task_playbooks_for(task_type: str) -> list[str]:
     task = task_type.lower()
     if task == "asr":
@@ -253,6 +263,8 @@ def task_playbooks_for(task_type: str) -> list[str]:
         return ["references/task_playbooks/VC.md"]
     if task == "kws":
         return ["references/task_playbooks/KWS.md"]
+    if task == "se":
+        return ["references/task_playbooks/SE.md"]
     return []
 
 
@@ -299,7 +311,9 @@ def make_model_input_resolved(
     model_id = normalize_required_string(model_input.get("model_id"), "model_id")
     model_name = str(model_input.get("model_name") or slugify_model_name(model_id)).strip()
     model_name = slugify_model_name(model_name)
-    task_type = normalize_required_string(model_input.get("task_type"), "task_type")
+    task_type = canonical_task_type(
+        normalize_required_string(model_input.get("task_type"), "task_type")
+    )
     deployment_type = normalize_required_string(model_input.get("deployment_type"), "deployment_type")
     repo_url = normalize_required_string(get_nested(model_input, "repo", "url"), "repo.url")
 
@@ -357,7 +371,7 @@ def make_model_input_resolved(
             "handoff_artifacts_dir": str(handoff_dir / "artifacts") if handoff_dir else None,
             "raw_args": raw_args,
         },
-        "normalized_model_input": model_input,
+        "normalized_model_input": {**model_input, "task_type": task_type},
     }
     if package_profile == "docker-registry":
         site = load_site_policy(repository_root=repo_root, required=True) or {}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -222,6 +224,38 @@ def validate_mcp_evidence(evidence_path: Path, tool_name: str) -> str | None:
             polarities.add(detected)
         if polarities != {False, True}:
             return "KWS MCP smoke must prove one positive detection and one negative rejection"
+    if tool_name == "enhance_speech":
+        samples = call.get("samples")
+        if not isinstance(samples, list) or not 1 <= len(samples) <= 5:
+            return "SE MCP smoke must record 1 to 5 keyed noisy/clean samples"
+        if call.get("expected_samples") != len(samples) or call.get("num_samples") != len(samples):
+            return "SE MCP smoke sample counts do not match"
+        keys: set[str] = set()
+        for sample in samples:
+            if not isinstance(sample, dict) or sample.get("ok") is not True:
+                return "every SE MCP smoke sample must pass"
+            key = str(sample.get("key") or "")
+            if not key or key in keys:
+                return "SE MCP smoke samples require unique keys"
+            keys.add(key)
+            result = sample.get("result")
+            if not isinstance(result, dict):
+                return f"SE MCP smoke sample {key} must record generated audio evidence"
+            audio_path = result.get("audio_path")
+            audio_sha256 = result.get("audio_sha256")
+            noisy_sha256 = sample.get("audio_sha256")
+            if (
+                not isinstance(audio_path, str)
+                or not audio_path.startswith("outputs/")
+                or not isinstance(audio_sha256, str)
+                or len(audio_sha256) != 64
+                or not isinstance(noisy_sha256, str)
+                or len(noisy_sha256) != 64
+            ):
+                return f"SE MCP smoke sample {key} must preserve portable output identity"
+            reference_sha256 = sample.get("reference_audio_sha256")
+            if not isinstance(reference_sha256, str) or len(reference_sha256) != 64:
+                return f"SE MCP smoke sample {key} clean reference hash is invalid"
     return None
 
 
@@ -351,6 +385,234 @@ def compare_kws_equivalence(
     )
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pcm_values(data: bytes, sample_width: int) -> list[int]:
+    if sample_width == 1:
+        return [value - 128 for value in data]
+    return [
+        int.from_bytes(data[offset : offset + sample_width], "little", signed=True)
+        for offset in range(0, len(data), sample_width)
+    ]
+
+
+def compare_audio_content(baseline_path: Path, adapter_path: Path) -> tuple[dict[str, object], bool]:
+    hashes = {
+        "baseline_sha256": file_sha256(baseline_path),
+        "adapter_sha256": file_sha256(adapter_path),
+    }
+    try:
+        with wave.open(str(baseline_path), "rb") as baseline, wave.open(
+            str(adapter_path), "rb"
+        ) as adapter:
+            baseline_params = {
+                "channels": baseline.getnchannels(),
+                "sample_width_bytes": baseline.getsampwidth(),
+                "sample_rate": baseline.getframerate(),
+                "frames": baseline.getnframes(),
+                "compression": baseline.getcomptype(),
+            }
+            adapter_params = {
+                "channels": adapter.getnchannels(),
+                "sample_width_bytes": adapter.getsampwidth(),
+                "sample_rate": adapter.getframerate(),
+                "frames": adapter.getnframes(),
+                "compression": adapter.getcomptype(),
+            }
+            if (
+                baseline_params["compression"] != "NONE"
+                or adapter_params["compression"] != "NONE"
+                or baseline_params["sample_width_bytes"] not in {1, 2, 3, 4}
+                or adapter_params["sample_width_bytes"] not in {1, 2, 3, 4}
+            ):
+                raise wave.Error("not comparable integer PCM")
+            parameters_match = baseline_params == adapter_params
+            max_abs_error_lsb = 0
+            if parameters_match:
+                sample_width = int(baseline_params["sample_width_bytes"])
+                while True:
+                    baseline_chunk = baseline.readframes(4096)
+                    adapter_chunk = adapter.readframes(4096)
+                    if not baseline_chunk and not adapter_chunk:
+                        break
+                    baseline_values = pcm_values(baseline_chunk, sample_width)
+                    adapter_values = pcm_values(adapter_chunk, sample_width)
+                    if len(baseline_values) != len(adapter_values):
+                        parameters_match = False
+                        break
+                    if baseline_values:
+                        max_abs_error_lsb = max(
+                            max_abs_error_lsb,
+                            max(
+                                abs(left - right)
+                                for left, right in zip(baseline_values, adapter_values)
+                            ),
+                        )
+            tolerance_lsb = 1
+            match = parameters_match and max_abs_error_lsb <= tolerance_lsb
+            return {
+                "method": "integer_pcm_samples",
+                "pcm_integer_lsb_tolerance": tolerance_lsb,
+                "max_abs_error_lsb": max_abs_error_lsb,
+                "baseline_params": baseline_params,
+                "adapter_params": adapter_params,
+                **hashes,
+            }, match
+    except (EOFError, OSError, wave.Error):
+        match = hashes["baseline_sha256"] == hashes["adapter_sha256"]
+        return {
+            "method": "exact_content_sha256_fallback",
+            "reason": "audio was not comparable integer PCM WAV",
+            **hashes,
+        }, match
+
+
+def se_audio_roots(run_dir: Path, role: str) -> tuple[Path, ...]:
+    if role == "baseline":
+        return (
+            run_dir / "original_output",
+            run_dir / "artifacts" / "original_output",
+        )
+    if role == "adapter":
+        return (
+            run_dir / "artifacts" / "adapter_validation" / "outputs",
+            run_dir / "artifacts" / "outputs",
+        )
+    raise ValueError(f"unknown SE equivalence role: {role}")
+
+
+def resolve_recorded_audio(
+    raw_path: object,
+    document: Path,
+    run_dir: Path,
+    role: str,
+) -> Path:
+    raw = str(raw_path or "")
+    if not raw:
+        raise ValueError(f"{document} SE result is missing audio_path")
+    declared = Path(raw)
+    candidates: list[Path] = []
+    if declared.is_absolute():
+        if declared.parts[:2] == ("/", "validation"):
+            candidates.append(
+                run_dir / "artifacts" / "adapter_validation" / Path(*declared.parts[2:])
+            )
+        candidates.append(declared)
+    else:
+        candidates.extend(
+            [
+                document.parent / declared,
+                run_dir / declared,
+                *(root / declared for root in se_audio_roots(run_dir, role)),
+            ]
+        )
+    run_root = run_dir.resolve()
+    allowed_roots = se_audio_roots(run_root, role)
+    for candidate in candidates:
+        absolute = candidate.absolute()
+        matching_root = next(
+            (
+                root
+                for root in allowed_roots
+                if absolute == root or absolute.is_relative_to(root)
+            ),
+            None,
+        )
+        if matching_root is None:
+            continue
+        relative_to_run = absolute.relative_to(run_root)
+        current = run_root
+        for part in relative_to_run.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"{document} SE audio_path must not traverse a parent symlink")
+        if not absolute.is_file() or absolute.is_symlink() or absolute.stat().st_size <= 0:
+            continue
+        resolved = absolute.resolve()
+        if not resolved.is_relative_to(matching_root.resolve()):
+            raise ValueError(f"{document} SE audio_path escapes its controlled root")
+        return resolved
+    roots = ", ".join(root.relative_to(run_root).as_posix() for root in allowed_roots)
+    raise ValueError(
+        f"{document} SE {role} audio_path must be a real non-empty file under: {roots}"
+    )
+
+
+def se_equivalence_rows(path: Path, run_dir: Path, role: str) -> dict[str, Path]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    rows = value.get("rows") if isinstance(value, dict) else value
+    if not isinstance(rows, list):
+        raise ValueError(f"{path} must contain an SE rows array")
+    normalized: dict[str, Path] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{path} rows[{index}] must be an object")
+        key = str(row.get("sample_id") or row.get("key") or "")
+        if not key or key in normalized:
+            raise ValueError(f"{path} has a missing or duplicate SE key: {key!r}")
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"{path} SE result for {key} must be an object")
+        normalized[key] = resolve_recorded_audio(
+            result.get("audio_path"),
+            path,
+            run_dir,
+            role,
+        )
+    return normalized
+
+
+def compare_se_equivalence(
+    run_dir: Path,
+    baseline_path: Path,
+    adapter_path: Path,
+    policy: str,
+) -> tuple[dict, str | None]:
+    baseline = se_equivalence_rows(baseline_path, run_dir, "baseline")
+    adapter = se_equivalence_rows(adapter_path, run_dir, "adapter")
+    missing = sorted(set(baseline) - set(adapter))
+    extra = sorted(set(adapter) - set(baseline))
+    comparisons: dict[str, dict[str, object]] = {}
+    mismatches: list[str] = []
+    for key in sorted(set(baseline) & set(adapter)):
+        if baseline[key].samefile(adapter[key]):
+            comparison = {
+                "method": "rejected_same_recorded_file",
+                "reason": "baseline and adapter must be independent run-owned files",
+            }
+            row_matches = False
+        else:
+            comparison, row_matches = compare_audio_content(baseline[key], adapter[key])
+        comparison["match"] = row_matches
+        comparisons[key] = comparison
+        if not row_matches:
+            mismatches.append(key)
+    match = not missing and not extra and not mismatches
+    evidence = {
+        "policy": policy,
+        "comparison": "keyed_se_pcm_or_exact_content",
+        "primary_field": "audio_path",
+        "path_strings_compared": False,
+        "missing_keys": missing,
+        "extra_keys": extra,
+        "mismatched_keys": mismatches,
+        "rows": comparisons,
+        "match": match,
+    }
+    if match:
+        return evidence, None
+    return evidence, (
+        "baseline and adapter SE audio differ: "
+        f"missing={missing}, extra={extra}, mismatched={mismatches}"
+    )
+
+
 def adapter_primary_field(run_dir: Path) -> str:
     manifest = run_dir / "artifacts" / "adapter_manifest.json"
     if not manifest.is_file():
@@ -396,6 +658,16 @@ def compare_equivalence_outputs(run_dir: Path, data: dict) -> tuple[dict | None,
     if task_type == "kws":
         try:
             return compare_kws_equivalence(
+                paths["baseline_output"],
+                paths["adapter_output"],
+                policy,
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            return None, str(error)
+    if task_type == "se":
+        try:
+            return compare_se_equivalence(
+                run_dir,
                 paths["baseline_output"],
                 paths["adapter_output"],
                 policy,

@@ -31,6 +31,13 @@ CHECKS: dict[str, list[str]] = {
         "wekws_score_ctc",
         "wekws_frame_score",
     ],
+    "task_playbooks/SE.md": [
+        "enhance_speech",
+        "reference_audio",
+        "noisy_audio",
+        "SI-SDR",
+        "DNSMOS",
+    ],
     "task_playbooks/SPEECH_UNDERSTANDING.md": [
         "SD, SA-ASR",
         "speech_understanding_metric_report.json",

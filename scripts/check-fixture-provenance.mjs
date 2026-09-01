@@ -120,9 +120,17 @@ for (const provenancePath of provenancePaths) {
 		} catch (error) {
 			fail(`${groundTruthPath}:${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
 		}
-		if (!declared.has(row.audio)) fail(`${groundTruthPath}:${index + 1}: audio is not declared: ${row.audio}`);
-		if (referenced.has(row.audio)) fail(`${groundTruthPath}:${index + 1}: duplicate audio reference: ${row.audio}`);
-		referenced.add(row.audio);
+		const roles = [["audio", row.audio]];
+		if (row.reference_audio !== undefined) roles.push(["reference_audio", row.reference_audio]);
+		for (const [role, value] of roles) {
+			if (typeof value !== "string" || !declared.has(value)) {
+				fail(`${groundTruthPath}:${index + 1}: ${role} is not declared: ${value}`);
+			}
+			if (referenced.has(value)) {
+				fail(`${groundTruthPath}:${index + 1}: duplicate ${role} reference: ${value}`);
+			}
+			referenced.add(value);
+		}
 	}
 	for (const name of declared) {
 		if (!referenced.has(name)) fail(`${groundTruthPath}: declared audio is not referenced: ${name}`);

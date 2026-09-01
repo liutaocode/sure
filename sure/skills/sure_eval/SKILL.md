@@ -272,10 +272,14 @@ validation. Metric support is discovered from the current standalone
 static support matrix.
 For generated-audio tasks, pass an explicit audio metric when needed, for
 example `--metric dnsmos` or `--evaluation-metric dnsmos`; the harness converts
-structured TTS/VC predictions into the standalone engine's `samples_jsonl`
+structured TTS/VC/SE predictions into the standalone engine's `samples_jsonl`
 contract according to the selected route's required roles. Repeated `--metric`
 values produce one dataset-metric result each, and `--merge-payload` merges
 segmented TTS/VC evaluation payloads without rerunning metrics.
+SE defaults to the atomic `si-sdr` route. Full-reference SE metrics require an
+explicit clean `reference_audio`; the noisy model input is never reused as the
+clean reference. Other SE metrics run only when their standalone route and node
+environment are ready.
 
 `run_smoke.py` launches the approved local container or site Model Python with a
 bounded sample. `generate_predictions_via_server.py --device cpu` hides

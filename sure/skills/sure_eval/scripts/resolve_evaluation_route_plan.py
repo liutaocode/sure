@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,11 @@ def build_route_plan(
     evaluation_runtime = ensure_evaluation_runtime(engine_root, prepare=True)
     from evaluation_capabilities import _insert_engine_src
 
+    site_packages = str(evaluation_runtime.get("site_packages") or "")
+    if site_packages:
+        if site_packages in sys.path:
+            sys.path.remove(site_packages)
+        sys.path.insert(0, site_packages)
     _insert_engine_src(engine_root)
     from sure_eval.evaluation.agent_plan import build_agent_plan
 

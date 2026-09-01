@@ -13,6 +13,7 @@ import argparse
 import json
 import shutil
 import sys
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,90 @@ def copy_artifact(source: Path, dest: Path) -> None:
     shutil.copy2(source, dest)
 
 
+def canonical_task(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
+    return normalized
+
+
+def validated_output_files(root: Path, *, require_pcm_wav: bool) -> list[Path]:
+    if root.is_symlink():
+        raise ValueError(f"generated outputs root must not be a symlink: {root}")
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise ValueError(f"generated outputs root must be a directory: {root}")
+    resolved_root = root.resolve()
+    files: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"generated outputs must not contain symlinks: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file() or not path.resolve().is_relative_to(resolved_root):
+            raise ValueError(f"generated outputs contain an unsafe entry: {path}")
+        if path.stat().st_size <= 0:
+            raise ValueError(f"generated output is empty: {path}")
+        if require_pcm_wav:
+            try:
+                with wave.open(str(path), "rb") as handle:
+                    if (
+                        handle.getcomptype() != "NONE"
+                        or handle.getnchannels() < 1
+                        or handle.getsampwidth() not in {1, 2, 3, 4}
+                        or handle.getframerate() < 1
+                        or handle.getnframes() < 1
+                    ):
+                        raise ValueError(f"SE generated output must be a non-empty PCM WAV: {path}")
+            except (EOFError, OSError, wave.Error) as error:
+                raise ValueError(f"SE generated output must be a readable PCM WAV: {path}: {error}") from error
+        files.append(path)
+    return files
+
+
+def stage_output_tree(run_artifacts: Path, model_artifacts: Path, *, task: str) -> list[str]:
+    source = run_artifacts / "outputs"
+    destination = model_artifacts / "outputs"
+    require_pcm_wav = task == "se"
+    if source.exists() or source.is_symlink():
+        validated_output_files(source, require_pcm_wav=require_pcm_wav)
+        if not same_file(source, destination):
+            if destination.is_symlink():
+                raise ValueError(f"model outputs destination must not be a symlink: {destination}")
+            if destination.exists():
+                if not destination.is_dir() or not destination.resolve().is_relative_to(model_artifacts.resolve()):
+                    raise ValueError(f"model outputs destination is unsafe: {destination}")
+                shutil.rmtree(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, destination)
+    output_files = validated_output_files(destination, require_pcm_wav=require_pcm_wav)
+    return [path.relative_to(model_artifacts).as_posix() for path in output_files]
+
+
+def validate_se_sample_evidence(model_artifacts: Path) -> None:
+    output_root = (model_artifacts / "outputs").resolve()
+    evidence_paths = [model_artifacts / "sample_output.json", model_artifacts / "sample_outputs.jsonl"]
+    for evidence_path in evidence_paths:
+        if not evidence_path.is_file():
+            continue
+        if evidence_path.name.endswith(".jsonl"):
+            documents = [json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        else:
+            documents = [read_json(evidence_path)]
+        for document in documents:
+            output = document.get("output") if isinstance(document.get("output"), dict) else document
+            value = output.get("audio_path") if isinstance(output, dict) else None
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"SE sample evidence requires audio_path: {evidence_path}")
+            relative = Path(value)
+            if relative.is_absolute() or ".." in relative.parts or relative.parts[:2] != ("artifacts", "outputs"):
+                raise ValueError(f"SE sample evidence audio_path must be portable: {value}")
+            resolved = (model_artifacts.parent / relative).resolve()
+            if not resolved.is_file() or not resolved.is_relative_to(output_root):
+                raise ValueError(f"SE sample evidence audio_path is missing from model outputs: {value}")
+
+
 def artifact_entry(path: str, description: str) -> dict[str, Any]:
     return {"path": path, "description": description}
 
@@ -109,6 +194,7 @@ def build_manifest(
     resolved: dict[str, Any],
     copied_required: list[str],
     copied_optional: list[str],
+    copied_outputs: list[str],
 ) -> dict[str, Any]:
     required: dict[str, Any] = {
         "spec": artifact_entry("model.spec.yaml", "Model specification."),
@@ -122,6 +208,9 @@ def build_manifest(
     for name in copied_required:
         key = name.replace(".", "_").replace("-", "_")
         required[key] = artifact_entry(f"artifacts/{name}", f"Required /sure_onboard run artifact: {name}.")
+    for relative in copied_outputs:
+        path = f"artifacts/{relative}"
+        required[f"file:{path}"] = artifact_entry(path, f"Generated model output: {path}.")
 
     optional: dict[str, Any] = {}
     for name in copied_optional:
@@ -146,6 +235,7 @@ def build_manifest(
             "source": "stage_model_artifacts.py",
             "copied_required_run_artifacts": copied_required,
             "copied_optional_run_artifacts": copied_optional,
+            "copied_output_files": copied_outputs,
         },
     }
 
@@ -208,11 +298,26 @@ def main_with_args(argv: list[str] | None = None) -> int:
             copy_artifact(source, model_artifacts / name)
             copied_optional.append(name)
 
+    try:
+        copied_outputs = stage_output_tree(
+            run_artifacts,
+            model_artifacts,
+            task=canonical_task(resolved.get("task_type")),
+        )
+        if canonical_task(resolved.get("task_type")) == "se":
+            if not copied_outputs:
+                raise ValueError("SE staging requires at least one generated output")
+            validate_se_sample_evidence(model_artifacts)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"stage_model_artifacts failed: {exc}", file=sys.stderr)
+        return 1
+
     manifest = build_manifest(
         model_dir=model_dir,
         resolved=resolved,
         copied_required=copied_required,
         copied_optional=copied_optional,
+        copied_outputs=copied_outputs,
     )
     model_manifest = model_artifacts / "artifact_manifest.json"
     model_manifest.parent.mkdir(parents=True, exist_ok=True)

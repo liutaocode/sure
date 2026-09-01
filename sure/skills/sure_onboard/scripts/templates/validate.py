@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import importlib
 import json
 import math
 import os
 import sys
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,13 @@ IO_CONTRACT: dict[str, Any] = (
     {} if _IO_CONTRACT_JSON.startswith("__") else json.loads(_IO_CONTRACT_JSON)
 )
 KWS_OPERATING_THRESHOLD = 0.5
+
+
+def normalized_task_type() -> str:
+    normalized = TASK_TYPE.lower().replace("-", "_")
+    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
+    return normalized
 
 
 def now_iso() -> str:
@@ -134,6 +143,7 @@ def load_wrapper() -> Any:
 
 
 def fixture_payloads() -> list[dict[str, Any]]:
+    task = normalized_task_type()
     raw_payload = os.environ.get("SURE_VALIDATE_INPUT_JSON")
     if raw_payload:
         parsed = json.loads(raw_payload)
@@ -141,17 +151,32 @@ def fixture_payloads() -> list[dict[str, Any]]:
             raise ValueError("SURE_VALIDATE_INPUT_JSON must decode to an object.")
         keywords = parsed.get("keywords")
         if (
-            TASK_TYPE.lower().replace("-", "_") == "kws"
+            task == "kws"
             and keywords is not None
             and not valid_keywords(keywords)
         ):
             raise ValueError("KWS keywords must be non-empty when provided")
         if (
-            TASK_TYPE.lower().replace("-", "_") == "kws"
+            task == "kws"
             and "threshold" in parsed
             and not valid_kws_threshold(parsed["threshold"])
         ):
             raise ValueError(f"KWS threshold must equal {KWS_OPERATING_THRESHOLD}")
+        if task == "se":
+            audio_path = parsed.get("audio_path")
+            if not isinstance(audio_path, str) or not audio_path.strip():
+                raise ValueError("SE SURE_VALIDATE_INPUT_JSON requires audio_path")
+            model_input = {"audio_path": audio_path}
+            return [
+                {
+                    "input": model_input,
+                    "fixture": {
+                        field: parsed[field]
+                        for field in ("key", "audio", "reference_audio")
+                        if field in parsed
+                    },
+                }
+            ]
         return [
             {
                 "input": parsed,
@@ -182,21 +207,34 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 continue
             payload: dict[str, Any] = {}
             audio = item.get("audio") or item.get("wav") or item.get("prompt_audio") or item.get("reference_audio")
-            if isinstance(audio, str):
+            if task == "se":
+                reference_audio = item.get("reference_audio")
+                if not isinstance(audio, str) or not audio:
+                    raise ValueError("SE fixture requires a non-empty noisy audio field")
+                if not isinstance(reference_audio, str) or not reference_audio:
+                    raise ValueError("SE fixture requires a non-empty reference_audio field")
+                noisy_path = (gt_path.parent / audio).resolve()
+                clean_path = (gt_path.parent / reference_audio).resolve()
+                if not noisy_path.is_file() or not clean_path.is_file():
+                    raise FileNotFoundError("SE fixture noisy and reference audio files must exist")
+                if noisy_path == clean_path:
+                    raise ValueError("SE fixture audio and reference_audio must be distinct files")
+                payload["audio_path"] = str(noisy_path)
+            elif isinstance(audio, str):
                 payload["audio_path"] = str((gt_path.parent / audio).resolve())
                 payload["prompt_audio_path"] = payload["audio_path"]
                 payload["reference_audio_path"] = payload["audio_path"]
                 payload["ref_audio"] = payload["audio_path"]
             text = item.get("target_text") or item.get("text") or item.get("prompt_text") or item.get("ground_truth")
-            if isinstance(text, str):
+            if task != "se" and isinstance(text, str):
                 payload["text"] = text
                 payload["prompt_text"] = item.get("prompt_text", text)
-            if isinstance(item.get("language"), str):
+            if task != "se" and isinstance(item.get("language"), str):
                 payload["language"] = item["language"]
-            if "keywords" in item:
+            if task != "se" and "keywords" in item:
                 payload["keywords"] = item["keywords"]
-            if "threshold" in item:
-                if TASK_TYPE.lower().replace("-", "_") == "kws" and not valid_kws_threshold(
+            if task != "se" and "threshold" in item:
+                if task == "kws" and not valid_kws_threshold(
                     item["threshold"]
                 ):
                     raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
@@ -205,12 +243,15 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 fixture_metadata: dict[str, Any] = {
                     "key": item.get("key"),
                     "audio": item.get("audio"),
+                    "reference_audio": item.get("reference_audio"),
                     "language": item.get("language"),
                     "dataset": item.get("dataset"),
                     "ground_truth": item.get("ground_truth"),
                     "text": item.get("text"),
                     "keywords": item.get("keywords"),
                 }
+                if task == "se":
+                    fixture_metadata["reference_audio_path"] = str(clean_path)
                 fixture_metadata.update(
                     {
                         field: item[field]
@@ -227,7 +268,7 @@ def fixture_payloads() -> list[dict[str, Any]]:
         if payloads:
             if len(payloads) > 5:
                 raise ValueError(f"Fixture set exceeds the 5-sample validation limit: {gt_path}")
-            if TASK_TYPE.lower().replace("-", "_") == "kws":
+            if task == "kws":
                 polarities: list[bool] = []
                 for fixture in payloads:
                     metadata = fixture["fixture"]
@@ -477,6 +518,108 @@ def validate_kws_rows(rows: list[dict[str, Any]], contract: dict[str, Any]) -> l
     return violations
 
 
+def se_outputs_root() -> Path:
+    root = ARTIFACTS_DIR / "outputs"
+    if root.is_symlink():
+        raise ValueError("SE outputs directory must not be a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir() or not os.access(root, os.W_OK):
+        raise ValueError("SE outputs directory must be writable")
+    return root.resolve()
+
+
+def se_output_path(key: str, index: int) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return se_outputs_root() / f"{index:02d}-{digest}.wav"
+
+
+def resolve_se_output_path(value: str) -> Path:
+    raw = Path(value)
+    if raw.is_absolute():
+        return raw
+    if raw.parts and raw.parts[0] == "artifacts":
+        return ARTIFACTS_DIR.joinpath(*raw.parts[1:])
+    return se_outputs_root() / raw
+
+
+def portable_se_output_path(path: Path) -> str:
+    relative = path.resolve().relative_to(ARTIFACTS_DIR.resolve())
+    return (Path("artifacts") / relative).as_posix()
+
+
+def validate_se_output(
+    sample: dict[str, Any],
+    *,
+    expected_path: Path | None = None,
+    forbidden_inputs: tuple[Path, ...] = (),
+) -> list[str]:
+    audio_path = sample.get("audio_path")
+    if not isinstance(audio_path, str) or not audio_path.strip():
+        return ["SE output audio_path must be a non-empty string"]
+    output = resolve_se_output_path(audio_path)
+    root = se_outputs_root()
+    try:
+        lexical_relative = output.absolute().relative_to(root)
+    except ValueError:
+        return [f"SE output audio_path must stay below artifacts/outputs: {audio_path}"]
+    current = root
+    for part in lexical_relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return [f"SE output audio_path must not traverse a symlink: {audio_path}"]
+    resolved = output.resolve()
+    if not resolved.is_relative_to(root):
+        return [f"SE output audio_path must stay below artifacts/outputs: {audio_path}"]
+    if expected_path is not None and resolved != expected_path.resolve():
+        return [f"SE output audio_path differs from the harness-assigned output: {audio_path}"]
+    if not resolved.is_file():
+        return [f"SE output audio_path does not exist: {audio_path}"]
+    if resolved.stat().st_size <= 0:
+        return [f"SE output audio_path is empty: {audio_path}"]
+    for input_path in forbidden_inputs:
+        if input_path.is_file() and os.path.samefile(resolved, input_path):
+            return [f"SE output audio_path must not alias an input audio file: {audio_path}"]
+    try:
+        with wave.open(str(resolved), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                return [f"SE output audio_path must be a non-empty PCM WAV: {audio_path}"]
+    except (EOFError, OSError, wave.Error) as error:
+        return [f"SE output audio_path must be a readable PCM WAV: {error}"]
+    return []
+
+
+def validate_se_rows(rows: list[dict[str, Any]], contract: dict[str, Any]) -> list[str]:
+    violations: list[str] = []
+    if not rows:
+        return ["SE validation requires at least one output row"]
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            violations.append(f"SE output row {index} must be an object")
+            continue
+        output = row.get("output")
+        if not isinstance(output, dict):
+            violations.append(f"SE output row {index} result must be an object")
+            continue
+        key = str(row.get("key") or index)
+        prefix = f"SE output {key!r}"
+        if not isinstance(row.get("audio"), str) or not row["audio"].strip():
+            violations.append(f"{prefix}: noisy audio role is missing")
+        if not isinstance(row.get("reference_audio"), str) or not row["reference_audio"].strip():
+            violations.append(f"{prefix}: reference_audio role is missing")
+        violations.extend(f"{prefix}: {item}" for item in validate_contract(output, contract))
+        violations.extend(
+            f"{prefix}: {item}"
+            for item in validate_se_output(output, expected_path=se_output_path(key, index))
+        )
+    return violations
+
+
 def validate_contract(sample: dict[str, Any], contract: dict[str, Any]) -> list[str]:
     violations: list[str] = []
     required = string_list(contract.get("required_fields"))
@@ -538,17 +681,40 @@ def stage_infer() -> bool:
         payloads = fixture_payloads()
         outputs: list[dict[str, Any]] = []
         rows: list[dict[str, Any]] = []
+        task = normalized_task_type()
         for index, fixture in enumerate(payloads, start=1):
-            payload = fixture["input"]
+            payload = dict(fixture["input"])
+            requested_output: Path | None = None
+            if task == "se":
+                key = str(fixture["fixture"].get("key") or index)
+                requested_output = se_output_path(key, index)
+                if requested_output.exists() or requested_output.is_symlink():
+                    requested_output.unlink()
+                payload["output_path"] = str(requested_output)
             sample = run_predict(wrapper, payload)
             if not sample:
                 raise AssertionError(f"prediction output is empty for fixture {index}")
+            if task == "se":
+                forbidden_inputs = [Path(str(payload["audio_path"]))]
+                reference_path = fixture["fixture"].get("reference_audio_path")
+                if isinstance(reference_path, str) and reference_path:
+                    forbidden_inputs.append(Path(reference_path))
+                violations = validate_se_output(
+                    sample,
+                    expected_path=requested_output,
+                    forbidden_inputs=tuple(forbidden_inputs),
+                )
+                if violations:
+                    raise AssertionError("; ".join(violations))
+                assert requested_output is not None
+                sample["audio_path"] = portable_se_output_path(requested_output)
             outputs.append(sample)
             row = {
                 "id": index,
                 "key": fixture["fixture"].get("key")
-                or (str(index) if TASK_TYPE.lower().replace("-", "_") == "kws" else None),
+                or (str(index) if task in {"kws", "se"} else None),
                 "audio": fixture["fixture"].get("audio"),
+                "reference_audio": fixture["fixture"].get("reference_audio"),
                 "language": fixture["fixture"].get("language") or payload.get("language"),
                 "dataset": fixture["fixture"].get("dataset"),
                 "ground_truth": fixture["fixture"].get("ground_truth"),
@@ -589,17 +755,27 @@ def stage_contract() -> bool:
         if not isinstance(sample, dict):
             raise ValueError("sample_output.json must be an object")
         contract = load_io_contract()
-        if TASK_TYPE.lower().replace("-", "_") == "kws" and SAMPLE_OUTPUTS.is_file():
+        task = normalized_task_type()
+        if task == "kws" and SAMPLE_OUTPUTS.is_file():
             rows = [
                 json.loads(line)
                 for line in SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
             violations = validate_kws_rows(rows, contract)
+        elif task == "se" and SAMPLE_OUTPUTS.is_file():
+            rows = [
+                json.loads(line)
+                for line in SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            violations = validate_se_rows(rows, contract)
         else:
             violations = validate_contract(sample, contract)
-            if TASK_TYPE.lower().replace("-", "_") == "kws":
+            if task == "kws":
                 violations.extend(validate_kws_output(sample))
+            elif task == "se":
+                violations.extend(validate_se_output(sample))
         if violations:
             raise AssertionError("; ".join(violations))
     except Exception as exc:  # noqa: BLE001

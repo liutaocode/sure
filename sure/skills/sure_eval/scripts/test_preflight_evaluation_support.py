@@ -72,6 +72,18 @@ def _run_preflight(payload: dict):
 
 @unittest.skipUnless(ENGINE_ROOT.is_dir(), "sure-evaluation submodule is not checked out")
 class PreflightCliTests(unittest.TestCase):
+    def test_se_si_sdr_capability_and_preflight_are_supported(self):
+        capabilities = _capabilities("SE", "n/a")
+        self.assertEqual(capabilities["task"], "se")
+        self.assertIn("si_sdr", capabilities["supported_metrics"])
+        self.assertIn(
+            "se.any.si_sdr.si_sdr_v1",
+            {row.get("pipeline_id") for row in capabilities["catalog_entries"]},
+        )
+        result, written = _run_preflight(_payload([_dataset("SE", "n/a", ["si-sdr"])]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(written["supported"], written)
+
     def test_supported_route_exits_zero_and_writes_artifact(self):
         metrics = _capabilities("ASR", "zh")["supported_metrics"]
         self.assertTrue(metrics, "engine must expose at least one ASR zh metric")

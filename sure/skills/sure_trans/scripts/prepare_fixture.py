@@ -35,24 +35,27 @@ def choose_fixture(resolved: dict, task: str) -> Path:
     explicit = resolved.get("fixture_path")
     if explicit:
         path = Path(str(explicit))
-        if task == "kws" and (path.is_dir() or (path.is_file() and path.name == "gt.jsonl")):
+        if task in {"kws", "se"} and (
+            path.is_dir() or (path.is_file() and path.name == "gt.jsonl")
+        ):
             return path
-        if task != "kws" and path.is_file():
+        if task not in {"kws", "se"} and path.is_file():
             return path
-        expected = "a directory or gt.jsonl" if task == "kws" else "a file"
+        expected = "a directory or gt.jsonl" if task in {"kws", "se"} else "a file"
         raise ValueError(f"fixture must be {expected}: {path}")
     build_context = Path(str(resolved["build_context"]))
-    if task == "kws":
-        kws_candidates = [
-            build_context / "examples" / "kws" / "gt.jsonl",
-            build_context / "fixture" / "kws" / "gt.jsonl",
-            build_context / "fixtures" / "kws" / "gt.jsonl",
+    if task in {"kws", "se"}:
+        structured_candidates = [
+            build_context / "examples" / task / "gt.jsonl",
+            build_context / "fixture" / task / "gt.jsonl",
+            build_context / "fixtures" / task / "gt.jsonl",
         ]
-        matches = [candidate for candidate in kws_candidates if candidate.is_file()]
+        matches = [candidate for candidate in structured_candidates if candidate.is_file()]
         if len(matches) == 1:
             return matches[0]
         raise ValueError(
-            "KWS fixture could not be selected unambiguously; pass fixture=/absolute/path/to/gt.jsonl"
+            f"{task.upper()} fixture could not be selected unambiguously; "
+            "pass fixture=/absolute/path/to/gt.jsonl"
         )
     preferred = [
         build_context / "examples" / "smoke.wav",
@@ -87,7 +90,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         except json.JSONDecodeError as error:
             raise ValueError(f"invalid JSON in {path}:{line_number}: {error}") from error
         if not isinstance(row, dict):
-            raise ValueError(f"KWS fixture row must be an object: {path}:{line_number}")
+            raise ValueError(f"fixture row must be an object: {path}:{line_number}")
         rows.append(row)
     return rows
 
@@ -319,6 +322,137 @@ def prepare_kws_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str
     }
 
 
+def se_audio_source(source_dir: Path, value: object, *, key: str, role: str) -> tuple[Path, Path]:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"SE fixture {key} requires a non-empty {role}")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"SE fixture {key} {role} path must stay inside the fixture directory")
+    current = source_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"SE fixture {key} {role} must not traverse a symlink")
+    resolved = (source_dir / relative).resolve()
+    if (
+        not resolved.is_relative_to(source_dir)
+        or not resolved.is_file()
+        or resolved.suffix.lower() not in AUDIO_SUFFIXES
+    ):
+        raise ValueError(f"SE fixture {key} {role} is missing or unsafe: {value}")
+    return relative, resolved
+
+
+def prepare_se_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str, Any]:
+    source_dir = (source.parent if source.is_file() else source).resolve()
+    source_gt = source if source.is_file() else source_dir / "gt.jsonl"
+    if source_gt.name != "gt.jsonl" or not source_gt.is_file():
+        raise ValueError(f"SE fixture must contain gt.jsonl: {source_dir}")
+    rows = read_jsonl(source_gt)
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("SE smoke fixture must contain 1 to 5 bounded samples")
+
+    staged_dir = run_dir / "fixture" / "se"
+    clear_directory(staged_dir, run_dir / "fixture")
+    seen_keys: set[str] = set()
+    staged_rows: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    relative_files: set[Path] = set()
+
+    for index, row in enumerate(rows, 1):
+        key = str(row.get("sample_id") or row.get("key") or "").strip()
+        if not key:
+            raise ValueError(f"SE fixture row {index} requires a non-empty sample_id or key")
+        if key in seen_keys:
+            raise ValueError(f"SE fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        noisy_relative, noisy_source = se_audio_source(
+            source_dir,
+            row.get("noisy_audio", row.get("audio")),
+            key=key,
+            role="noisy_audio",
+        )
+        clean_relative, clean_source = se_audio_source(
+            source_dir, row.get("reference_audio"), key=key, role="reference_audio"
+        )
+        if noisy_source.samefile(clean_source):
+            raise ValueError(
+                f"SE fixture {key} noisy_audio and reference_audio must be independent files"
+            )
+
+        for relative, audio_source in (
+            (noisy_relative, noisy_source),
+            (clean_relative, clean_source),
+        ):
+            destination = staged_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.is_symlink():
+                raise ValueError(f"SE fixture destination must not be a symlink: {destination}")
+            shutil.copy2(audio_source, destination)
+            relative_files.add(relative)
+
+        staged_row = {
+            **row,
+            "key": key,
+            "sample_id": key,
+            "task_type": "se",
+            "audio": noisy_relative.as_posix(),
+            "noisy_audio": noisy_relative.as_posix(),
+            "reference_audio": clean_relative.as_posix(),
+        }
+        staged_rows.append(staged_row)
+        noisy_destination = staged_dir / noisy_relative
+        clean_destination = staged_dir / clean_relative
+        samples.append(
+            {
+                "key": key,
+                "audio": noisy_relative.as_posix(),
+                "audio_path": str(noisy_destination),
+                "noisy_audio": noisy_relative.as_posix(),
+                "noisy_audio_path": str(noisy_destination),
+                "reference_audio": clean_relative.as_posix(),
+                "reference_audio_path": str(clean_destination),
+                "annotation_fields": ["reference_audio"],
+                "sha256": sha256(noisy_destination),
+                "reference_sha256": sha256(clean_destination),
+                "size_bytes": noisy_destination.stat().st_size,
+                "reference_size_bytes": clean_destination.stat().st_size,
+            }
+        )
+
+    gt_jsonl = staged_dir / "gt.jsonl"
+    with gt_jsonl.open("w", encoding="utf-8") as handle:
+        for row in staged_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    relative_files.add(Path("gt.jsonl"))
+    return {
+        "schema": "sure.trans.fixture_manifest.v1",
+        "status": "ready",
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(run_dir),
+        "task_type": "se",
+        "source_dir": str(source_dir),
+        "staged_dir": str(staged_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": samples,
+        "source_path": str(source_dir),
+        "staged_path": str(staged_dir),
+        "sha256": fixture_tree_identity(staged_dir, list(relative_files)),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(samples),
+        "link_policy": "copy",
+        "annotation_source": {
+            "type": "fixture_gt_jsonl",
+            "source_path": str(source_gt.resolve()),
+            "staged_path": str(gt_jsonl),
+            "fallback": False,
+        },
+    }
+
+
 def clear_directory(path: Path, controlled_root: Path) -> None:
     if controlled_root.is_symlink() or path.is_symlink():
         raise ValueError(f"fixture staging directory must not be a symlink: {path}")
@@ -347,6 +481,12 @@ def main() -> int:
     source = choose_fixture(resolved, task).resolve()
     if task == "kws":
         payload = prepare_kws_fixture(resolved, source, run_dir)
+        output = artifacts / "fixture_manifest.json"
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(output)
+        return 0
+    if task == "se":
+        payload = prepare_se_fixture(resolved, source, run_dir)
         output = artifacts / "fixture_manifest.json"
         output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(output)

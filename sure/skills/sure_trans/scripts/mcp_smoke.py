@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from collections import deque
 from pathlib import Path
 
@@ -52,6 +53,7 @@ def tool_arguments(
     tool: str,
     audio: Path,
     fixture_row: dict | None = None,
+    output_path: Path | None = None,
 ) -> dict[str, object]:
     if tool == "synthesize_speech":
         return {
@@ -76,11 +78,16 @@ def tool_arguments(
             elif threshold is not None:
                 raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
         return arguments
+    if tool == "enhance_speech":
+        arguments = {"audio_path": str(audio)}
+        if output_path is not None:
+            arguments["output_path"] = str(output_path)
+        return arguments
     return {"audio_path": str(audio)}
 
 
 def primary_output_field(tool: str) -> str:
-    if tool in {"synthesize_speech", "convert_voice"}:
+    if tool in {"synthesize_speech", "convert_voice", "enhance_speech"}:
         return "audio_path"
     if tool == "kws_predict":
         return "detected"
@@ -219,6 +226,109 @@ def load_kws_fixture(path: Path) -> list[tuple[str, Path, dict]]:
     return rows
 
 
+def load_se_fixture(path: Path) -> list[tuple[str, Path, dict, Path]]:
+    rows: list[tuple[str, Path, dict, Path]] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"SE fixture line {line_number} must be an object")
+        key = str(row.get("sample_id") or row.get("key") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"SE fixture key is missing or duplicated: {key!r}")
+        seen.add(key)
+        paths: dict[str, Path] = {}
+        for role in ("noisy_audio", "reference_audio"):
+            value = row.get(role, row.get("audio")) if role == "noisy_audio" else row.get(role)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"SE fixture {key} requires {role}")
+            relative = Path(value)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"SE fixture {key} {role} path must be relative and contained")
+            audio_path = path.parent / relative
+            if (
+                audio_path.is_symlink()
+                or not audio_path.is_file()
+                or not audio_path.resolve().is_relative_to(path.parent.resolve())
+            ):
+                raise ValueError(f"SE fixture {key} {role} is missing or unsafe")
+            paths[role] = audio_path.resolve()
+        if paths["noisy_audio"].samefile(paths["reference_audio"]):
+            raise ValueError(
+                f"SE fixture {key} noisy_audio and reference_audio must be independent files"
+            )
+        rows.append((key, paths["noisy_audio"], row, paths["reference_audio"]))
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("SE MCP smoke requires 1 to 5 noisy/clean samples")
+    return rows
+
+
+def mcp_output_path(produces: Path, key: str, index: int) -> Path:
+    root = produces.parent / "outputs"
+    if root.is_symlink():
+        raise ValueError("MCP outputs directory must not be a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir() or not os.access(root, os.W_OK):
+        raise ValueError("MCP outputs directory must be writable")
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return root / f"mcp-{index:02d}-{digest}.wav"
+
+
+def validate_se_output(
+    value: object,
+    *,
+    key: str,
+    outputs_root: Path,
+    expected_path: Path,
+    forbidden_inputs: tuple[Path, ...],
+) -> tuple[list[str], Path | None]:
+    if not isinstance(value, dict):
+        return ["SE output must be an object"], None
+    raw_path = value.get("audio_path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return ["SE output requires audio_path"], None
+    candidate = Path(raw_path)
+    if candidate.is_symlink() or not candidate.is_file() or candidate.stat().st_size <= 0:
+        return ["SE audio_path must name a real non-empty file"], None
+    root = outputs_root.resolve()
+    try:
+        lexical_relative = candidate.absolute().relative_to(root)
+    except ValueError:
+        return ["SE audio_path must stay below MCP validation outputs"], None
+    current = root
+    for part in lexical_relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return ["SE audio_path must not traverse a symlink"], None
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        return ["SE audio_path must stay below MCP validation outputs"], None
+    if candidate.absolute() != expected_path.absolute() or resolved != expected_path.resolve():
+        return ["SE audio_path must equal the harness-assigned output_path"], None
+    for input_path in forbidden_inputs:
+        try:
+            aliases_input = resolved.samefile(input_path)
+        except OSError:
+            aliases_input = False
+        if aliases_input:
+            return ["SE audio_path must not alias noisy or clean input audio"], None
+    try:
+        with wave.open(str(resolved), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                return ["SE audio_path must be a non-empty PCM WAV"], None
+    except (EOFError, OSError, wave.Error):
+        return ["SE audio_path must be a readable PCM WAV"], None
+    return [], resolved
+
+
 def _read_line(fd: int, buffer: bytearray, deadline: float) -> str | None:
     """Read one line from fd before deadline; None on timeout or EOF."""
     while True:
@@ -320,12 +430,17 @@ def main() -> int:
     proc: subprocess.Popen | None = None
     try:
         if fixture_gt_jsonl is not None:
-            if args.tool != "kws_predict":
-                raise ValueError("--fixture-gt-jsonl is only valid with --tool kws_predict")
-            calls = load_kws_fixture(fixture_gt_jsonl)
+            if args.tool == "kws_predict":
+                calls = [(*call, None) for call in load_kws_fixture(fixture_gt_jsonl)]
+            elif args.tool == "enhance_speech":
+                calls = load_se_fixture(fixture_gt_jsonl)
+            else:
+                raise ValueError(
+                    "--fixture-gt-jsonl is only valid with --tool kws_predict or enhance_speech"
+                )
         else:
             assert audio is not None
-            calls = [(audio.stem, audio, None)]
+            calls = [(audio.stem, audio, None, None)]
         proc = subprocess.Popen(
             args.server_command,
             stdin=subprocess.PIPE,
@@ -360,7 +475,15 @@ def main() -> int:
         primary_field = primary_output_field(args.tool)
         sample_evidence: list[dict] = []
         all_calls_ok = True
-        for request_id, (key, call_audio, fixture_row) in enumerate(calls, 3):
+        for sample_index, (key, call_audio, fixture_row, reference_audio) in enumerate(calls, 1):
+            request_id = sample_index + 2
+            requested_output = (
+                mcp_output_path(produces, key, sample_index)
+                if args.tool == "enhance_speech"
+                else None
+            )
+            if requested_output is not None and (requested_output.exists() or requested_output.is_symlink()):
+                requested_output.unlink()
             ok, payload = False, {}
             if _send(
                 proc,
@@ -370,7 +493,12 @@ def main() -> int:
                     "method": "tools/call",
                     "params": {
                         "name": args.tool,
-                        "arguments": tool_arguments(args.tool, call_audio, fixture_row),
+                        "arguments": tool_arguments(
+                            args.tool,
+                            call_audio,
+                            fixture_row,
+                            requested_output,
+                        ),
                     },
                 },
                 deadline,
@@ -392,9 +520,21 @@ def main() -> int:
                 if args.tool == "kws_predict" and fixture_row is not None
                 else []
             )
+            generated_audio: Path | None = None
+            if args.tool == "enhance_speech":
+                se_violations, generated_audio = validate_se_output(
+                    parsed,
+                    key=key,
+                    outputs_root=produces.parent / "outputs",
+                    expected_path=requested_output,
+                    forbidden_inputs=tuple(
+                        path for path in (call_audio, reference_audio) if path is not None
+                    ),
+                )
+                violations.extend(se_violations)
             call_ok = ok and output_nonempty and not violations
             all_calls_ok = all_calls_ok and call_ok
-            result_preview = (
+            result_preview: object = (
                 {
                     field: parsed.get(field)
                     for field in ("detected", "keyword", "score")
@@ -403,15 +543,34 @@ def main() -> int:
                 if isinstance(parsed, dict) and args.tool == "kws_predict"
                 else primary_value
             )
+            if args.tool == "enhance_speech":
+                result_preview = (
+                    {
+                        "audio_path": f"outputs/{generated_audio.name}",
+                        "audio_sha256": sha256_file(generated_audio),
+                    }
+                    if generated_audio is not None
+                    else None
+                )
             sample_evidence.append(
                 {
                     "key": key,
                     "audio": (
-                        str(fixture_row.get("audio") or fixture_row.get("wav"))
+                        str(
+                            fixture_row.get("noisy_audio")
+                            or fixture_row.get("audio")
+                            or fixture_row.get("wav")
+                        )
                         if fixture_row is not None
                         else call_audio.name
                     ),
                     "audio_sha256": sha256_file(call_audio),
+                    "reference_audio": (
+                        str(fixture_row.get("reference_audio"))
+                        if fixture_row is not None and reference_audio is not None
+                        else None
+                    ),
+                    "reference_audio_sha256": sha256_file(reference_audio),
                     "ok": call_ok,
                     "output_nonempty": output_nonempty,
                     "result": result_preview,

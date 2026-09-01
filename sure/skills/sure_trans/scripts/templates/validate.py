@@ -18,11 +18,13 @@ artifacts directory (in-container runs mount the run artifacts there).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import sys
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -259,6 +261,144 @@ def run_kws_fixture(wrapper: Any) -> dict[str, Any]:
     return {"rows": output_rows}
 
 
+def se_fixture_rows() -> list[tuple[Path, dict[str, Any]]]:
+    rows: list[tuple[Path, dict[str, Any]]] = []
+    for gt_path in sorted((MODEL_DIR / "fixture" / "se").glob("**/gt.jsonl")):
+        for line_number, line in enumerate(gt_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"{gt_path}:{line_number} must be a JSON object")
+            rows.append((gt_path, row))
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("SE validation requires 1 to 5 noisy/clean fixture rows")
+    return rows
+
+
+def se_fixture_audio(gt_path: Path, row: dict[str, Any], role: str, key: str) -> Path:
+    value = row.get(role, row.get("audio")) if role == "noisy_audio" else row.get(role)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"SE fixture {key} requires {role}")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"SE fixture {key} {role} path must be relative and contained")
+    path = gt_path.parent / relative
+    if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(gt_path.parent.resolve()):
+        raise ValueError(f"SE fixture {key} {role} is missing or unsafe")
+    return path.resolve()
+
+
+def validation_outputs_root() -> Path:
+    root = ARTIFACTS_DIR / "outputs"
+    if root.is_symlink():
+        raise ValueError("SE validation outputs directory must not be a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir() or not os.access(root, os.W_OK):
+        raise ValueError("SE validation outputs directory must be writable")
+    return root.resolve()
+
+
+def se_output_path(key: str, index: int) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return validation_outputs_root() / f"{index:02d}-{digest}.wav"
+
+
+def resolve_se_generated_audio(
+    value: Any,
+    *,
+    key: str,
+    expected_path: Path | None = None,
+    forbidden_inputs: tuple[Path, ...] = (),
+) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"SE result {key} requires audio_path")
+    raw_path = Path(value)
+    path = raw_path if raw_path.is_absolute() else validation_outputs_root() / raw_path
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"SE result {key} audio_path must be a real non-empty file")
+    root = validation_outputs_root()
+    try:
+        lexical_relative = path.absolute().relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"SE result {key} audio_path must stay below validation outputs") from error
+    current = root
+    for part in lexical_relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"SE result {key} audio_path must not traverse a symlink")
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"SE result {key} audio_path must stay below validation outputs")
+    if expected_path is not None and (
+        path.absolute() != expected_path.absolute()
+        or resolved != expected_path.resolve()
+    ):
+        raise ValueError(
+            f"SE result {key} audio_path must equal the harness-assigned output_path"
+        )
+    for input_path in forbidden_inputs:
+        try:
+            aliases_input = resolved.samefile(input_path)
+        except OSError:
+            aliases_input = False
+        if aliases_input:
+            raise ValueError(
+                f"SE result {key} audio_path must not alias noisy or clean input audio"
+            )
+    try:
+        with wave.open(str(resolved), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                raise ValueError(f"SE result {key} must be a non-empty PCM WAV")
+    except (EOFError, OSError, wave.Error) as error:
+        raise ValueError(f"SE result {key} must be a readable PCM WAV: {error}") from error
+    return resolved
+
+
+def run_se_fixture(wrapper: Any) -> dict[str, Any]:
+    output_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, (gt_path, reference) in enumerate(se_fixture_rows(), 1):
+        key = str(reference.get("sample_id") or reference.get("key") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"SE fixture key is missing or duplicated: {key!r}")
+        seen.add(key)
+        noisy_audio = se_fixture_audio(gt_path, reference, "noisy_audio", key)
+        clean_audio = se_fixture_audio(gt_path, reference, "reference_audio", key)
+        if noisy_audio.samefile(clean_audio):
+            raise ValueError(
+                f"SE fixture {key} noisy_audio and reference_audio must be independent files"
+            )
+        requested_output = se_output_path(key, index)
+        if requested_output.exists() or requested_output.is_symlink():
+            requested_output.unlink()
+        result = run_predict(
+            wrapper,
+            {
+                "audio_path": str(noisy_audio),
+                "output_path": str(requested_output),
+            },
+            scalar_fallback=False,
+        )
+        if not isinstance(result, dict):
+            raise ValueError(f"SE sample {key} result must be an object")
+        generated = resolve_se_generated_audio(
+            result.get("audio_path"),
+            key=key,
+            expected_path=requested_output,
+            forbidden_inputs=(noisy_audio, clean_audio),
+        )
+        result["audio_path"] = str(generated)
+        output_rows.append({"key": key, "sample_id": key, "result": result})
+    return {"rows": output_rows}
+
+
 def to_plain(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return to_plain(value.to_dict())
@@ -381,6 +521,57 @@ def validate_kws_output_document(sample: dict[str, Any], contract: dict[str, Any
     return violations
 
 
+def validate_se_output_document(sample: dict[str, Any], contract: dict[str, Any]) -> list[str]:
+    rows = sample.get("rows")
+    if not isinstance(rows, list):
+        return ["SE sample_output.json must be an object with a rows array"]
+    references: dict[str, tuple[Path, Path, Path]] = {}
+    for fixture_index, (gt_path, reference) in enumerate(se_fixture_rows(), 1):
+        key = str(reference.get("sample_id") or reference.get("key") or "")
+        if not key or key in references:
+            return [f"SE fixture key is missing or duplicated: {key!r}"]
+        references[key] = (
+            se_fixture_audio(gt_path, reference, "noisy_audio", key),
+            se_fixture_audio(gt_path, reference, "reference_audio", key),
+            se_output_path(key, fixture_index),
+        )
+    outputs: set[str] = set()
+    violations: list[str] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            violations.append(f"rows[{index}] must be an object")
+            continue
+        key = str(row.get("sample_id") or row.get("key") or "")
+        if not key or key in outputs:
+            violations.append(f"SE output key is missing or duplicated: {key!r}")
+            continue
+        outputs.add(key)
+        result = row.get("result")
+        if not isinstance(result, dict):
+            violations.append(f"SE output {key} result must be an object")
+            continue
+        violations.extend(f"SE output {key}: {item}" for item in validate_contract(result, contract))
+        try:
+            if key not in references:
+                raise ValueError(f"unexpected SE output key: {key}")
+            noisy_audio, clean_audio, expected_path = references[key]
+            resolve_se_generated_audio(
+                result.get("audio_path"),
+                key=key,
+                expected_path=expected_path,
+                forbidden_inputs=(noisy_audio, clean_audio),
+            )
+        except ValueError as error:
+            violations.append(str(error))
+    missing = sorted(set(references) - outputs)
+    extra = sorted(outputs - set(references))
+    if missing:
+        violations.append(f"missing SE output keys: {', '.join(missing)}")
+    if extra:
+        violations.append(f"unexpected SE output keys: {', '.join(extra)}")
+    return violations
+
+
 def stage_import() -> bool:
     started = time.time()
     try:
@@ -411,8 +602,11 @@ def stage_infer() -> bool:
     started = time.time()
     try:
         wrapper = load_wrapper()
-        if TASK_TYPE.lower().replace("-", "_") == "kws":
+        task = TASK_TYPE.lower().replace("-", "_")
+        if task == "kws":
             sample = run_kws_fixture(wrapper)
+        elif task == "se":
+            sample = run_se_fixture(wrapper)
         else:
             payload = first_fixture_payload()
             sample = run_predict(wrapper, payload)
@@ -451,8 +645,11 @@ def stage_contract() -> bool:
         if not isinstance(sample, dict):
             raise ValueError("sample_output.json must be an object")
         contract = load_io_contract()
-        if TASK_TYPE.lower().replace("-", "_") == "kws":
+        task = TASK_TYPE.lower().replace("-", "_")
+        if task == "kws":
             violations = validate_kws_output_document(sample, contract)
+        elif task == "se":
+            violations = validate_se_output_document(sample, contract)
         else:
             violations = validate_contract(sample, contract)
         if violations:

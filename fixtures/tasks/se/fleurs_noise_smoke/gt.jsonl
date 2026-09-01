@@ -1,0 +1,1 @@
+{"key":"fleurs_ar_eg_1993_noise_10db","audio":"noisy.wav","reference_audio":"clean.wav","task":"SE","language":"n/a","sample_rate":16000,"duration":8.16,"metadata":{"noise_type":"deterministic_white_gaussian","target_snr_db":10.0,"actual_snr_db":10.010540483548581,"seed":20260902}}

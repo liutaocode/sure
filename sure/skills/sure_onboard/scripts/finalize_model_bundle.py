@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,9 @@ def ensure_safe_bundle_targets(model_dir: Path, resolved: dict[str, Any]) -> Non
     artifacts.mkdir(parents=True, exist_ok=True)
     if not artifacts.is_dir() or not artifacts.resolve().is_relative_to(model_dir.resolve()):
         raise ValueError("model artifacts directory escapes the model bundle")
+    outputs = artifacts / "outputs"
+    if outputs.is_symlink():
+        raise ValueError("model outputs directory must not be a symlink")
     for name in (
         *CORE_TERMINAL_ARTIFACTS,
         MODEL_RUNTIME_ARTIFACT,
@@ -145,12 +149,72 @@ def weights_integrity(model_dir: Path, weights_manifest: dict[str, Any]) -> str:
     return "bundled" if resolve_weights_root(model_dir, weights_manifest) is not None else "external"
 
 
+def canonical_task(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
+    return normalized
+
+
+def bundled_output_files(model_dir: Path, *, require_pcm_wav: bool) -> list[Path]:
+    root = model_dir / "artifacts" / "outputs"
+    if root.is_symlink():
+        raise ValueError("model outputs directory must not be a symlink")
+    if not root.exists():
+        return []
+    if not root.is_dir():
+        raise ValueError("model outputs path must be a directory")
+    resolved_root = root.resolve()
+    files: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"model outputs must not contain symlinks: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file() or not path.resolve().is_relative_to(resolved_root):
+            raise ValueError(f"model outputs contain an unsafe entry: {path}")
+        if path.stat().st_size <= 0:
+            raise ValueError(f"model output is empty: {path}")
+        if require_pcm_wav:
+            try:
+                with wave.open(str(path), "rb") as handle:
+                    if (
+                        handle.getcomptype() != "NONE"
+                        or handle.getnchannels() < 1
+                        or handle.getsampwidth() not in {1, 2, 3, 4}
+                        or handle.getframerate() < 1
+                        or handle.getnframes() < 1
+                    ):
+                        raise ValueError(f"SE model output must be a non-empty PCM WAV: {path}")
+            except (EOFError, OSError, wave.Error) as error:
+                raise ValueError(f"SE model output must be a readable PCM WAV: {path}: {error}") from error
+        files.append(path)
+    return files
+
+
+def validate_portable_se_sample_output(model_dir: Path, sample_output: Path) -> None:
+    if not sample_output.is_file():
+        return
+    sample = read_json(sample_output)
+    value = sample.get("audio_path")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("SE sample_output.json requires audio_path")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts or relative.parts[:2] != ("artifacts", "outputs"):
+        raise ValueError(f"SE sample_output audio_path must be portable: {value}")
+    resolved = (model_dir / relative).resolve()
+    output_root = (model_dir / "artifacts" / "outputs").resolve()
+    if not resolved.is_file() or not resolved.is_relative_to(output_root):
+        raise ValueError(f"SE sample_output audio_path is missing from model outputs: {value}")
+
+
 def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]:
     manifest_path = model_dir / "artifacts" / "artifact_manifest.json"
     manifest = read_json(manifest_path)
     required = manifest.setdefault("artifacts", {}).setdefault("required", {})
     profile = str(resolved.get("package_profile") or "none")
     deployment_type = str(resolved.get("deployment_type") or "local")
+    task = canonical_task(resolved.get("task_type"))
     generated_paths = {
         *(f"artifacts/{name}" for name in CORE_TERMINAL_ARTIFACTS),
         f"artifacts/{MODEL_RUNTIME_ARTIFACT}",
@@ -159,7 +223,8 @@ def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]
         "artifacts/deployment_ready.json",
     }
     for key, entry in list(required.items()):
-        if isinstance(entry, dict) and entry.get("path") in generated_paths:
+        path = str(entry.get("path") or "") if isinstance(entry, dict) else ""
+        if path in generated_paths or path.startswith("artifacts/outputs/"):
             required.pop(key)
     delivery_required = (
         DELIVERY_ARTIFACTS
@@ -194,6 +259,17 @@ def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]
         required["sample_output_json"] = {
             "path": "artifacts/sample_output.json",
             "description": "Bounded inference sample output.",
+        }
+    output_files = bundled_output_files(model_dir, require_pcm_wav=task == "se")
+    if ready_profile and task == "se" and not output_files:
+        raise ValueError("ready SE bundle is missing generated audio under artifacts/outputs")
+    if task == "se":
+        validate_portable_se_sample_output(model_dir, sample_output)
+    for output_file in output_files:
+        relative = output_file.relative_to(model_dir).as_posix()
+        required[f"file:{relative}"] = {
+            "path": relative,
+            "description": f"Generated model output: {relative}.",
         }
     fixture_root = model_dir / "fixture"
     fixture_files = sorted(path for path in fixture_root.rglob("*") if path.is_file()) if fixture_root.is_dir() else []

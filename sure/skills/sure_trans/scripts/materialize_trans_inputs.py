@@ -38,7 +38,15 @@ MODEL_FRAMEWORK_ALIASES = {
 }
 MODEL_FRAMEWORK = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
-TASK_TYPES = {"asr", "kws", "s2tt", "tts", "vc"}
+TASK_TYPES = {"asr", "kws", "s2tt", "se", "tts", "vc"}
+TASK_TYPE_ALIASES = {
+    "acoustic noise suppression": "se",
+    "acoustic-noise-suppression": "se",
+    "acoustic_noise_suppression": "se",
+    "speech enhancement": "se",
+    "speech-enhancement": "se",
+    "speech_enhancement": "se",
+}
 TASK_MARKERS = {
     "asr": ("asr", "transcribe", "speech recognition", "speech_recognition"),
     "kws": (
@@ -52,6 +60,15 @@ TASK_MARKERS = {
         "wake_word",
         "hotword",
         "kws_predict",
+    ),
+    "se": (
+        "speech enhancement",
+        "speech-enhancement",
+        "speech_enhancement",
+        "enhance_speech",
+        "enhance_audio",
+        "denoise_audio",
+        "speech denoising",
     ),
     "s2tt": ("s2tt", "speech translation", "translate_audio", "speech_to_text_translation"),
     "tts": ("tts", "text to speech", "text-to-speech", "synthesize_speech"),
@@ -91,7 +108,8 @@ def existing_absolute(value: str, label: str) -> Path:
 
 def resolve_task_type(explicit: str | None, inference_entrypoint: Path, model_path: Path) -> str:
     if explicit:
-        task_type = explicit.strip().lower()
+        raw_task_type = explicit.strip().lower()
+        task_type = TASK_TYPE_ALIASES.get(raw_task_type, raw_task_type)
         if task_type not in TASK_TYPES:
             raise ValueError(f"unsupported task type {explicit!r}; expected one of {sorted(TASK_TYPES)}")
         return task_type
@@ -122,7 +140,7 @@ def resolve_task_type(explicit: str | None, inference_entrypoint: Path, model_pa
     winners = [task_type for task_type, score in scores.items() if score == highest and score > 0]
     if len(winners) != 1:
         raise ValueError(
-            "task_type could not be inferred unambiguously; pass task_type=asr|kws|s2tt|tts|vc"
+            "task_type could not be inferred unambiguously; pass task_type=asr|kws|s2tt|se|tts|vc"
         )
     return winners[0]
 

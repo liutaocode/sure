@@ -127,6 +127,7 @@ else:
         "S2TT": "translate_audio",
         "TTS": "synthesize_speech",
         "VC": "convert_voice",
+        "SE": "enhance_speech",
     }
     if task in defaults:
         print(defaults[task])

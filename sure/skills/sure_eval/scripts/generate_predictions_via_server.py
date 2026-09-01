@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
@@ -287,6 +288,36 @@ def _sample_reference_audio_path(repo_root: Path, sample: dict[str, Any], fallba
     return _resolve_audio_field_path(repo_root, value) or fallback
 
 
+def _se_run_output_path(output_audio_dir: Path, key: str) -> Path:
+    root = output_audio_dir.expanduser().absolute()
+    if root.is_symlink():
+        raise ValueError(f"SE output directory must not be a symlink: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    if root.resolve() != root:
+        raise ValueError(f"SE output directory must not traverse a symlink: {root}")
+    output = (root / f"{_safe_filename(key)}.wav").absolute()
+    if output.parent != root or output.is_symlink():
+        raise ValueError(f"SE output_path must be a direct non-symlink child of {root}")
+    return output
+
+
+def _validate_pcm_wav(path: Path, *, label: str) -> None:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"{label} must be a real non-empty file: {path}")
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                raise ValueError(f"{label} must be a readable non-empty PCM WAV: {path}")
+    except (EOFError, OSError, wave.Error) as exc:
+        raise ValueError(f"{label} must be a readable non-empty PCM WAV: {path}") from exc
+
+
 def _validate_kws_threshold(value: Any, *, source: str) -> float:
     if (
         isinstance(value, bool)
@@ -315,6 +346,15 @@ def _build_tool_arguments(
     tool_args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     task_name = task.upper()
+    if task_name == "SE":
+        key = str(sample.get("key", "sample"))
+        output_audio_path = str(_se_run_output_path(output_audio_dir, key))
+        arguments: dict[str, Any] = {argument_name: str(audio_path)}
+        if tool_args:
+            arguments.update(tool_args)
+        arguments["output_path"] = output_audio_path
+        return arguments
+
     if task_name in {"TTS", "VC"}:
         key = str(sample.get("key", "sample"))
         prompt_audio_path = _sample_reference_audio_path(repo_root, sample, audio_path)
@@ -726,6 +766,7 @@ def _normalize_prediction_payload(
     *,
     task: str,
     kws_require_score: bool = False,
+    expected_audio_output: str | Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     task_name = task.upper()
     if isinstance(payload, dict):
@@ -760,6 +801,36 @@ def _normalize_prediction_payload(
                 if prediction.get(key) is not None:
                     normalized[key] = prediction[key]
             return str(value), normalized
+        if task_name == "SE":
+            value = (
+                prediction.get("audio_path")
+                or prediction.get("enhanced_audio")
+                or prediction.get("path")
+                or prediction.get("output_path")
+            )
+            if not value:
+                raise ValueError("SE prediction payload must contain audio_path or enhanced_audio")
+            audio_path = Path(str(value)).expanduser()
+            if not audio_path.is_absolute():
+                raise ValueError("SE prediction audio path must be absolute")
+            audio_path = audio_path.absolute()
+            if expected_audio_output is not None:
+                expected_path = Path(expected_audio_output).expanduser().absolute()
+                output_root = expected_path.parent
+                if output_root.is_symlink() or output_root.resolve() != output_root:
+                    raise ValueError("SE run-local output directory must not traverse a symlink")
+                if audio_path != expected_path:
+                    raise ValueError(
+                        f"SE prediction audio path differs from run-local output_path: {audio_path}"
+                    )
+                if not audio_path.is_relative_to(output_root):
+                    raise ValueError("SE prediction audio path escapes the run-local output directory")
+            _validate_pcm_wav(audio_path, label="SE prediction audio")
+            resolved_audio = str(audio_path)
+            return resolved_audio, {
+                "audio_path": resolved_audio,
+                "enhanced_audio": resolved_audio,
+            }
         if task_name in {"SER", "GR"}:
             value = prediction.get("label") or payload.get("label") or payload.get("text") or ""
             return str(value), {"label": str(value)}
@@ -839,6 +910,8 @@ def _normalize_prediction_payload(
         return value, {"label": value}
     if task_name in {"SD", "SA-ASR"}:
         return value, {"annotation": value}
+    if task_name == "SE":
+        raise ValueError("SE prediction payload must be a JSON object with an audio path")
     if task_name == "KWS":
         raise ValueError("KWS prediction payload must be a JSON object with detected, keyword, and score")
     return value, {"text": value}
@@ -1409,6 +1482,7 @@ def main() -> int:
                         raw_payload,
                         task=sample_task,
                         kws_require_score=_kws_metrics_require_scores(generation_metrics),
+                        expected_audio_output=arguments.get("output_path") if sample_task == "SE" else None,
                     )
                     prediction_map[key] = prediction
                     structured_map[key] = {

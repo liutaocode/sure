@@ -12,6 +12,7 @@
 | TTS | [TTS.md](TTS.md) | F5-TTS、IndexTTS-2、带音色参考的语音合成 |
 | VC | [VC.md](VC.md) | Seed-VC、音频到音频的 voice conversion |
 | KWS | [KWS.md](KWS.md) | keyword spotting、WekWS、唤醒词模型 |
+| SE | [SE.md](SE.md) | speech enhancement、speech denoising、acoustic noise suppression |
 
 维护规则：
 

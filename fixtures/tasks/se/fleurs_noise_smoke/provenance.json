@@ -1,0 +1,36 @@
+{
+  "schema": "sure.fixture_provenance.v1",
+  "dataset": {
+    "repository": "google/fleurs",
+    "revision": "70bb2e84b976b7e960aa89f1c648e09c59f894dd",
+    "configuration": "ar_eg",
+    "split": "test",
+    "metadata_sha256": "af9b9aa3f99c39f90e7f8417f10f2f45a7f783441c6a27abfc2c1bededed4af1",
+    "license": "CC-BY-4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/google/fleurs/tree/70bb2e84b976b7e960aa89f1c648e09c59f894dd/data/ar_eg",
+    "citation_url": "https://arxiv.org/abs/2205.12446"
+  },
+  "selection": {
+    "rule": "reuse sentence id 1993 from the tracked FLEURS Arabic smoke fixture",
+    "sentence_ids": [1993],
+    "transforms": [
+      "convert source mono 16 kHz float32 WAV to clipped PCM16",
+      "add deterministic Gaussian white noise with seed 20260902 at 10 dB target SNR"
+    ]
+  },
+  "files": [
+    {
+      "path": "clean.wav",
+      "source_path": "test/10019390257075855641.wav",
+      "role": "reference_audio",
+      "sha256": "276cc1709781855a5533db09818abb24add89185fec1eae18f052fe309437525"
+    },
+    {
+      "path": "noisy.wav",
+      "source_path": "derived from test/10019390257075855641.wav",
+      "role": "audio",
+      "sha256": "ed8d3cf6cbfd88c2bbf2fd82e7ff1721b24e8fc0a6a2ab8c47bc3ad21faf6cb7"
+    }
+  ]
+}

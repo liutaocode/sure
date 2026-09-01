@@ -65,6 +65,20 @@ class TaskCompatibilityPolicyTests(unittest.TestCase):
             [{"name": "kws-dataset", "task": "KWS"}],
         )
 
+    def test_se_model_rejects_asr_dataset(self) -> None:
+        with self.assertRaisesRegex(resolve_eval_input.EvalInputError, "Task mismatch"):
+            resolve_eval_input._check_task_compatibility(
+                {"name": "se-model", "declared_task": "SE"},
+                [{"name": "asr-dataset", "task": "ASR"}],
+            )
+
+    def test_asr_model_rejects_se_dataset(self) -> None:
+        with self.assertRaisesRegex(resolve_eval_input.EvalInputError, "Task mismatch"):
+            resolve_eval_input._check_task_compatibility(
+                {"name": "asr-model", "declared_task": "ASR"},
+                [{"name": "se-dataset", "task": "SE"}],
+            )
+
     def test_other_non_synthesis_tasks_keep_existing_compatibility(self) -> None:
         resolve_eval_input._check_task_compatibility(
             {"name": "asr-model", "declared_task": "ASR"},

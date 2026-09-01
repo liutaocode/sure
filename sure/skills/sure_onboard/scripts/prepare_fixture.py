@@ -27,7 +27,10 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def canonical_task(task: str) -> str:
-    return task.replace("-", "_").lower()
+    normalized = task.replace("-", "_").lower()
+    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
+    return normalized
 
 
 def infer_repo_root(model_dir: Path) -> Path:
@@ -69,7 +72,7 @@ def default_fixture_dir(repo_root: Path, task: str) -> Path | None:
     return options[0] if options else None
 
 
-def load_samples(source_dir: Path) -> list[dict[str, Any]]:
+def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
     gt = source_dir / "gt.jsonl"
     samples: list[dict[str, Any]] = []
     for line_no, line in enumerate(gt.read_text(encoding="utf-8").splitlines(), 1):
@@ -89,16 +92,36 @@ def load_samples(source_dir: Path) -> list[dict[str, Any]]:
             raise ValueError(f"{gt}:{line_no} audio path must be relative and stay inside the fixture directory")
         if not (source_dir / audio_path).exists():
             raise FileNotFoundError(f"Fixture audio referenced by {gt}:{line_no} does not exist: {audio}")
+        reference_audio = row.get("reference_audio")
+        reference_path: Path | None = None
+        if task == "se":
+            if not isinstance(reference_audio, str) or not reference_audio:
+                raise ValueError(f"{gt}:{line_no} task se requires a non-empty reference_audio")
+            reference_path = Path(reference_audio)
+            if reference_path.is_absolute() or ".." in reference_path.parts:
+                raise ValueError(
+                    f"{gt}:{line_no} reference_audio must be relative and stay inside the fixture directory"
+                )
+            if not (source_dir / reference_path).is_file():
+                raise FileNotFoundError(
+                    f"Fixture reference_audio referenced by {gt}:{line_no} does not exist: {reference_audio}"
+                )
+            if (source_dir / reference_path).samefile(source_dir / audio_path):
+                raise ValueError(
+                    f"{gt}:{line_no} task se audio and reference_audio must be independent files"
+                )
         key = row.get("key") or row.get("id") or audio_path.stem
         annotation_fields = [
             field
             for field in ("ground_truth", "target_text", "text", "segments", "label", "intent")
             if field in row
         ]
+        if task == "se" and isinstance(reference_audio, str) and reference_audio:
+            annotation_fields.append("reference_audio")
         if not annotation_fields:
             raise ValueError(
                 f"{gt}:{line_no} must contain at least one annotation field "
-                "(ground_truth, target_text, text, segments, label, or intent)"
+                "(ground_truth, target_text, text, segments, label, intent, or reference_audio)"
             )
         sample = {
             "key": str(key),
@@ -106,6 +129,9 @@ def load_samples(source_dir: Path) -> list[dict[str, Any]]:
             "audio_path": str((source_dir / audio_path).resolve()),
             "annotation_fields": annotation_fields,
         }
+        if task == "se" and reference_path is not None:
+            sample["reference_audio"] = str(reference_audio)
+            sample["reference_audio_path"] = str((source_dir / reference_path).resolve())
         if isinstance(row.get("duration_sec"), (int, float)):
             sample["duration_sec"] = row["duration_sec"]
         if isinstance(row.get("sample_rate"), (int, float)):
@@ -167,12 +193,12 @@ def main() -> int:
         print(f"Fixture source must contain gt.jsonl: {source_dir}", file=sys.stderr)
         return 1
 
-    samples = load_samples(source_dir)
+    samples = load_samples(source_dir, task)
     staged_dir = model_dir / "fixture" / task / source_dir.name
     replace_tree(source_dir, staged_dir)
 
     staged_samples = []
-    for sample in load_samples(staged_dir):
+    for sample in load_samples(staged_dir, task):
         staged_samples.append(sample)
 
     manifest = {

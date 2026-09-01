@@ -74,6 +74,7 @@ const TASK_TYPES = [
 	"s2tt",
 	"sd",
 	"ser",
+	"se",
 	"tts",
 	"vc",
 	"kws",
@@ -85,6 +86,15 @@ const TASK_TYPES = [
 ];
 const DEPLOYMENT_TYPES = ["local", "api"];
 const PACKAGE_PROFILES = ["none", "docker-local", "docker-registry"];
+
+function canonicalTaskType(value: string): string {
+	const raw = value.trim().toLowerCase();
+	const normalized = raw.replace(/-/g, "_");
+	if (normalized === "speech_enhancement" || normalized === "acoustic_noise_suppression") {
+		return "se";
+	}
+	return raw;
+}
 
 interface ResolvedOnboardArgs {
 	args: Record<string, string>;
@@ -544,6 +554,9 @@ export function preStart(ctx: SureHookContext): SureHookResult {
 		return failure(resolved.error, "Invalid model_input_path.");
 	}
 	const args = resolved.args;
+	if (args.task_type) {
+		args.task_type = canonicalTaskType(args.task_type);
+	}
 	if (!args.package_profile && args.package) {
 		args.package_profile = args.package;
 	}

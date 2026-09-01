@@ -16,6 +16,8 @@ def normalize_task(task: str) -> str:
     value = str(task or "").strip().lower().replace("-", "_")
     if value in {"sa_asr", "saasr"}:
         return "sa_asr"
+    if value in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
     return value
 
 
@@ -113,6 +115,18 @@ def _path_from_row(row: dict[str, Any], sample_dir: Path, repo_root: Path) -> st
     return _rel(path, repo_root)
 
 
+def _named_audio_path(
+    row: dict[str, Any], field: str, sample_dir: Path, repo_root: Path
+) -> str | None:
+    value = row.get(field)
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        path = sample_dir / path
+    return _rel(path, repo_root)
+
+
 def _compact_sample(row: dict[str, Any], sample_dir: Path, repo_root: Path) -> dict[str, Any]:
     sample: dict[str, Any] = {}
     for key in (
@@ -147,6 +161,9 @@ def _compact_sample(row: dict[str, Any], sample_dir: Path, repo_root: Path) -> d
     audio = _path_from_row(row, sample_dir, repo_root)
     if audio:
         sample["audio"] = audio
+    reference_audio = _named_audio_path(row, "reference_audio", sample_dir, repo_root)
+    if reference_audio:
+        sample["reference_audio"] = reference_audio
     return sample
 
 
@@ -186,10 +203,14 @@ def _prefer_gt_files(task: str, gt_files: list[Path], candidate_text: str) -> li
 
 def io_contract_for_task(task: str) -> dict[str, Any]:
     normalized = normalize_task(task)
-    if normalized in {"tts", "vc"}:
+    if normalized in {"tts", "vc", "se"}:
         return {
-            "input_type": "text_with_reference_audio" if normalized == "tts" else "audio_pair",
-            "output_type": "json",
+            "input_type": (
+                "text_with_reference_audio"
+                if normalized == "tts"
+                else "audio_pair" if normalized == "vc" else "audio_path"
+            ),
+            "output_type": "audio" if normalized == "se" else "json",
             "primary_field": "audio_path",
             "required_fields": ["audio_path"],
             "nonempty_fields": ["audio_path"],
@@ -245,6 +266,10 @@ def _apply_task_specific_fields(task: str, fixture: dict[str, Any], samples: lis
             fixture["reference_audio"] = audios[1]
         elif audios:
             fixture["reference_audio"] = audios[0]
+    elif task == "se":
+        reference_audio = first.get("reference_audio")
+        if isinstance(reference_audio, str) and reference_audio:
+            fixture["reference_audio"] = reference_audio
     elif task == "kws":
         polarities = [(sample, _kws_expected_detected(sample)) for sample in samples]
         positives = [sample for sample, expected in polarities if expected]
@@ -314,6 +339,12 @@ def select_atomic_fixture(
             issues.append("missing:fixture.kws.negative")
         if issues:
             return None, io_contract_for_task(normalized), issues
+    if normalized == "se" and any(
+        not isinstance(sample.get("reference_audio"), str)
+        or not str(sample["reference_audio"]).strip()
+        for sample in samples
+    ):
+        return None, io_contract_for_task(normalized), ["missing:fixture.se.reference_audio"]
 
     fixture: dict[str, Any] = {
         "fixture_id": f"{normalized}/{_rel(fixture_root, root).removeprefix(f'fixtures/tasks/{normalized}/')}",

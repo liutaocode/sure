@@ -223,6 +223,108 @@ def validate_kws_fixture_manifest(
     )
 
 
+def validate_se_fixture_manifest(
+    value: dict,
+    *,
+    model_dir: Path,
+    staged_dir: Path,
+    gt_jsonl: Path,
+) -> None:
+    require(staged_dir.is_relative_to(model_dir / "fixture"), "fixture staged_dir must stay under model_dir/fixture")
+    require(Path(str(value.get("staged_path") or "")).resolve() == staged_dir, "SE staged_path must equal staged_dir")
+    require(gt_jsonl.is_file() and gt_jsonl.parent == staged_dir, "SE gt_jsonl must exist directly inside staged_dir")
+    require(value.get("gt_sha256") == sha256_file(gt_jsonl), "SE fixture ground-truth checksum changed")
+    require(value.get("expected_sha256") == sha256_file(gt_jsonl), "SE reference checksum changed")
+
+    rows: list[dict] = []
+    for line_number, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"SE fixture gt_jsonl line {line_number} is invalid JSON: {error}") from error
+        require(isinstance(row, dict), f"SE fixture gt_jsonl line {line_number} must be an object")
+        rows.append(row)
+    require(1 <= len(rows) <= 5, "SE smoke fixture must contain 1 to 5 samples")
+    samples = value.get("samples")
+    require(isinstance(samples, list) and len(samples) == len(rows), "SE samples must mirror gt_jsonl rows")
+    require(value.get("sample_count") == len(rows), "SE sample_count must match gt_jsonl")
+
+    seen_keys: set[str] = set()
+    relative_files = {Path("gt.jsonl")}
+    for index, (row, sample) in enumerate(zip(rows, samples)):
+        require(isinstance(sample, dict), f"SE fixture sample {index} must be an object")
+        key = row.get("sample_id") or row.get("key")
+        require(isinstance(key, str) and bool(key.strip()), f"SE fixture row {index} requires a non-empty key")
+        require(row.get("key") == key and row.get("sample_id") == key, f"SE fixture row {key} key aliases changed")
+        require(key not in seen_keys, f"SE fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        require(sample.get("key") == key, f"SE fixture sample {key} does not mirror gt_jsonl key")
+
+        paths: dict[str, tuple[Path, Path]] = {}
+        for role in ("noisy_audio", "reference_audio"):
+            raw_audio = row.get(role, row.get("audio")) if role == "noisy_audio" else row.get(role)
+            require(isinstance(raw_audio, str) and bool(raw_audio.strip()), f"SE fixture {key} requires {role}")
+            relative_audio = Path(raw_audio)
+            require(
+                not relative_audio.is_absolute() and ".." not in relative_audio.parts,
+                f"SE fixture {key} {role} path must be relative and contained",
+            )
+            audio_path = staged_dir / relative_audio
+            require(
+                audio_path.is_file()
+                and not audio_path.is_symlink()
+                and audio_path.resolve().is_relative_to(staged_dir),
+                f"SE fixture {key} {role} is missing or unsafe",
+            )
+            paths[role] = (relative_audio, audio_path)
+            relative_files.add(relative_audio)
+        require(
+            not paths["noisy_audio"][1].samefile(paths["reference_audio"][1]),
+            f"SE fixture {key} noisy and clean audio must be independent files",
+        )
+
+        noisy_relative, noisy_path = paths["noisy_audio"]
+        clean_relative, clean_path = paths["reference_audio"]
+        require(row.get("audio") == noisy_relative.as_posix(), f"SE fixture row {key} audio alias changed")
+        require(row.get("noisy_audio") == noisy_relative.as_posix(), f"SE fixture row {key} noisy_audio changed")
+        require(sample.get("audio") == noisy_relative.as_posix(), f"SE fixture sample {key} audio path changed")
+        require(sample.get("noisy_audio") == noisy_relative.as_posix(), f"SE fixture sample {key} noisy_audio changed")
+        require(sample.get("reference_audio") == clean_relative.as_posix(), f"SE fixture sample {key} reference_audio changed")
+        require(Path(str(sample.get("audio_path") or "")).resolve() == noisy_path.resolve(), f"SE fixture sample {key} audio_path changed")
+        require(Path(str(sample.get("noisy_audio_path") or "")).resolve() == noisy_path.resolve(), f"SE fixture sample {key} noisy_audio_path changed")
+        require(Path(str(sample.get("reference_audio_path") or "")).resolve() == clean_path.resolve(), f"SE fixture sample {key} reference_audio_path changed")
+        require(sample.get("sha256") == sha256_file(noisy_path), f"SE fixture sample {key} noisy checksum changed")
+        require(sample.get("reference_sha256") == sha256_file(clean_path), f"SE fixture sample {key} clean checksum changed")
+        require(sample.get("size_bytes") == noisy_path.stat().st_size, f"SE fixture sample {key} noisy size changed")
+        require(sample.get("reference_size_bytes") == clean_path.stat().st_size, f"SE fixture sample {key} clean size changed")
+        require(sample.get("annotation_fields") == ["reference_audio"], f"SE sample {key} annotation_fields changed")
+
+    actual_files: set[Path] = set()
+    for path in staged_dir.rglob("*"):
+        require(not path.is_symlink(), f"SE fixture tree must not contain symlinks: {path}")
+        if path.is_file():
+            actual_files.add(path.relative_to(staged_dir))
+    require(actual_files == relative_files, "SE fixture tree must contain only gt.jsonl and referenced audio")
+    require(value.get("sha256") == fixture_tree_identity(staged_dir, relative_files), "SE fixture tree checksum changed")
+    require(
+        value.get("size_bytes") == sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "SE fixture tree size changed",
+    )
+    annotation_source = value.get("annotation_source")
+    require(isinstance(annotation_source, dict), "SE fixture annotation_source must be an object")
+    require(
+        annotation_source.get("type") == "fixture_gt_jsonl"
+        and annotation_source.get("fallback") is False,
+        "SE ground truth must come from fixture gt.jsonl",
+    )
+    require(
+        Path(str(annotation_source.get("staged_path") or "")).resolve() == gt_jsonl,
+        "SE annotation_source staged_path must match gt_jsonl",
+    )
+
+
 def validate_fixture_manifest(value: dict) -> None:
     require(value.get("status") == "ready", "fixture manifest is not ready")
     for key in ("model_dir", "staged_dir", "gt_jsonl", "samples", "annotation_source"):
@@ -236,6 +338,14 @@ def validate_fixture_manifest(value: dict) -> None:
     require(staged_dir.is_dir(), "fixture staged_dir is missing")
     if task == "kws":
         validate_kws_fixture_manifest(
+            value,
+            model_dir=model_dir,
+            staged_dir=staged_dir,
+            gt_jsonl=gt_jsonl,
+        )
+        return
+    if task == "se":
+        validate_se_fixture_manifest(
             value,
             model_dir=model_dir,
             staged_dir=staged_dir,
@@ -631,6 +741,21 @@ def main() -> int:
             require(
                 any(isinstance(tool, dict) and tool.get("name") == "kws_predict" for tool in tools),
                 "KWS adapter config must expose kws_predict",
+            )
+        if str(resolved_input.get("task_type") or "").lower() == "se":
+            contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
+            require(
+                contract.get("input_type") == "audio_path"
+                and contract.get("output_type") == "audio"
+                and contract.get("primary_field") == "audio_path"
+                and contract.get("required_fields") == ["audio_path"]
+                and contract.get("nonempty_fields") == ["audio_path"],
+                "SE adapter io_contract must require generated audio_path",
+            )
+            tools = config.get("tools") if isinstance(config.get("tools"), list) else []
+            require(
+                any(isinstance(tool, dict) and tool.get("name") == "enhance_speech" for tool in tools),
+                "SE adapter config must expose enhance_speech",
             )
         require(
             "COPY --from=sure_harness_runtime" in dockerfile_text,

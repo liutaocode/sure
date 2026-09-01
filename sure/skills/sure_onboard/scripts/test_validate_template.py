@@ -1,14 +1,17 @@
 import importlib.util
 import json
 import os
+import shutil
 import tempfile
 import unittest
+import wave
 from unittest import mock
 from pathlib import Path
 
 
 TEMPLATE = Path(__file__).parent / "templates" / "validate.py"
 STAGE_MODEL_ARTIFACTS = Path(__file__).parent / "stage_model_artifacts.py"
+SE_FIXTURE = Path(__file__).resolve().parents[4] / "fixtures" / "tasks" / "se" / "fleurs_noise_smoke"
 
 
 def load_template():
@@ -304,6 +307,142 @@ class ValidateTemplateTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "keywords"):
                 self.module.fixture_payloads()
+
+    def test_se_validation_uses_only_noisy_input_and_checks_real_output_audio(self):
+        model_dir = Path(self.temp_dir.name) / "model"
+        fixture_dir = model_dir / "fixture" / "se" / "fleurs_noise_smoke"
+        shutil.copytree(SE_FIXTURE, fixture_dir)
+        self.module.MODEL_DIR = model_dir
+        self.module.TASK_TYPE = "speech-enhancement"
+        self.module.IO_CONTRACT = {
+            "input_type": "audio_path",
+            "output_type": "audio",
+            "primary_field": "audio_path",
+            "required_fields": ["audio_path"],
+            "nonempty_fields": ["audio_path"],
+            "json_serializable": True,
+        }
+
+        fixtures = self.module.fixture_payloads()
+        self.assertEqual(len(fixtures), 1)
+        self.assertEqual(set(fixtures[0]["input"]), {"audio_path"})
+        self.assertTrue(fixtures[0]["input"]["audio_path"].endswith("noisy.wav"))
+        self.assertEqual(fixtures[0]["fixture"]["reference_audio"], "clean.wav")
+
+        calls = []
+        enhanced = self.module.se_output_path("fleurs_ar_eg_1993_noise_10db", 1)
+        self.module.load_wrapper = lambda: object()
+
+        def predict(_wrapper, payload):
+            calls.append(dict(payload))
+            enhanced.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(enhanced), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(b"\x00\x00" * 160)
+            return {"audio_path": str(enhanced)}
+
+        self.module.run_predict = predict
+        self.assertTrue(self.module.stage_infer())
+        self.assertTrue(self.module.stage_contract())
+        self.assertEqual(calls[0]["audio_path"], fixtures[0]["input"]["audio_path"])
+        self.assertEqual(calls[0]["output_path"], str(enhanced))
+        self.assertNotIn("reference_audio_path", calls[0])
+        rows = [
+            json.loads(line)
+            for line in self.module.SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(rows[0]["audio"], "noisy.wav")
+        self.assertEqual(rows[0]["reference_audio"], "clean.wav")
+
+        enhanced.write_bytes(b"")
+        self.assertFalse(self.module.stage_contract())
+        result = json.loads(
+            (self.module.ARTIFACTS_DIR / "contract_result.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("SE output audio_path is empty", result["error"])
+
+    def test_se_explicit_input_does_not_forward_reference_audio(self):
+        self.module.TASK_TYPE = "acoustic-noise-suppression"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SURE_VALIDATE_INPUT_JSON": json.dumps(
+                    {
+                        "audio_path": "noisy.wav",
+                        "reference_audio": "clean.wav",
+                        "output_path": "enhanced.wav",
+                    }
+                )
+            },
+            clear=False,
+        ):
+            fixtures = self.module.fixture_payloads()
+        self.assertEqual(
+            fixtures[0]["input"],
+            {"audio_path": "noisy.wav"},
+        )
+        self.assertEqual(fixtures[0]["fixture"]["reference_audio"], "clean.wav")
+
+    def test_se_rejects_input_alias_external_path_symlink_and_non_wav(self):
+        model_dir = Path(self.temp_dir.name) / "model"
+        fixture_dir = model_dir / "fixture" / "se" / "fleurs_noise_smoke"
+        shutil.copytree(SE_FIXTURE, fixture_dir)
+        self.module.MODEL_DIR = model_dir
+        self.module.TASK_TYPE = "se"
+        self.module.IO_CONTRACT = {
+            "input_type": "audio_path",
+            "output_type": "audio",
+            "primary_field": "audio_path",
+            "required_fields": ["audio_path"],
+            "nonempty_fields": ["audio_path"],
+            "json_serializable": True,
+        }
+        self.module.load_wrapper = lambda: object()
+
+        self.module.run_predict = lambda _wrapper, payload: {
+            "audio_path": payload["audio_path"]
+        }
+        self.assertFalse(self.module.stage_infer())
+
+        def non_wav(_wrapper, payload):
+            output = Path(payload["output_path"])
+            output.write_bytes(b"not-a-wave")
+            return {"audio_path": str(output)}
+
+        self.module.run_predict = non_wav
+        self.assertFalse(self.module.stage_infer())
+
+        external = Path(self.temp_dir.name) / "outside.wav"
+        with wave.open(str(external), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16000)
+            handle.writeframes(b"\x00\x00" * 8)
+        self.module.run_predict = lambda _wrapper, _payload: {
+            "audio_path": str(external)
+        }
+        self.assertFalse(self.module.stage_infer())
+
+        target = Path(self.temp_dir.name) / "target.wav"
+        shutil.copy2(external, target)
+
+        def symlink_output(_wrapper, payload):
+            output = Path(payload["output_path"])
+            output.symlink_to(target)
+            return {"audio_path": str(output)}
+
+        self.module.run_predict = symlink_output
+        self.assertFalse(self.module.stage_infer())
+
+        def hardlink_input(_wrapper, payload):
+            output = Path(payload["output_path"])
+            os.link(payload["audio_path"], output)
+            return {"audio_path": str(output)}
+
+        self.module.run_predict = hardlink_input
+        self.assertFalse(self.module.stage_infer())
 
     def test_sample_outputs_jsonl_is_staged(self):
         stage_model_artifacts = load_stage_model_artifacts()

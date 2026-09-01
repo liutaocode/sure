@@ -165,6 +165,14 @@ def _modelscope_model_url(source: dict[str, Any]) -> str:
     return str(source.get("id") or "")
 
 
+def _canonical_task_type(task_type: str) -> str:
+    value = str(task_type or "").strip().lower()
+    normalized = value.replace("-", "_")
+    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
+        return "se"
+    return value
+
+
 def _sure_task_name(task_type: str) -> str:
     mapping = {
         "asr": "ASR",
@@ -173,6 +181,7 @@ def _sure_task_name(task_type: str) -> str:
         "gr": "GR",
         "ser": "SER",
         "tts": "TTS",
+        "se": "SE",
     }
     return mapping.get(task_type.lower(), task_type.upper())
 
@@ -186,6 +195,7 @@ def _default_tool_name(task_type: str) -> str:
         "ser": "emotion_recognize",
         "tts": "tts_synthesize",
         "kws": "kws_predict",
+        "se": "enhance_speech",
     }
     return mapping.get(task_type.lower(), f"{task_type.lower()}_predict")
 
@@ -209,6 +219,15 @@ def _io_contract_for_task(task_type: str) -> dict[str, Any]:
             "primary_field": "detected",
             "required_fields": ["detected", "keyword", "score"],
             "nonempty_fields": ["detected"],
+        }
+    if task == "se":
+        return {
+            "input_field": "audio_path",
+            "input_type": "audio_path",
+            "output_type": "audio",
+            "primary_field": "audio_path",
+            "required_fields": ["audio_path"],
+            "nonempty_fields": ["audio_path"],
         }
     return {
         "input_field": "audio_path",
@@ -241,6 +260,15 @@ def _tool_input_schema_for_task(task_type: str) -> dict[str, Any]:
             },
             "required": ["audio_path"],
         }
+    if task == "se":
+        return {
+            "type": "object",
+            "properties": {
+                "audio_path": {"type": "string"},
+                "output_path": {"type": "string"},
+            },
+            "required": ["audio_path"],
+        }
     input_field = "text" if task == "tts" else "audio_path"
     return {
         "type": "object",
@@ -265,7 +293,7 @@ def _default_model_spec_yaml(
 ) -> str:
     source = _require_mapping(manifest["source"], "source")
     model_id = model_root.name
-    task_type = str(manifest["task_type"]).lower()
+    task_type = _canonical_task_type(str(manifest["task_type"]))
     io_contract = _io_contract_for_task(task_type)
     local_path = None
     if weights_manifest:
@@ -334,13 +362,13 @@ def _default_config_yaml(
     weights_manifest: dict[str, Any] | None,
 ) -> str:
     source = _require_mapping(manifest["source"], "source")
-    task_type = str(manifest["task_type"]).lower()
+    task_type = _canonical_task_type(str(manifest["task_type"]))
     sure_task = _sure_task_name(task_type)
     tool_name = _default_tool_name(task_type)
     io_contract = _io_contract_for_task(task_type)
     input_field = io_contract["input_field"]
     input_description = "Text to synthesize" if input_field == "text" else "Path to an audio file"
-    if task_type == "kws":
+    if task_type in {"kws", "se"}:
         input_schema_block = (
             "    input_schema: "
             + json.dumps(_tool_input_schema_for_task(task_type), ensure_ascii=False, separators=(",", ":"))
@@ -450,7 +478,7 @@ __all__ = ["ModelWrapper", "PredictionResult"]
 
 def _default_model_py(manifest: dict[str, Any]) -> str:
     source = _require_mapping(manifest["source"], "source")
-    task_type = str(manifest["task_type"]).lower()
+    task_type = _canonical_task_type(str(manifest["task_type"]))
     if task_type == "tts":
         predict_body = '''        text = input_data.get("text") if isinstance(input_data, dict) else input_data
         if not text:
@@ -488,6 +516,22 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         result_fields = '''    detected: bool = False
     keyword: str | None = None
     score: float | None = None
+    raw: dict[str, Any] | None = None'''
+    elif task_type == "se":
+        predict_body = '''        if not isinstance(input_data, dict):
+            raise ValueError("SE input must contain audio_path")
+        audio_path = input_data.get("audio_path")
+        output_path = input_data.get("output_path")
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            raise ValueError("audio_path is required")
+        if not Path(audio_path).is_file():
+            raise FileNotFoundError(audio_path)
+        if output_path is not None and (not isinstance(output_path, str) or not output_path.strip()):
+            raise ValueError("output_path must be a non-empty string when provided")
+        if not self.model_loaded:
+            self.load()
+        raise NotImplementedError("SURE tool-agent must implement speech enhancement inference.")'''
+        result_fields = '''    audio_path: str = ""
     raw: dict[str, Any] | None = None'''
     else:
         predict_body = '''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
@@ -559,7 +603,7 @@ def _default_server_py(task_type: str) -> str:
     )
     content_value = (
         "json.dumps(result, ensure_ascii=False)"
-        if task_type.lower() == "kws"
+        if task_type.lower() in {"kws", "se"}
         else f'str(result.get("{content_field}", ""))'
     )
     return f'''#!/usr/bin/env python3
@@ -1486,15 +1530,19 @@ def emit_sure_model_agent_handoff(
     has_weights = weights_manifest is not None
     generated_at = _utc_now()
     model_name = str(manifest["model_name"])
-    task_type = str(manifest["task_type"]).lower()
+    task_type = _canonical_task_type(str(manifest["task_type"]))
 
-    spec_manifest = {**manifest, "_manifest_path": str(manifest_path.resolve())}
+    normalized_manifest = {**manifest, "task_type": task_type}
+    spec_manifest = {
+        **normalized_manifest,
+        "_manifest_path": str(manifest_path.resolve()),
+    }
     spec_path = model_root / "model.spec.yaml"
     _write_text(spec_path, _default_model_spec_yaml(spec_manifest, model_root, weights_manifest))
     generated_scaffold = {
         "config_yaml": _write_generated_text(
             model_root / "config.yaml",
-            _default_config_yaml(manifest, model_root, weights_manifest),
+            _default_config_yaml(normalized_manifest, model_root, weights_manifest),
         ),
         "pyproject_toml": _write_generated_text(model_root / "pyproject.toml", _default_pyproject(model_root.name)),
         "requirements_xforge": _write_generated_text(
@@ -1505,7 +1553,9 @@ def emit_sure_model_agent_handoff(
             model_root / "requirements-local.txt",
             _default_requirements_local(),
         ),
-        "model_py": _write_text_if_missing(model_root / "model.py", _default_model_py(manifest)),
+        "model_py": _write_text_if_missing(
+            model_root / "model.py", _default_model_py(normalized_manifest)
+        ),
         "server_py": _write_text_if_missing(model_root / "server.py", _default_server_py(task_type), executable=True),
         "validate_py": _write_text_if_missing(model_root / "validate.py", _default_validate_py(), executable=True),
         "init_py": _write_text_if_missing(model_root / "__init__.py", _default_init_py()),

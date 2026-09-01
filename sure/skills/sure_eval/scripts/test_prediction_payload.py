@@ -3,12 +3,24 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
+import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import generate_predictions_via_server as gp  # noqa: E402
+
+
+def _write_pcm_wav(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\x00\x00" * 160)
+    return path
 
 
 class AsrPayloadNormalizationTests(unittest.TestCase):
@@ -203,6 +215,112 @@ class KwsPayloadNormalizationTests(unittest.TestCase):
                 task="KWS",
                 kws_require_score=True,
             )
+
+
+class SePayloadTests(unittest.TestCase):
+    def test_builder_materializes_run_local_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "predictions" / "audio" / "dataset"
+            arguments = gp._build_tool_arguments(
+                repo_root=Path(temporary),
+                sample={"key": "utt/1"},
+                task="SE",
+                language="en",
+                argument_name="audio_path",
+                audio_path=Path(temporary) / "noisy.wav",
+                output_audio_dir=output_dir,
+                tool_args={"output_path": "/outside.wav", "strength": 0.5},
+            )
+        self.assertEqual(arguments["audio_path"], str(Path(temporary) / "noisy.wav"))
+        self.assertEqual(arguments["strength"], 0.5)
+        self.assertEqual(arguments["output_path"], str((output_dir / "utt_1.wav").resolve()))
+
+    def test_builder_rejects_lexical_parent_components(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_dir = root / "predictions" / "audio" / "dataset" / ".." / "escape"
+            with self.assertRaisesRegex(ValueError, "must not traverse"):
+                gp._se_run_output_path(output_dir, "utt")
+
+    def test_builder_rejects_symlinked_output_root_or_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            linked_root = root / "linked-root"
+            linked_root.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                gp._se_run_output_path(linked_root, "utt")
+
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                gp._se_run_output_path(linked_parent / "dataset", "utt")
+
+    def test_normalizer_preserves_audio_aliases_and_requires_real_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = _write_pcm_wav(Path(temporary) / "enhanced.wav")
+            projection, normalized = gp._normalize_prediction_payload(
+                {"enhanced_audio": str(output)},
+                task="SE",
+                expected_audio_output=output,
+            )
+        self.assertEqual(projection, str(output.resolve()))
+        self.assertEqual(
+            normalized,
+            {"audio_path": str(output.resolve()), "enhanced_audio": str(output.resolve())},
+        )
+
+    def test_normalizer_rejects_missing_empty_non_wav_or_nonlocal_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            empty = root / "empty.wav"
+            empty.write_bytes(b"")
+            non_wav = root / "not-a-wave.wav"
+            non_wav.write_bytes(b"not a wave")
+            other = root / "other.wav"
+            _write_pcm_wav(other)
+            cases = [
+                ({}, None),
+                ({"audio_path": str(empty)}, empty),
+                ({"audio_path": str(non_wav)}, non_wav),
+                ({"audio_path": str(other)}, root / "expected.wav"),
+            ]
+            for payload, expected in cases:
+                with self.subTest(payload=payload), self.assertRaises(ValueError):
+                    gp._normalize_prediction_payload(
+                        payload,
+                        task="SE",
+                        expected_audio_output=expected,
+                    )
+            with self.assertRaisesRegex(ValueError, "JSON object"):
+                gp._normalize_prediction_payload(str(other), task="SE")
+
+    def test_normalizer_rejects_lexical_alias_of_requested_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected = _write_pcm_wav(root / "audio" / "enhanced.wav")
+            lexical_alias = root / "audio" / "nested" / ".." / "enhanced.wav"
+            with self.assertRaisesRegex(ValueError, "differs from run-local output_path"):
+                gp._normalize_prediction_payload(
+                    {"audio_path": str(lexical_alias)},
+                    task="SE",
+                    expected_audio_output=expected,
+                )
+
+    def test_normalizer_rejects_returned_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = _write_pcm_wav(root / "target.wav")
+            expected = root / "audio" / "enhanced.wav"
+            expected.parent.mkdir()
+            expected.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "real non-empty file"):
+                gp._normalize_prediction_payload(
+                    {"audio_path": str(expected)},
+                    task="SE",
+                    expected_audio_output=expected,
+                )
 
 
 if __name__ == "__main__":

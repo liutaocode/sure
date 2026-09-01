@@ -16,6 +16,7 @@ import argparse
 import json
 import math
 import sys
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,43 @@ def _resolve_audio_path(value: Any, base_dir: Path | None) -> Path:
     return path
 
 
+def _valid_se_pcm_output(value: Any, base_dir: Path | None) -> bool:
+    if base_dir is None or value in (None, ""):
+        return False
+    root = (base_dir / "audio").expanduser().absolute()
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).absolute()
+    else:
+        path = path.absolute()
+    if root.is_symlink() or root.resolve() != root:
+        return False
+    if path.resolve() != path:
+        return False
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    try:
+        with wave.open(str(path), "rb") as handle:
+            return (
+                handle.getcomptype() == "NONE"
+                and handle.getnchannels() >= 1
+                and handle.getsampwidth() in {1, 2, 3, 4}
+                and handle.getframerate() >= 1
+                and handle.getnframes() >= 1
+            )
+    except (EOFError, OSError, wave.Error):
+        return False
+
+
 def _kws_reference_contract_violation(sample: dict[str, Any]) -> bool:
     labels: list[bool] = []
     for field in ("expected", "label", "expected_detected"):
@@ -153,6 +191,14 @@ def _task_contract_violations(
         elif task in {"TTS", "VC"}:
             audio_path = prediction.get("audio_path") or normalized
             if not audio_path or not _resolve_audio_path(audio_path, base_dir).exists():
+                violations.append(key)
+        elif task == "SE":
+            audio_path = prediction.get("audio_path")
+            enhanced_audio = prediction.get("enhanced_audio")
+            if not audio_path or not enhanced_audio or str(audio_path) != str(enhanced_audio):
+                violations.append(key)
+                continue
+            if not _valid_se_pcm_output(audio_path, base_dir):
                 violations.append(key)
         elif task in {"SER", "GR"} and not (prediction.get("label") or normalized):
             violations.append(key)
