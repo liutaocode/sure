@@ -15,7 +15,7 @@
 		"repo_commit": { "type": ["string", "null"] },
 		"task_type": {
 			"type": "string",
-			"enum": ["asr", "s2tt", "sd", "ser", "se", "tts", "vc", "kws", "slu", "gr", "speech_understanding", "sa-asr", "sa_asr"]
+			"enum": ["asr", "s2tt", "sd", "ser", "se", "vad", "tts", "vc", "kws", "slu", "gr", "speech_understanding", "sa-asr", "sa_asr"]
 		},
 		"deployment_type": { "type": "string", "enum": ["local", "api"] },
 		"package_profile": { "type": "string", "enum": ["none", "docker-local", "docker-registry"] },
@@ -65,8 +65,8 @@
 			"type": "object",
 			"required": ["tool_name", "predict_method", "input_fields", "public_inference_parameters", "io_contract"],
 			"properties": {
-				"tool_name": { "type": "string", "enum": ["diarize", "transcribe_with_speakers"] },
-				"predict_method": { "type": "string", "enum": ["diarize", "transcribe_with_speakers"] },
+				"tool_name": { "type": "string", "enum": ["detect_speech", "diarize", "transcribe_with_speakers"] },
+				"predict_method": { "type": "string", "enum": ["detect_speech", "diarize", "transcribe_with_speakers"] },
 				"input_fields": { "const": ["audio_path"] },
 				"public_inference_parameters": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
 				"io_contract": { "type": "object" }

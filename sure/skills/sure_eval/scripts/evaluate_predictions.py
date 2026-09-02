@@ -50,6 +50,7 @@ KWS_POSITIVE_LABELS = {"detect", "detected", "positive", "true", "1", "yes"}
 KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
 KWS_OPERATING_THRESHOLD = 0.5
 ANNOTATION_TASKS = {"SD", "SA-ASR", "SA_ASR"}
+VAD_DETECTION_METRICS = ("f1", "p_fa", "p_miss", "dcf_nist")
 
 LOWER_IS_BETTER_METRICS = {
     "wer",
@@ -57,11 +58,23 @@ LOWER_IS_BETTER_METRICS = {
     "mer",
     "der",
     "cpwer",
+    "p_fa",
+    "p_miss",
+    "dcf_nist",
     "tts_wer",
     "tts_cer",
     "vc_wer",
     "vc_cer",
 }
+
+
+def _normalize_task(value: Any) -> str:
+    normalized = (
+        str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    )
+    if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
+        return "VAD"
+    return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
 def _utc_now() -> str:
@@ -180,6 +193,71 @@ def _scoped_samples(samples: list[dict[str, Any]], max_samples: int) -> list[dic
     return samples[:max_samples] if max_samples > 0 else samples
 
 
+def _vad_has_complete_frame_scores(
+    prediction_path: Path,
+    samples: list[dict[str, Any]],
+) -> bool:
+    structured = load_structured_prediction_map(prediction_path.with_suffix(".jsonl"))
+    if not structured or set(structured) != {str(sample.get("key") or "") for sample in samples}:
+        return False
+    for sample in samples:
+        key = str(sample.get("key") or "")
+        try:
+            duration = _sample_duration_seconds(sample)
+        except ValueError:
+            return False
+        if not key or duration is None:
+            return False
+        row = structured[key]
+        prediction = row.get("prediction") if isinstance(row, dict) else None
+        frame_scores = prediction.get("frame_scores") if isinstance(prediction, dict) else None
+        if not isinstance(frame_scores, list) or not frame_scores:
+            return False
+        try:
+            _validated_vad_intervals(
+                frame_scores,
+                role="frame_scores",
+                key=key,
+                duration=duration,
+                with_score=True,
+            )
+        except ValueError:
+            return False
+    return True
+
+
+def _dataset_evaluation_requests(
+    *,
+    task: str,
+    prediction_path: Path,
+    evaluation_requests: list[tuple[str | None, str | None]],
+    explicit_metric_requested: bool,
+    pipeline_overrides: list[str],
+    samples: list[dict[str, Any]] | None = None,
+) -> list[tuple[str | None, str | None]]:
+    if task != "VAD":
+        return evaluation_requests
+    requested_metric_names = {
+        str(metric).lower().replace("-", "_")
+        for metric, _ in evaluation_requests
+        if metric
+    }
+    auc_requested = "auc_roc" in requested_metric_names or any(
+        ".auc_roc." in str(pipeline_id).lower() for pipeline_id in pipeline_overrides
+    )
+    if auc_requested:
+        if samples is None or not _vad_has_complete_frame_scores(prediction_path, samples):
+            raise ValueError(
+                "VAD auc_roc requires complete frame_scores for every evaluated sample"
+            )
+        return evaluation_requests
+    if pipeline_overrides:
+        return evaluation_requests
+    if explicit_metric_requested and requested_metric_names != set(VAD_DETECTION_METRICS):
+        return evaluation_requests
+    return [(metric, None) for metric in VAD_DETECTION_METRICS]
+
+
 def _write_eval_file(rows: list[str]) -> str:
     handle = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
     handle.write("\n".join(rows) + "\n")
@@ -242,6 +320,7 @@ def _metric_from_sota(
 def _legacy_default_metric(task: str, language: str) -> str:
     return (
         "accuracy" if task in {"SER", "GR", "SLU"}
+        else "f1" if task == "VAD"
         else "bleu" if task == "S2TT"
         else "der" if task == "SD"
         else "cpwer" if task == "SA-ASR"
@@ -291,8 +370,8 @@ def _metric_task_hint(metrics: list[str | None]) -> str:
 
 
 def _effective_audio_task(dataset_task: str, task_hint: str) -> str:
-    task = str(dataset_task or "").upper()
-    hint = str(task_hint or "").upper()
+    task = _normalize_task(dataset_task)
+    hint = _normalize_task(task_hint)
     if task in {"TTS", "VC"} and hint in {"TTS", "VC"}:
         return hint
     return task
@@ -437,6 +516,7 @@ def _annotation_token(value: Any, *, label: str, key: str) -> str:
 
 
 def _sample_duration_seconds(sample: dict[str, Any]) -> float | None:
+    values: list[float] = []
     for field in ("duration_sec", "duration_seconds", "duration"):
         if field not in sample:
             continue
@@ -448,8 +528,15 @@ def _sample_duration_seconds(sample: dict[str, Any]) -> float | None:
             or float(value) <= 0
         ):
             raise ValueError(f"sample duration field {field} must be a finite positive number")
-        return float(value)
-    return None
+        values.append(float(value))
+    if not values:
+        return None
+    if any(
+        not math.isclose(value, values[0], rel_tol=0, abs_tol=1e-6)
+        for value in values[1:]
+    ):
+        raise ValueError("sample duration fields disagree")
+    return values[0]
 
 
 def _validated_annotation_segments(
@@ -630,6 +717,178 @@ def _write_external_annotation_role_files(
         encoding="utf-8",
     )
     return reference_path, hypothesis_path, manifest_path
+
+
+def _validated_vad_intervals(
+    value: Any,
+    *,
+    role: str,
+    key: str,
+    duration: float,
+    with_score: bool = False,
+) -> list[dict[str, float]]:
+    if not isinstance(value, list):
+        raise ValueError(f"VAD {role} must be a list: {key}")
+    if with_score and not value:
+        raise ValueError(f"VAD frame_scores must not be empty when provided: {key}")
+    allowed = {"start", "end", "score"} if with_score else {"start", "end"}
+    rows: list[dict[str, float]] = []
+    previous_end: float | None = None
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"VAD {role}[{index}] must be an object: {key}")
+        unknown = sorted(str(field) for field in item if field not in allowed)
+        missing = sorted(allowed - set(item))
+        if unknown or missing:
+            details = []
+            if unknown:
+                details.append("unapproved=" + ",".join(unknown))
+            if missing:
+                details.append("missing=" + ",".join(missing))
+            raise ValueError(f"VAD {role}[{index}] has invalid fields ({'; '.join(details)}): {key}")
+        start = item["start"]
+        end = item["end"]
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(start))
+            or not math.isfinite(float(end))
+        ):
+            raise ValueError(f"VAD {role}[{index}] times must be finite numbers: {key}")
+        start_value = float(start)
+        end_value = float(end)
+        if start_value < 0 or end_value <= start_value:
+            raise ValueError(f"VAD {role}[{index}] requires 0 <= start < end: {key}")
+        if end_value > duration + 1e-6:
+            raise ValueError(f"VAD {role}[{index}] exceeds duration {duration}: {key}")
+        if previous_end is not None and start_value < previous_end - 1e-12:
+            raise ValueError(f"VAD {role} must be ordered and non-overlapping: {key}")
+        if with_score and (
+            (previous_end is None and start_value > 1e-6)
+            or (previous_end is not None and abs(start_value - previous_end) > 1e-6)
+        ):
+            raise ValueError(f"VAD frame_scores must continuously cover the timebase: {key}")
+        row = {"start": start_value, "end": end_value}
+        if with_score:
+            score = item["score"]
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0.0 <= float(score) <= 1.0
+            ):
+                raise ValueError(f"VAD frame_scores[{index}].score must be within [0, 1]: {key}")
+            row["score"] = float(score)
+        rows.append(row)
+        previous_end = end_value
+    if with_score and abs((previous_end or 0.0) - duration) > 1e-6:
+        raise ValueError(f"VAD frame_scores must continuously cover the timebase: {key}")
+    return rows
+
+
+def _write_external_vad_role_files(
+    *,
+    samples: list[dict[str, Any]],
+    structured_predictions: dict[str, dict[str, Any]],
+    output_dir: Path,
+    dataset_name: str | None = None,
+) -> tuple[Path, Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reference_path = output_dir / "reference.jsonl"
+    sample_output_path = output_dir / "sample_output.jsonl"
+    manifest_path = output_dir / "vad_conversion.json"
+    reference_rows: list[dict[str, Any]] = []
+    prediction_rows: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+    for sample in samples:
+        key = str(sample.get("key") or "").strip()
+        if not key:
+            raise ValueError("VAD reference sample is missing key")
+        duration = _sample_duration_seconds(sample)
+        if duration is None:
+            raise ValueError(f"VAD reference duration must be a finite positive number: {key}")
+        duration_value = duration
+        reference_segments = _validated_vad_intervals(
+            sample.get("speech_segments"),
+            role="reference speech_segments",
+            key=key,
+            duration=duration_value,
+        )
+        structured = structured_predictions.get(key)
+        if not isinstance(structured, dict):
+            raise ValueError(f"Missing structured prediction row for VAD sample: {key}")
+        if _normalize_task(structured.get("task")) != "VAD":
+            raise ValueError(f"VAD structured prediction task mismatch: {key}")
+        if dataset_name is not None and str(structured.get("dataset") or "") != dataset_name:
+            raise ValueError(f"VAD structured prediction dataset mismatch: {key}")
+        prediction = structured.get("prediction")
+        if not isinstance(prediction, dict):
+            raise ValueError(f"VAD structured prediction requires a prediction object: {key}")
+        unknown = sorted(
+            str(field) for field in prediction if field not in {"speech_segments", "frame_scores"}
+        )
+        if unknown:
+            raise ValueError(
+                f"VAD prediction contains unapproved field(s): {', '.join(unknown)}: {key}"
+            )
+        prediction_segments = _validated_vad_intervals(
+            prediction.get("speech_segments"),
+            role="prediction speech_segments",
+            key=key,
+            duration=duration_value,
+        )
+        prediction_row: dict[str, Any] = {
+            "key": key,
+            "speech_segments": prediction_segments,
+        }
+        if "frame_scores" in prediction:
+            prediction_row["frame_scores"] = _validated_vad_intervals(
+                prediction["frame_scores"],
+                role="frame_scores",
+                key=key,
+                duration=duration_value,
+                with_score=True,
+            )
+        reference_rows.append(
+            {
+                "key": key,
+                "duration": duration_value,
+                "speech_segments": reference_segments,
+            }
+        )
+        prediction_rows.append(prediction_row)
+        manifest_rows.append(
+            {
+                "key": key,
+                "reference_segments": len(reference_segments),
+                "prediction_segments": len(prediction_segments),
+                "frame_scores": len(prediction_row.get("frame_scores") or []),
+            }
+        )
+    for path, rows in ((reference_path, reference_rows), (sample_output_path, prediction_rows)):
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema": "sure.eval.vad_conversion.v1",
+                "roles": {
+                    "reference_jsonl": reference_path.name,
+                    "sample_output": sample_output_path.name,
+                },
+                "rows": manifest_rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return reference_path, sample_output_path, manifest_path
 
 
 def _se_external_prediction_audio(value: Any, structured_prediction_path: Path) -> str:
@@ -1458,6 +1717,176 @@ def evaluate_annotation_prediction_file_external(
     }
 
 
+def evaluate_vad_prediction_file_external(
+    dataset_manager: DatasetManager,
+    sota_manager: SOTAManager,
+    dataset_name: str,
+    prediction_path: Path,
+    *,
+    engine_source: str,
+    engine_root: Path,
+    external_runs_dir: Path,
+    device: str,
+    cache_dir: str | None,
+    timeout: int,
+    metric_override: str | None,
+    pipeline_id_override: str | None = None,
+    task_override: str | None = None,
+    max_samples: int = 0,
+    requested_metric_source_override: str | None = None,
+) -> dict[str, Any]:
+    canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
+    jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
+    if not jsonl_path.exists():
+        jsonl_path = dataset_manager.download_and_convert(canonical_name)
+    dataset_samples = load_jsonl(jsonl_path)
+    all_samples = _scoped_samples(dataset_samples, max_samples)
+    if not all_samples:
+        raise ValueError(f"Dataset has no samples: {canonical_name}")
+    dataset_task = _normalize_task(all_samples[0].get("task"))
+    task = _normalize_task(task_override or dataset_task)
+    if task != "VAD":
+        raise ExternalEvaluationUnsupported(f"task {task!r} does not use the VAD bridge")
+    language = str(all_samples[0].get("language") or "n/a")
+    sota_metric = _metric_from_sota(
+        sota_manager,
+        canonical_name,
+        fallback_names=_source_fallback_names(jsonl_path),
+    )
+    requested_metric = metric_override or sota_metric or "f1"
+    pipeline = _describe_external_pipeline(
+        engine_root=engine_root,
+        task=task,
+        language=language,
+        metric=None if pipeline_id_override else requested_metric,
+        pipeline_id=pipeline_id_override,
+        timeout=timeout,
+    )
+    if not _pipeline_uses_reference_jsonl_pair(pipeline):
+        raise ExternalEvaluationUnsupported(
+            f"task={task} metric={requested_metric or pipeline.get('metric')} "
+            "does not use reference_jsonl/sample_output"
+        )
+    structured_prediction_path = prediction_path.with_suffix(".jsonl")
+    structured_predictions = load_structured_prediction_map(structured_prediction_path)
+    if not structured_predictions:
+        raise ValueError(
+            f"VAD external evaluation requires structured predictions: "
+            f"{structured_prediction_path}"
+        )
+    samples = _samples_with_predictions(
+        all_samples,
+        set(structured_predictions),
+        dataset_name=canonical_name,
+    )
+    run_dir = _external_run_dir(
+        external_runs_dir,
+        canonical_name,
+        str(pipeline_id_override or requested_metric or "default"),
+    )
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    reference_jsonl, sample_output, conversion_manifest = _write_external_vad_role_files(
+        samples=samples,
+        structured_predictions=structured_predictions,
+        output_dir=run_dir,
+        dataset_name=canonical_name,
+    )
+    external_payload = _run_external_pipeline(
+        engine_root=engine_root,
+        request={
+            "task": task,
+            "language": language if language not in {"auto", "n/a"} else None,
+            "metric": None if pipeline_id_override else requested_metric,
+            "pipeline_id": pipeline_id_override,
+            "output_dir": str(run_dir.resolve()),
+            "reference_jsonl": str(reference_jsonl.resolve()),
+            "sample_output": str(sample_output.resolve()),
+            "samples_jsonl": None,
+            "device": device,
+            "cache_dir": cache_dir,
+            "pipeline": pipeline,
+        },
+        timeout=timeout,
+    )
+    summary = external_payload["summary"]
+    resolved_pipeline = external_payload["pipeline"]
+    report = external_payload.get("report") or {}
+    metric = str(
+        summary.get("metric")
+        or resolved_pipeline.get("metric")
+        or requested_metric
+        or ""
+    )
+    score = summary.get("score", report.get("score"))
+    rps, rps_status = _calculate_metric_rps(
+        sota_manager,
+        canonical_name,
+        metric,
+        score,
+        fallback_names=_source_fallback_names(jsonl_path),
+    )
+    return {
+        "dataset": canonical_name,
+        "jsonl_path": str(jsonl_path),
+        "prediction_path": str(prediction_path),
+        "prediction_jsonl_path": str(structured_prediction_path),
+        "task": task,
+        "language": str(summary.get("language") or language),
+        "metric": metric,
+        "score": score,
+        "rps": rps,
+        "rps_status": rps_status,
+        "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
+        "num_samples": len(samples),
+        "expected_samples": len(all_samples),
+        "total_dataset_samples": len(dataset_samples),
+        "evaluation_max_samples": max_samples if max_samples > 0 else 0,
+        "provided_predictions": len(samples),
+        "evaluation_backend": "external",
+        "evaluator_version": "sure-evaluation",
+        "pipeline_id": summary.get("pipeline_id") or resolved_pipeline.get("pipeline_id"),
+        "evaluation_context": {
+            "backend": "sure-evaluation",
+            "engine_source": engine_source,
+            "engine_root": str(engine_root),
+            "evaluation_runtime": _evaluation_runtime_binding(engine_root),
+            "dataset_task": dataset_task,
+            "pipeline_id": summary.get("pipeline_id")
+            or resolved_pipeline.get("pipeline_id"),
+            "route_id": resolved_pipeline.get("route_id"),
+            "nodes": [
+                node.get("node_id") for node in resolved_pipeline.get("nodes", [])
+            ],
+            "node_config_paths": summary.get("node_config_paths", []),
+            "external_output_dir": summary.get("output_dir"),
+            "vad_roles": {
+                "reference_jsonl": str(reference_jsonl),
+                "sample_output": str(sample_output),
+            },
+            "vad_conversion": str(conversion_manifest),
+            "requested_metric_source": requested_metric_source_override
+            or (
+                "cli_pipeline_id"
+                if pipeline_id_override
+                else "cli_override"
+                if metric_override
+                else "sota_baseline"
+                if sota_metric
+                else "sure-evaluation_task_manifest"
+            ),
+            "requested_pipeline_id": pipeline_id_override,
+        },
+        "details": {
+            "summary": summary,
+            "report": report,
+            "pipeline": resolved_pipeline,
+            "vad_conversion": _read_json_file(conversion_manifest),
+        },
+    }
+
+
 def evaluate_audio_prediction_file_external(
     dataset_manager: DatasetManager,
     sota_manager: SOTAManager,
@@ -1930,6 +2359,9 @@ def _primary_result(metric: str, score: Any, report: dict[str, Any] | None = Non
     if metric_name in {"cpwer", "cp_wer"}:
         result["cpwer"] = numeric_score
         result["score_key"] = "cpwer"
+    if metric_name in {*VAD_DETECTION_METRICS, "auc_roc"}:
+        result[metric_name] = numeric_score
+        result["score_key"] = metric_name
     return result
 
 
@@ -2148,6 +2580,10 @@ def _metric_unit(metric: str) -> str:
         "macro_recall",
         "macro-recall",
         "f1",
+        "p_fa",
+        "p_miss",
+        "dcf_nist",
+        "auc_roc",
         "false_reject_rate",
         "false_alarm_rate",
     }:
@@ -2302,7 +2738,7 @@ def _peek_dataset_task_language(dataset_manager: DatasetManager, dataset_name: s
             if not line.strip():
                 continue
             row = json.loads(line)
-            return str(row.get("task", "")).upper(), str(row.get("language", "auto")).lower()
+            return _normalize_task(row.get("task")), str(row.get("language", "auto")).lower()
     raise ValueError(f"Dataset has no samples: {dataset_name}")
 
 
@@ -2988,6 +3424,23 @@ def _write_sample_report(
                 row["reference"] = {"segments": list(sample.get("segments") or [])}
                 if key in metric_details_by_key:
                     row["metric_details"] = metric_details_by_key[key]
+            elif task == "VAD":
+                structured = (structured_predictions or {}).get(key, {})
+                structured_prediction = structured.get("prediction")
+                prediction_fields = (
+                    structured_prediction if isinstance(structured_prediction, dict) else {}
+                )
+                row["prediction"] = {
+                    field: prediction_fields[field]
+                    for field in ("speech_segments", "frame_scores")
+                    if field in prediction_fields
+                }
+                row["reference"] = {
+                    "duration": _sample_duration_seconds(sample),
+                    "speech_segments": sample.get("speech_segments"),
+                }
+                if key in metric_details_by_key:
+                    row["metric_details"] = metric_details_by_key[key]
             else:
                 row["reference"] = sample.get("target") or sample.get("reference_text") or ""
             handle.write(json.dumps(_to_strict_jsonable(row), ensure_ascii=False) + "\n")
@@ -3173,7 +3626,7 @@ def _record_evaluation_result(
         "details": result["details"],
     }
     task = str(result.get("task") or "").upper()
-    if task not in {"KWS", "SE", "SD", "SA-ASR", "SA_ASR"}:
+    if task not in {"KWS", "SE", "SD", "SA-ASR", "SA_ASR", "VAD"}:
         return rps_manager.evaluate_and_record(
             tool_name=tool_name,
             dataset=result["dataset"],
@@ -3276,6 +3729,7 @@ def _write_run_artifacts(
                     "SD",
                     "SA-ASR",
                     "SA_ASR",
+                    "VAD",
                 }
                 else set(predictions)
             )
@@ -3619,6 +4073,7 @@ def main() -> int:
                 pipeline_overrides.append(item)
     if pipeline_overrides and args.evaluation_backend == "legacy":
         raise ValueError("--pipeline-id requires --evaluation-backend external or auto with an external engine")
+    explicit_metric_requested = bool(metric_overrides)
     if not metric_overrides:
         metric_overrides = [None]
     task_hint = _metric_task_hint(metric_overrides)
@@ -3653,11 +4108,27 @@ def main() -> int:
         if not prediction_path.exists():
             raise FileNotFoundError(f"Prediction file not found: {prediction_path}")
 
+        dataset_evaluation_requests = _dataset_evaluation_requests(
+            task=effective_task,
+            prediction_path=prediction_path,
+            evaluation_requests=evaluation_requests,
+            explicit_metric_requested=explicit_metric_requested,
+            pipeline_overrides=pipeline_overrides,
+            samples=(
+                _scoped_samples(
+                    load_jsonl(dataset_manager.get_jsonl_path(canonical_name)),
+                    evaluation_max_samples,
+                )
+                if effective_task == "VAD"
+                else None
+            ),
+        )
+
         request_failures: list[str] = []
         if args.evaluation_backend != "legacy" and resolved_engine is not None:
             applicable_requests = [
                 (metric_override, pipeline_id_override)
-                for metric_override, pipeline_id_override in evaluation_requests
+                for metric_override, pipeline_id_override in dataset_evaluation_requests
                 if _external_metric_applies_to_task_language(
                     engine_root=resolved_engine[1],
                     metric=None if pipeline_id_override else metric_override,
@@ -3671,12 +4142,19 @@ def main() -> int:
         else:
             applicable_requests = [
                 (metric_override, None)
-                for metric_override, pipeline_id_override in evaluation_requests
+                for metric_override, pipeline_id_override in dataset_evaluation_requests
                 if pipeline_id_override is None
                 if _legacy_metric_applies_to_task_language(metric_override, effective_task, dataset_language)
             ]
         if not applicable_requests:
-            requested = ", ".join(pipeline_overrides or [metric for metric in metric_overrides if metric]) or "default"
+            requested = ", ".join(
+                pipeline_overrides
+                or [
+                    str(metric)
+                    for metric, _ in dataset_evaluation_requests
+                    if metric
+                ]
+            ) or "default"
             source = "current sure-evaluation engine" if args.evaluation_backend != "legacy" and resolved_engine else "legacy evaluator"
             raise ValueError(
                 _unsupported_request_message(
@@ -3715,7 +4193,29 @@ def main() -> int:
                         pipeline_id=pipeline_id_override,
                         timeout=args.evaluation_timeout,
                     )
-                    if effective_task == "KWS":
+                    if effective_task == "VAD":
+                        result = evaluate_vad_prediction_file_external(
+                            dataset_manager,
+                            sota_manager,
+                            canonical_name,
+                            prediction_path,
+                            engine_source=engine_source,
+                            engine_root=engine_root,
+                            external_runs_dir=external_runs_dir,
+                            device=args.evaluation_device,
+                            cache_dir=args.evaluation_cache_dir,
+                            timeout=args.evaluation_timeout,
+                            metric_override=metric_override,
+                            pipeline_id_override=pipeline_id_override,
+                            task_override=effective_task,
+                            max_samples=evaluation_max_samples,
+                            requested_metric_source_override=(
+                                "task_default_suite"
+                                if not explicit_metric_requested and not pipeline_overrides
+                                else None
+                            ),
+                        )
+                    elif effective_task == "KWS":
                         result = evaluate_kws_prediction_file_external(
                             dataset_manager,
                             sota_manager,

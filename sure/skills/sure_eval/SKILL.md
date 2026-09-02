@@ -280,6 +280,12 @@ SE defaults to the atomic `si-sdr` route. Full-reference SE metrics require an
 explicit clean `reference_audio`; the noisy model input is never reused as the
 clean reference. Other SE metrics run only when their standalone route and node
 environment are ready.
+VAD predictions remain structured as `speech_segments` and optional
+`frame_scores`; they are bridged to the standalone engine's
+`reference_jsonl`/`sample_output` roles without TSV serialization. The default
+VAD suite reports F1, `p_fa`, `p_miss`, and `dcf_nist`. The `auc_roc` route runs
+only when explicitly selected and every evaluated sample provides non-empty,
+valid frame scores that cover the complete audio timebase.
 
 `run_smoke.py` launches the approved local container or site Model Python with a
 bounded sample. `generate_predictions_via_server.py --device cpu` hides

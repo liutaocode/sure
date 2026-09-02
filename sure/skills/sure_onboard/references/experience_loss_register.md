@@ -27,6 +27,12 @@ remains outside this skill.
 | `templates/validate.py` | `references/templates/validate_metric_enrichment.md` | Original template discovered subtask fixtures, wrote ref/hyp files, and called route-backed metric scripts with `report.json` and `pipeline_description.json`. | Preserve as design reference; do not overwrite harness runtime template. | Affects future metric enrichment helper. |
 | `memory/*` | `references/memory/*` and context selection | Bad-case memories are present but must be routed by trigger rather than forgotten. | Add routing guidance and keep trigger list explicit. | Affects context selection and repair quality. |
 
+## Not Restored As Default Gate
+
+Full benchmark metric pipelines remain optional enrichment after model-local
+inference and output-contract validation. Onboard does not rerun inference only
+to produce task metrics; `/sure_eval` owns benchmark scoring.
+
 ## Deployment Boundary
 
 | Source experience | Harness decision |

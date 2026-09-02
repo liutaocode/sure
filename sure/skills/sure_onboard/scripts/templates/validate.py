@@ -50,10 +50,13 @@ IO_CONTRACT: dict[str, Any] = (
     {} if _IO_CONTRACT_JSON.startswith("__") else json.loads(_IO_CONTRACT_JSON)
 )
 KWS_OPERATING_THRESHOLD = 0.5
-STRUCTURED_TASKS = {"sd", "sa_asr"}
-STRUCTURED_APPROVED_OUTPUT_FIELDS = {"segments", "num_speakers"}
+STRUCTURED_TASKS = {"vad", "sd", "sa_asr"}
+STRUCTURED_SPEAKER_OUTPUT_FIELDS = {"segments", "num_speakers"}
+STRUCTURED_VAD_OUTPUT_FIELDS = {"speech_segments", "frame_scores"}
 STRUCTURED_SD_SEGMENT_FIELDS = {"speaker", "start", "end", "duration"}
 STRUCTURED_SA_ASR_SEGMENT_FIELDS = {*STRUCTURED_SD_SEGMENT_FIELDS, "text"}
+STRUCTURED_VAD_SEGMENT_FIELDS = {"start", "end"}
+STRUCTURED_VAD_FRAME_SCORE_FIELDS = {"start", "end", "score"}
 STRUCTURED_PUBLIC_INFERENCE_PARAMETERS = {
     "batch_size",
     "beam_size",
@@ -98,10 +101,27 @@ STRUCTURED_URI_PREFIX = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
 def normalized_task_value(value: Any) -> str:
-    normalized = str(value or "").lower().replace("-", "_")
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
+    if normalized in {"speech_activity_detection", "voice_activity_detection"}:
+        return "vad"
     return normalized
+
+
+def structured_reference_segments_field(task: str) -> str:
+    return "speech_segments" if task == "vad" else "segments"
+
+
+def structured_public_inference_parameters(task: str) -> set[str]:
+    if task == "vad":
+        return {
+            "batch_size",
+            "min_duration_off",
+            "min_duration_on",
+            "vad_threshold",
+        }
+    return STRUCTURED_PUBLIC_INFERENCE_PARAMETERS
 
 
 def normalized_task_type() -> str:
@@ -192,6 +212,13 @@ def load_wrapper() -> Any:
     return wrapper
 
 
+def require_vad_single_link_file(path: Path, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"VAD {label} must be a regular file: {path}")
+    if path.stat().st_nlink != 1:
+        raise ValueError(f"VAD {label} must not be hard-linked: {path}")
+
+
 def fixture_payloads() -> list[dict[str, Any]]:
     task = normalized_task_type()
     raw_payload = os.environ.get("SURE_VALIDATE_INPUT_JSON")
@@ -202,11 +229,14 @@ def fixture_payloads() -> list[dict[str, Any]]:
         if task in STRUCTURED_TASKS:
             audio_path = parsed.get("audio_path")
             if not isinstance(audio_path, str) or not audio_path.strip():
-                raise ValueError("SD/SA-ASR SURE_VALIDATE_INPUT_JSON requires audio_path")
+                raise ValueError("structured SURE_VALIDATE_INPUT_JSON requires audio_path")
+            if task == "vad":
+                require_vad_single_link_file(Path(audio_path), "input audio")
             info = structured_wav_info(Path(audio_path))
-            if "segments" in parsed:
+            reference_field = structured_reference_segments_field(task)
+            if reference_field in parsed:
                 violations = validate_structured_segments(
-                    parsed["segments"],
+                    parsed[reference_field],
                     task=task,
                     duration_sec=float(info["duration_sec"]),
                     audio_is_silence=bool(info["audio_is_silence"]),
@@ -217,7 +247,7 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 field in parsed for field in STRUCTURED_PUBLIC_INFERENCE_PARAMETERS
             ):
                 raise ValueError(
-                    "SD/SA-ASR inference parameters must be supplied through "
+                    "structured inference parameters must be supplied through "
                     "SURE_VALIDATE_PROTOCOL_JSON, not fixture/reference input"
                 )
             model_input = {"audio_path": audio_path}
@@ -282,6 +312,8 @@ def fixture_payloads() -> list[dict[str, Any]]:
 
     fixture_root = MODEL_DIR / "fixture"
     for gt_path in sorted(fixture_root.glob("**/gt.jsonl")):
+        if task == "vad":
+            require_vad_single_link_file(gt_path, "fixture gt.jsonl")
         payloads: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
         for line in gt_path.read_text(encoding="utf-8").splitlines():
@@ -291,25 +323,42 @@ def fixture_payloads() -> list[dict[str, Any]]:
             if not isinstance(item, dict):
                 continue
             payload: dict[str, Any] = {}
-            audio = item.get("audio") or item.get("wav") or item.get("prompt_audio") or item.get("reference_audio")
+            audio = (
+                item.get("audio") or item.get("wav")
+                if task in STRUCTURED_TASKS
+                else item.get("audio")
+                or item.get("wav")
+                or item.get("prompt_audio")
+                or item.get("reference_audio")
+            )
             if task in STRUCTURED_TASKS:
                 if not isinstance(audio, str) or not audio:
-                    raise ValueError("SD/SA-ASR fixture requires a non-empty audio field")
+                    raise ValueError("structured fixture requires a non-empty audio field")
                 if item.get("task") is not None and normalized_task_value(item["task"]) != task:
                     raise ValueError(
                         f"Structured fixture declares task {item['task']!r}, expected {task!r}"
                     )
                 if "inference_params" in item:
                     raise ValueError(
-                        "SD/SA-ASR fixture rows must not declare inference_params; "
+                        "structured fixture rows must not declare inference_params; "
                         "use SURE_VALIDATE_PROTOCOL_JSON"
                     )
                 audio_path = (gt_path.parent / audio).resolve()
                 if not audio_path.is_file():
                     raise FileNotFoundError(f"Structured fixture audio does not exist: {audio_path}")
+                if task == "vad":
+                    relative_audio = Path(audio)
+                    if (
+                        relative_audio.is_absolute()
+                        or ".." in relative_audio.parts
+                        or "\\" in audio
+                        or not audio_path.is_relative_to(gt_path.parent.resolve())
+                    ):
+                        raise ValueError("VAD fixture audio must stay inside its fixture directory")
+                    require_vad_single_link_file(audio_path, f"fixture audio {audio!r}")
                 info = structured_wav_info(audio_path)
                 violations = validate_structured_segments(
-                    item.get("segments"),
+                    item.get(structured_reference_segments_field(task)),
                     task=task,
                     duration_sec=float(info["duration_sec"]),
                     audio_is_silence=bool(info["audio_is_silence"]),
@@ -318,9 +367,9 @@ def fixture_payloads() -> list[dict[str, Any]]:
                     raise ValueError("invalid fixture reference segments: " + "; ".join(violations))
                 key = str(item.get("key") or item.get("id") or audio_path.stem).strip()
                 if not key:
-                    raise ValueError("SD/SA-ASR fixture requires a non-empty key")
+                    raise ValueError("structured fixture requires a non-empty key")
                 if key in seen_keys:
-                    raise ValueError(f"SD/SA-ASR fixture duplicates key {key!r}")
+                    raise ValueError(f"structured fixture duplicates key {key!r}")
                 seen_keys.add(key)
                 payload["audio_path"] = str(audio_path)
                 payload.update(structured_protocol_arguments())
@@ -449,13 +498,19 @@ def to_plain(value: Any) -> Any:
 def run_predict(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     task = normalized_task_type()
     if task in STRUCTURED_TASKS:
-        method_name = "transcribe_with_speakers" if task == "sa_asr" else "diarize"
+        method_name = (
+            "detect_speech"
+            if task == "vad"
+            else "transcribe_with_speakers"
+            if task == "sa_asr"
+            else "diarize"
+        )
         predict = getattr(wrapper, method_name, None)
         if predict is None:
-            raise AttributeError(f"SD/SA-ASR wrapper must implement {method_name}().")
+            raise AttributeError(f"structured-task wrapper must implement {method_name}().")
         audio_path = payload.get("audio_path")
         if not isinstance(audio_path, str) or not audio_path.strip():
-            raise ValueError("SD/SA-ASR prediction requires audio_path")
+            raise ValueError("structured-task prediction requires audio_path")
         public_args = {key: value for key, value in payload.items() if key != "audio_path"}
         result = predict(audio_path, **public_args)
         plain = to_plain(result)
@@ -520,7 +575,8 @@ def structured_protocol_arguments() -> dict[str, Any]:
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise ValueError("SURE_VALIDATE_PROTOCOL_JSON must decode to an object")
-    unknown = sorted(str(key) for key in parsed if key not in STRUCTURED_PUBLIC_INFERENCE_PARAMETERS)
+    allowed = structured_public_inference_parameters(normalized_task_type())
+    unknown = sorted(str(key) for key in parsed if key not in allowed)
     if unknown:
         raise ValueError("unsupported public inference parameter(s): " + ", ".join(unknown))
     arguments: dict[str, Any] = {}
@@ -631,6 +687,14 @@ def validate_structured_segments(
     duration_sec: float,
     audio_is_silence: bool,
 ) -> list[str]:
+    if task == "vad":
+        return validate_vad_intervals(
+            segments,
+            field="speech_segments",
+            duration_sec=duration_sec,
+            audio_is_silence=audio_is_silence,
+            require_score=False,
+        )
     if not isinstance(segments, list):
         return ["segments must be an array"]
     if not segments:
@@ -685,6 +749,88 @@ def validate_structured_segments(
     return violations
 
 
+def validate_vad_intervals(
+    intervals: Any,
+    *,
+    field: str,
+    duration_sec: float,
+    audio_is_silence: bool,
+    require_score: bool,
+) -> list[str]:
+    if not isinstance(intervals, list):
+        return [f"{field} must be an array"]
+    if not intervals:
+        if field == "speech_segments" and audio_is_silence:
+            return []
+        if field == "speech_segments":
+            return ["empty VAD speech_segments are allowed only for pure-silence audio"]
+        return ["frame_scores must be non-empty when provided"]
+
+    approved_fields = (
+        STRUCTURED_VAD_FRAME_SCORE_FIELDS
+        if require_score
+        else STRUCTURED_VAD_SEGMENT_FIELDS
+    )
+    violations: list[str] = []
+    previous_start: float | None = None
+    previous_end: float | None = None
+    for index, interval in enumerate(intervals, 1):
+        prefix = f"{field} item {index}"
+        if not isinstance(interval, dict):
+            violations.append(f"{prefix} must be an object")
+            continue
+        unknown_fields = sorted(
+            str(key) for key in interval if key not in approved_fields
+        )
+        if unknown_fields:
+            violations.append(
+                f"{prefix} contains unapproved field(s): "
+                + ", ".join(unknown_fields)
+            )
+        start = interval.get("start")
+        end = interval.get("end")
+        if not structured_finite_number(start):
+            violations.append(f"{prefix} start must be a finite number")
+        elif float(start) < 0:
+            violations.append(f"{prefix} start must be >= 0")
+        if not structured_finite_number(end):
+            violations.append(f"{prefix} end must be a finite number")
+        elif structured_finite_number(start) and float(end) <= float(start):
+            violations.append(f"{prefix} end must be greater than start")
+        if structured_finite_number(end) and float(end) > duration_sec + 1e-6:
+            violations.append(
+                f"{prefix} end {float(end):.6f} exceeds WAV duration {duration_sec:.6f}"
+            )
+        if structured_finite_number(start):
+            current_start = float(start)
+            if require_score and index == 1 and not math.isclose(
+                current_start, 0.0, rel_tol=0, abs_tol=1e-9
+            ):
+                violations.append(f"{prefix} must start at 0")
+            if previous_start is not None and current_start < previous_start:
+                violations.append(f"{prefix} is not ordered by start time")
+            if previous_end is not None and current_start < previous_end - 1e-9:
+                violations.append(f"{prefix} overlaps the previous interval")
+            elif require_score and previous_end is not None and current_start > previous_end + 1e-9:
+                violations.append(f"{prefix} leaves a gap after the previous interval")
+            previous_start = current_start
+        if structured_finite_number(end):
+            previous_end = float(end)
+        if require_score:
+            score = interval.get("score")
+            if not structured_finite_number(score):
+                violations.append(f"{prefix} score must be a finite number")
+            elif not 0 <= float(score) <= 1:
+                violations.append(f"{prefix} score must be within [0, 1]")
+    if require_score and previous_end is not None and not math.isclose(
+        previous_end, duration_sec, rel_tol=0, abs_tol=1e-6
+    ):
+        violations.append(
+            f"frame_scores must end at WAV duration {duration_sec:.6f}"
+        )
+    return violations
+
+
 def structured_forbidden_output_paths(value: Any, path: str = "output") -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
@@ -714,8 +860,13 @@ def validate_structured_output(
 ) -> list[str]:
     if not isinstance(output, dict):
         return ["structured prediction must be an object"]
+    approved_output_fields = (
+        STRUCTURED_VAD_OUTPUT_FIELDS
+        if task == "vad"
+        else STRUCTURED_SPEAKER_OUTPUT_FIELDS
+    )
     unknown_fields = sorted(
-        str(key) for key in output if key not in STRUCTURED_APPROVED_OUTPUT_FIELDS
+        str(key) for key in output if key not in approved_output_fields
     )
     violations = [
         f"model output must not expose reference or path field {path}"
@@ -729,14 +880,24 @@ def validate_structured_output(
     )
     violations.extend(
         validate_structured_segments(
-            output.get("segments"),
+            output.get(structured_reference_segments_field(task)),
             task=task,
             duration_sec=duration_sec,
             audio_is_silence=audio_is_silence,
         )
     )
+    if task == "vad" and "frame_scores" in output:
+        violations.extend(
+            validate_vad_intervals(
+                output["frame_scores"],
+                field="frame_scores",
+                duration_sec=duration_sec,
+                audio_is_silence=audio_is_silence,
+                require_score=True,
+            )
+        )
     num_speakers = output.get("num_speakers")
-    if num_speakers is not None:
+    if task != "vad" and num_speakers is not None:
         if isinstance(num_speakers, bool) or not isinstance(num_speakers, int) or num_speakers < 0:
             violations.append("num_speakers must be a non-negative integer when provided")
         elif isinstance(output.get("segments"), list):
@@ -1077,7 +1238,11 @@ def validate_contract(sample: dict[str, Any], contract: dict[str, Any]) -> list[
     if isinstance(primary, str) and primary:
         if primary not in required:
             required.append(primary)
-        if primary not in nonempty and contract.get("allow_empty_segments") != "silence_only":
+        if (
+            primary not in nonempty
+            and contract.get("allow_empty_primary") is not True
+            and contract.get("allow_empty_segments") != "silence_only"
+        ):
             nonempty.append(primary)
     for field in required:
         if field not in sample:
@@ -1237,7 +1402,7 @@ def stage_contract() -> bool:
         contract = load_io_contract()
         if task in STRUCTURED_TASKS:
             if not SAMPLE_OUTPUTS.is_file():
-                violations = ["SD/SA-ASR contract validation requires sample_outputs.jsonl"]
+                violations = ["structured contract validation requires sample_outputs.jsonl"]
             else:
                 rows = [
                     json.loads(line)

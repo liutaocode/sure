@@ -11,12 +11,13 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from mcp_smoke import validate_speaker_output
+from mcp_smoke import validate_speaker_output, validate_vad_output
 from prepare_fixture import (
     SPEAKER_TASKS,
     looks_like_absolute_path_or_uri,
     pcm_wav_info,
     validate_speaker_segments,
+    validate_vad_intervals,
 )
 from scaffold_adapter import io_contract_for
 from vc_exec import default_partition
@@ -466,6 +467,155 @@ def validate_speaker_fixture_manifest(
     )
 
 
+def validate_vad_fixture_manifest(
+    value: dict,
+    *,
+    model_dir: Path,
+    staged_dir: Path,
+    gt_jsonl: Path,
+) -> None:
+    require(
+        staged_dir.is_relative_to(model_dir / "fixture"),
+        "fixture staged_dir must stay under model_dir/fixture",
+    )
+    require(
+        Path(str(value.get("staged_path") or "")).resolve() == staged_dir,
+        "VAD staged_path must equal staged_dir",
+    )
+    require(
+        gt_jsonl.is_file() and gt_jsonl.parent == staged_dir,
+        "VAD gt_jsonl must exist directly inside staged_dir",
+    )
+    require(
+        gt_jsonl.stat().st_nlink == 1,
+        "VAD gt_jsonl must not be hard-linked",
+    )
+    require(value.get("gt_sha256") == sha256_file(gt_jsonl), "VAD ground-truth checksum changed")
+    require(value.get("expected_sha256") == sha256_file(gt_jsonl), "VAD reference checksum changed")
+
+    rows: list[dict] = []
+    for line_number, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"VAD fixture gt_jsonl line {line_number} is invalid JSON: {error}"
+            ) from error
+        require(isinstance(row, dict), f"VAD fixture gt_jsonl line {line_number} must be an object")
+        try:
+            json.dumps(row, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"VAD fixture gt_jsonl line {line_number} must contain strict JSON: {error}"
+            ) from error
+        rows.append(row)
+    require(1 <= len(rows) <= 5, "VAD smoke fixture must contain 1 to 5 samples")
+    samples = value.get("samples")
+    require(
+        isinstance(samples, list) and len(samples) == len(rows),
+        "VAD samples must mirror gt_jsonl rows",
+    )
+    require(value.get("sample_count") == len(rows), "VAD sample_count must match gt_jsonl")
+
+    seen_keys: set[str] = set()
+    relative_files = {Path("gt.jsonl")}
+    for index, (row, sample) in enumerate(zip(rows, samples)):
+        require(isinstance(sample, dict), f"VAD fixture sample {index} must be an object")
+        key = row.get("key")
+        require(
+            isinstance(key, str) and bool(key.strip()),
+            f"VAD fixture row {index} requires a non-empty key",
+        )
+        require(not looks_like_absolute_path_or_uri(key), "VAD fixture key must be a safe identifier")
+        require(key not in seen_keys, f"VAD fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        require(row.get("task_type") == "vad", f"VAD fixture row {key} must use canonical task_type=vad")
+        require(
+            "frame_scores" not in row,
+            f"VAD fixture row {key} must not contain prediction frame_scores",
+        )
+        require(sample.get("key") == key, f"VAD fixture sample {key} does not mirror gt_jsonl key")
+        require(
+            "speech_segments" not in sample and "frame_scores" not in sample,
+            "VAD manifest samples must not duplicate reference or prediction intervals",
+        )
+        audio = row.get("audio")
+        require(isinstance(audio, str) and bool(audio.strip()), f"VAD fixture {key} requires audio")
+        relative_audio = Path(audio)
+        require(
+            not relative_audio.is_absolute()
+            and ".." not in relative_audio.parts
+            and "\\" not in audio,
+            f"VAD fixture {key} audio path must be relative and contained",
+        )
+        audio_path = staged_dir / relative_audio
+        require(
+            audio_path.is_file()
+            and not audio_path.is_symlink()
+            and audio_path.stat().st_nlink == 1
+            and audio_path.stat().st_size > 0
+            and audio_path.resolve().is_relative_to(staged_dir),
+            f"VAD fixture {key} audio is missing, hard-linked, or unsafe",
+        )
+        relative_files.add(relative_audio)
+        require(sample.get("audio") == relative_audio.as_posix(), f"VAD sample {key} audio path changed")
+        require(
+            Path(str(sample.get("audio_path") or "")).resolve() == audio_path.resolve(),
+            f"VAD sample {key} audio_path changed",
+        )
+        require(sample.get("sha256") == sha256_file(audio_path), f"VAD sample {key} checksum changed")
+        require(sample.get("size_bytes") == audio_path.stat().st_size, f"VAD sample {key} size changed")
+        wav_info = pcm_wav_info(audio_path)
+        for field in ("duration_sec", "sample_rate", "audio_is_silence"):
+            require(sample.get(field) == wav_info[field], f"VAD sample {key} {field} changed")
+        speech_segments = validate_vad_intervals(
+            row.get("speech_segments"),
+            label=f"VAD fixture {key}",
+            empty_allowed=bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        require(
+            sample.get("segment_count") == len(speech_segments),
+            f"VAD sample {key} segment_count changed",
+        )
+        require(
+            sample.get("annotation_fields") == ["speech_segments"],
+            f"VAD sample {key} annotation_fields changed",
+        )
+
+    actual_files: set[Path] = set()
+    for path in staged_dir.rglob("*"):
+        require(not path.is_symlink(), f"VAD fixture tree must not contain symlinks: {path}")
+        if path.is_file():
+            actual_files.add(path.relative_to(staged_dir))
+    require(
+        actual_files == relative_files,
+        "VAD fixture tree must contain only gt.jsonl and referenced audio",
+    )
+    require(
+        value.get("sha256") == fixture_tree_identity(staged_dir, relative_files),
+        "VAD fixture tree checksum changed",
+    )
+    require(
+        value.get("size_bytes")
+        == sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "VAD fixture tree size changed",
+    )
+    annotation_source = value.get("annotation_source")
+    require(isinstance(annotation_source, dict), "VAD annotation_source must be an object")
+    require(
+        annotation_source.get("type") == "fixture_gt_jsonl"
+        and annotation_source.get("fallback") is False,
+        "VAD ground truth must come from fixture gt.jsonl",
+    )
+    require(
+        Path(str(annotation_source.get("staged_path") or "")).resolve() == gt_jsonl,
+        "VAD annotation_source staged_path must match gt_jsonl",
+    )
+
+
 def validate_fixture_manifest(value: dict) -> None:
     require(value.get("status") == "ready", "fixture manifest is not ready")
     for key in ("model_dir", "staged_dir", "gt_jsonl", "samples", "annotation_source"):
@@ -487,6 +637,14 @@ def validate_fixture_manifest(value: dict) -> None:
         return
     if task == "se":
         validate_se_fixture_manifest(
+            value,
+            model_dir=model_dir,
+            staged_dir=staged_dir,
+            gt_jsonl=gt_jsonl,
+        )
+        return
+    if task == "vad":
+        validate_vad_fixture_manifest(
             value,
             model_dir=model_dir,
             staged_dir=staged_dir,
@@ -760,6 +918,48 @@ def main() -> int:
                     polarities == {False, True},
                     "post-pull KWS MCP smoke must prove positive and negative behavior",
                 )
+            if protocol.get("tool") == "detect_speech":
+                call = protocol.get("tools_call") if isinstance(protocol.get("tools_call"), dict) else {}
+                samples = call.get("samples")
+                require(
+                    isinstance(samples, list) and 1 <= len(samples) <= 5,
+                    "post-pull VAD MCP smoke must cover 1 to 5 samples",
+                )
+                require(
+                    call.get("expected_samples") == len(samples)
+                    and call.get("num_samples") == len(samples),
+                    "post-pull VAD MCP smoke sample counts must match",
+                )
+                keys: set[str] = set()
+                for sample in samples:
+                    require(
+                        isinstance(sample, dict) and sample.get("ok") is True,
+                        "every post-pull VAD MCP smoke sample must pass",
+                    )
+                    key = str(sample.get("key") or "")
+                    require(
+                        bool(key) and key not in keys and not looks_like_absolute_path_or_uri(key),
+                        "post-pull VAD MCP smoke samples require unique safe keys",
+                    )
+                    keys.add(key)
+                    duration_sec = sample.get("audio_duration_sec")
+                    require(
+                        not isinstance(duration_sec, bool)
+                        and isinstance(duration_sec, (int, float))
+                        and math.isfinite(float(duration_sec))
+                        and float(duration_sec) > 0,
+                        f"post-pull VAD MCP smoke sample {key} lacks WAV duration evidence",
+                    )
+                    violations = validate_vad_output(
+                        sample.get("result"),
+                        empty_allowed=sample.get("audio_is_silence") is True,
+                        duration_sec=float(duration_sec),
+                    )
+                    require(
+                        not violations,
+                        f"post-pull VAD MCP smoke sample {key} is malformed: "
+                        + "; ".join(violations),
+                    )
             if protocol.get("tool") in {"diarize", "transcribe_with_speakers"}:
                 tool = str(protocol["tool"])
                 task = "sd" if tool == "diarize" else "sa_asr"
@@ -945,6 +1145,29 @@ def main() -> int:
             require(
                 any(isinstance(tool, dict) and tool.get("name") == "enhance_speech" for tool in tools),
                 "SE adapter config must expose enhance_speech",
+            )
+        if resolved_task == "vad":
+            contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
+            require(
+                contract == io_contract_for("vad"),
+                "VAD adapter io_contract must equal the canonical contract",
+            )
+            require(
+                contract.get("input_type") == "audio_path"
+                and contract.get("output_type") == "voice_activity_detection"
+                and contract.get("primary_field") == "speech_segments"
+                and contract.get("required_fields") == ["speech_segments"]
+                and contract.get("nonempty_fields") == []
+                and contract.get("allow_empty_primary") is True
+                and contract.get("approved_output_fields") == ["frame_scores", "speech_segments"]
+                and isinstance(contract.get("segment_schema"), dict)
+                and isinstance(contract.get("frame_score_schema"), dict),
+                "VAD adapter io_contract must require closed structured speech segments",
+            )
+            tools = config.get("tools") if isinstance(config.get("tools"), list) else []
+            require(
+                any(isinstance(tool, dict) and tool.get("name") == "detect_speech" for tool in tools),
+                "VAD adapter config must expose detect_speech",
             )
         if resolved_task in SPEAKER_TASKS:
             contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}

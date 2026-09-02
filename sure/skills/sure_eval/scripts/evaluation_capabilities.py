@@ -15,6 +15,9 @@ TASK_TO_ENGINE_TASK = {
     "SD": "sd",
     "SA-ASR": "sa-asr",
     "SA_ASR": "sa-asr",
+    "VAD": "vad",
+    "SPEECH_ACTIVITY_DETECTION": "vad",
+    "VOICE_ACTIVITY_DETECTION": "vad",
     "KWS": "kws",
     "SE": "se",
     "SPEECH_ENHANCEMENT": "se",
@@ -31,7 +34,7 @@ TASK_TO_ENGINE_TASK = {
 def normalize_engine_task(task: str) -> str:
     """Map harness task labels to the engine task id."""
 
-    normalized = task.strip().upper().replace(" ", "_")
+    normalized = task.strip().upper().replace("-", "_").replace(" ", "_")
     if normalized not in TASK_TO_ENGINE_TASK:
         raise ValueError(f"Unsupported evaluation task for sure-evaluation: {task!r}")
     return TASK_TO_ENGINE_TASK[normalized]

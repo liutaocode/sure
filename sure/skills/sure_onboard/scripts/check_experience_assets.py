@@ -38,6 +38,13 @@ CHECKS: dict[str, list[str]] = {
         "SI-SDR",
         "DNSMOS",
     ],
+    "task_playbooks/VAD.md": [
+        "detect_speech",
+        "speech_segments",
+        "frame_scores",
+        "pure-silence",
+        "SURE_VALIDATE_PROTOCOL_JSON",
+    ],
     "task_playbooks/SPEECH_UNDERSTANDING.md": [
         "SD, SA-ASR",
         "speech_understanding_metric_report.json",

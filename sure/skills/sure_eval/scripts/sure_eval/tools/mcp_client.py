@@ -177,7 +177,7 @@ class MCPToolClient:
             "S2TT": ["s2tt_translate", "translate_audio", "translate"],
             "SLU": ["slu_understand", "understand_audio", "audio_question_answer"],
             "SD": ["diarize", "diarize_audio", "speaker_diarization"],
-            "VAD": ["vad_predict", "detect_voice", "voice_activity_detection"],
+            "VAD": ["detect_speech", "vad_predict", "detect_voice", "voice_activity_detection"],
         }
         
         candidates = task_map.get(task or "", [])

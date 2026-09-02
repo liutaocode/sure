@@ -33,11 +33,15 @@ KWS_POSITIVE_LABELS = {"detect", "detected", "positive", "true", "1", "yes"}
 KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
 KWS_OPERATING_THRESHOLD = 0.5
 ANNOTATION_TASKS = {"SD", "SA-ASR"}
-STRUCTURED_REQUIRED_TASKS = {"KWS", "SE", *ANNOTATION_TASKS}
+STRUCTURED_REQUIRED_TASKS = {"KWS", "SE", "VAD", *ANNOTATION_TASKS}
 
 
 def _normalize_task(value: Any) -> str:
-    normalized = str(value or "").strip().upper().replace("-", "_")
+    normalized = (
+        str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    )
+    if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
+        return "VAD"
     return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
@@ -253,6 +257,79 @@ def _valid_annotation_segments(
     return True
 
 
+def _valid_vad_intervals(
+    value: Any,
+    *,
+    duration: float,
+    with_score: bool = False,
+) -> bool:
+    if not isinstance(value, list) or (with_score and not value):
+        return False
+    allowed = {"start", "end", "score"} if with_score else {"start", "end"}
+    previous_end: float | None = None
+    for item in value:
+        if not isinstance(item, dict) or set(item) != allowed:
+            return False
+        start = item.get("start")
+        end = item.get("end")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(start))
+            or not math.isfinite(float(end))
+        ):
+            return False
+        start_value = float(start)
+        end_value = float(end)
+        if (
+            start_value < 0
+            or end_value <= start_value
+            or end_value > duration + 1e-6
+            or (previous_end is not None and start_value < previous_end - 1e-12)
+        ):
+            return False
+        if with_score and (
+            (previous_end is None and start_value > 1e-6)
+            or (previous_end is not None and abs(start_value - previous_end) > 1e-6)
+        ):
+            return False
+        if with_score:
+            score = item.get("score")
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0.0 <= float(score) <= 1.0
+            ):
+                return False
+        previous_end = end_value
+    return not with_score or abs((previous_end or 0.0) - duration) <= 1e-6
+
+
+def _vad_sample_duration(sample: dict[str, Any]) -> float | None:
+    values: list[float] = []
+    for field in ("duration_sec", "duration_seconds", "duration"):
+        if field not in sample:
+            continue
+        value = sample[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            return None
+        values.append(float(value))
+    if not values or any(
+        not math.isclose(value, values[0], rel_tol=0, abs_tol=1e-6)
+        for value in values[1:]
+    ):
+        return None
+    return values[0]
+
+
 def _task_contract_violations(
     samples: list[dict[str, Any]],
     structured: dict[str, dict[str, Any]],
@@ -335,6 +412,27 @@ def _task_contract_violations(
                     or num_speakers != len(speakers)
                 ):
                     violations.append(key)
+        elif task == "VAD":
+            if any(field not in {"speech_segments", "frame_scores"} for field in prediction):
+                violations.append(key)
+                continue
+            duration = _vad_sample_duration(sample)
+            if duration is None:
+                violations.append(key)
+                continue
+            if not _valid_vad_intervals(
+                sample.get("speech_segments"), duration=duration
+            ) or not _valid_vad_intervals(
+                prediction.get("speech_segments"), duration=duration
+            ):
+                violations.append(key)
+                continue
+            if "frame_scores" in prediction and not _valid_vad_intervals(
+                prediction["frame_scores"],
+                duration=duration,
+                with_score=True,
+            ):
+                violations.append(key)
         elif task == "KWS":
             if _kws_reference_contract_violation(sample) or not {
                 "detected",

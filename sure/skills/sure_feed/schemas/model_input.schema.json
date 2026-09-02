@@ -22,7 +22,7 @@
 		"model_name": { "type": "string" },
 		"task_type": {
 			"type": "string",
-			"enum": ["asr", "s2tt", "sd", "ser", "se", "tts", "vc", "kws", "slu", "gr", "speech_understanding", "sa-asr", "sa_asr"]
+			"enum": ["asr", "s2tt", "sd", "ser", "se", "vad", "tts", "vc", "kws", "slu", "gr", "speech_understanding", "sa-asr", "sa_asr"]
 		},
 		"deployment_type": { "type": "string", "enum": ["local", "api"] },
 		"repo": {
@@ -130,6 +130,22 @@
 					"uniqueItems": true
 				},
 				"segment_schema": {
+					"type": "object",
+					"required": ["type", "required", "properties", "additionalProperties"],
+					"properties": {
+						"type": { "const": "object" },
+						"required": {
+							"type": "array",
+							"items": { "type": "string" },
+							"minItems": 2,
+							"uniqueItems": true
+						},
+						"properties": { "type": "object" },
+						"additionalProperties": { "const": false }
+					},
+					"additionalProperties": false
+				},
+				"frame_score_schema": {
 					"type": "object",
 					"required": ["type", "required", "properties", "additionalProperties"],
 					"properties": {

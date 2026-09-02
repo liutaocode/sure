@@ -292,7 +292,7 @@ def fixture_manifest_for(data: dict, run_dir: Path) -> dict:
         candidates.append(model_dir / "artifacts" / "fixture_manifest.json")
     path = first_existing(candidates)
     if path is None:
-        raise FileNotFoundError("SD/SA-ASR validation requires fixture_manifest.json")
+        raise FileNotFoundError("structured-task validation requires fixture_manifest.json")
     return read_json(path)
 
 
@@ -304,17 +304,17 @@ def validate_structured_evidence(data: dict, run_dir: Path) -> list[str]:
     actual_contract = io_contract_from(data, run_dir)
     violations: list[str] = []
     if actual_contract != expected_contract:
-        violations.append("SD/SA-ASR io_contract must equal the canonical structured segments contract")
+        violations.append("io_contract must equal the canonical structured task contract")
     outputs_path = sample_outputs_path_for(data, run_dir)
     if outputs_path is None:
-        return [*violations, "SD/SA-ASR validation requires sample_outputs.jsonl"]
+        return [*violations, "structured-task validation requires sample_outputs.jsonl"]
     try:
         rows = read_jsonl_objects(outputs_path)
         manifest = fixture_manifest_for(data, run_dir)
     except (OSError, ValueError) as exc:
         return [*violations, str(exc)]
     if canonical_task(manifest.get("task_type")) != task:
-        violations.append("fixture manifest task_type disagrees with SD/SA-ASR validation task")
+        violations.append("fixture manifest task_type disagrees with structured validation task")
     fixture_root = Path(str(manifest.get("staged_dir") or "")).expanduser()
     if not fixture_root.is_absolute() or not fixture_root.is_dir():
         violations.append("fixture manifest staged_dir must be an existing absolute directory")
@@ -378,6 +378,7 @@ def validate_output_contract(sample_output: dict, contract: dict) -> list[str]:
         isinstance(primary_field, str)
         and primary_field
         and primary_field not in nonempty_fields
+        and contract.get("allow_empty_primary") is not True
         and contract.get("allow_empty_segments") != "silence_only"
     ):
         nonempty_fields.append(primary_field)

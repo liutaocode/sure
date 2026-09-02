@@ -32,6 +32,7 @@ all model directories.
 | VC | `vc/README.md` | `vc/seed_vc_zh_smoke/` copied from `src/sure_eval/models/Plachtaa__seed-vc/fixture/zh/` |
 | KWS | `kws/README.md` | `kws/wenwen_smoke/` copied from `src/sure_eval/models/daydream_factory__keyword-spot-fsmn-ctc-wenwen/fixture/kws/` |
 | SE | `se/README.md` | `se/fleurs_noise_smoke/` with a provenance-locked noisy/clean FLEURS pair. |
+| VAD | `vad/README.md` | `vad/librispeech_vad_smoke/` with provenance-locked LibriSpeech speech/gap samples and a deterministic silence control. |
 
 ## Selection Rules
 

@@ -23,6 +23,7 @@ TASK_TYPES = {
     "sd",
     "ser",
     "se",
+    "vad",
     "tts",
     "vc",
     "kws",
@@ -276,10 +277,11 @@ def validate_model_input(model_input: Any, envelope_model_id: str, prefix: str) 
         if (
             nonempty_string(primary)
             and primary not in nonempty
+            and model_input["io_contract"].get("allow_empty_primary") is not True
             and model_input["io_contract"].get("allow_empty_segments") != "silence_only"
         ):
             errors.append(f"{prefix}.model_input.io_contract.primary_field must be in nonempty_fields")
-        if task_type in {"sd", "sa-asr", "sa_asr"}:
+        if task_type in {"vad", "sd", "sa-asr", "sa_asr"}:
             expected_contract = io_contract_for_task(task_type)
             if model_input["io_contract"] != expected_contract:
                 errors.append(

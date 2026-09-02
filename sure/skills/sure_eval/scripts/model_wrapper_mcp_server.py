@@ -88,8 +88,10 @@ def _model_task(config: dict[str, Any]) -> str:
     model = config.get("model") if isinstance(config.get("model"), dict) else {}
     task = str(
         model.get("task") or config.get("task") or config.get("task_type") or ""
-    ).strip().upper().replace("_", "-")
-    return task
+    ).strip().upper().replace("-", "_").replace(" ", "_")
+    if task in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
+        return "VAD"
+    return "SA-ASR" if task == "SA_ASR" else task
 
 
 def _tool_names(config: dict[str, Any]) -> list[str]:
@@ -107,6 +109,7 @@ def _tool_names(config: dict[str, Any]) -> list[str]:
         "SE": "enhance_speech",
         "SD": "diarize",
         "SA-ASR": "transcribe_with_speakers",
+        "VAD": "detect_speech",
     }
     return [defaults.get(_model_task(config), "predict")]
 
@@ -140,13 +143,21 @@ def _tool_schema(task: str) -> dict[str, Any]:
     else:
         required = ["audio_path"]
         properties = {"audio_path": {"type": "string"}}
-    return {"type": "object", "properties": properties, "required": required}
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    }
+    if task == "VAD":
+        schema["additionalProperties"] = False
+    return schema
 
 
 def _call_model(model: Any, name: str, arguments: dict[str, Any]) -> Any:
     structured_methods = {
         "diarize": "diarize",
         "transcribe_with_speakers": "transcribe_with_speakers",
+        "detect_speech": "detect_speech",
     }
     method_name = structured_methods.get(name)
     if method_name is None:

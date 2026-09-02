@@ -1,0 +1,33 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"required": ["speech_segments"],
+	"properties": {
+		"speech_segments": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["start", "end"],
+				"properties": {
+					"start": { "type": "number", "minimum": 0 },
+					"end": { "type": "number", "exclusiveMinimum": 0 }
+				},
+				"additionalProperties": false
+			}
+		},
+		"frame_scores": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["start", "end", "score"],
+				"properties": {
+					"start": { "type": "number", "minimum": 0 },
+					"end": { "type": "number", "exclusiveMinimum": 0 },
+					"score": { "type": "number", "minimum": 0, "maximum": 1 }
+				},
+				"additionalProperties": false
+			}
+		}
+	},
+	"additionalProperties": false
+}

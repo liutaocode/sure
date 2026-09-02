@@ -29,9 +29,11 @@ from check_artifact import validate_fixture_manifest
 from prepare_fixture import (
     SPEAKER_OUTPUT_FIELDS,
     SPEAKER_TASKS,
+    VAD_OUTPUT_FIELDS,
     looks_like_absolute_path_or_uri,
     pcm_wav_info,
     validate_speaker_segments,
+    validate_vad_intervals,
 )
 
 
@@ -553,6 +555,153 @@ def stage_speaker_fixture(
     validate_fixture_manifest(finalized_manifest)
 
 
+def stage_vad_fixture(
+    run_dir: Path,
+    model_dir: Path,
+    resolved: dict,
+    fixture_manifest: dict,
+) -> None:
+    samples = fixture_manifest.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("VAD fixture manifest must declare samples")
+    run_root = run_dir.resolve()
+    staged_dir = run_root / "fixture" / "vad"
+    gt_jsonl = staged_dir / "gt.jsonl"
+
+    def require_run_path(value: object, expected: Path, label: str) -> None:
+        declared = Path(str(value or "")).expanduser()
+        if not declared.is_absolute() or declared.absolute() != expected:
+            raise ValueError(f"VAD fixture {label} must stay in the current run-owned fixture tree")
+
+    require_run_path(fixture_manifest.get("model_dir"), run_root, "model_dir")
+    require_run_path(fixture_manifest.get("staged_dir"), staged_dir, "staged_dir")
+    require_run_path(fixture_manifest.get("staged_path"), staged_dir, "staged_path")
+    require_run_path(fixture_manifest.get("gt_jsonl"), gt_jsonl, "gt_jsonl")
+    if (
+        gt_jsonl.is_symlink()
+        or not gt_jsonl.is_file()
+        or gt_jsonl.stat().st_nlink != 1
+    ):
+        raise ValueError("VAD fixture gt_jsonl must be a real, non-hard-linked run-owned file")
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("VAD fixture samples must be objects")
+        relative_audio = Path(str(sample.get("audio") or ""))
+        if (
+            not str(relative_audio)
+            or relative_audio.is_absolute()
+            or ".." in relative_audio.parts
+            or "\\" in str(sample.get("audio") or "")
+        ):
+            raise ValueError(f"VAD fixture audio path must be portable: {relative_audio}")
+        audio_path = staged_dir / relative_audio
+        require_run_path(
+            sample.get("audio_path"),
+            audio_path,
+            f"sample {sample.get('key')!r} audio_path",
+        )
+        if (
+            audio_path.is_symlink()
+            or not audio_path.is_file()
+            or audio_path.stat().st_nlink != 1
+        ):
+            raise ValueError(
+                f"VAD fixture sample {sample.get('key')!r} audio must be a real, "
+                "non-hard-linked run-owned file"
+            )
+
+    validate_fixture_manifest(fixture_manifest)
+    source_samples: list[dict] = []
+    relative_files = {Path("gt.jsonl")}
+    for sample in samples:
+        relative_audio = Path(str(sample.get("audio") or ""))
+        audio_path = staged_dir / relative_audio
+        source_samples.append(
+            {
+                **sample,
+                "audio": relative_audio.as_posix(),
+                "audio_path": str(audio_path),
+                "sha256": sha256(audio_path),
+                "size_bytes": audio_path.stat().st_size,
+            }
+        )
+        relative_files.add(relative_audio)
+    annotation_source = fixture_manifest.get("annotation_source")
+    if not isinstance(annotation_source, dict):
+        raise ValueError("VAD fixture manifest is missing annotation_source")
+    source_manifest = {
+        **fixture_manifest,
+        "model_dir": str(run_root),
+        "staged_dir": str(staged_dir),
+        "staged_path": str(staged_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": source_samples,
+        "sha256": fixture_tree_identity(staged_dir, relative_files),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(source_samples),
+        "annotation_source": {
+            **annotation_source,
+            "staged_path": str(gt_jsonl),
+        },
+    }
+    validate_fixture_manifest(source_manifest)
+
+    fixture_dir = model_dir / "fixture" / "vad"
+    clear_directory(fixture_dir, model_dir / "fixture")
+    for source in sorted(staged_dir.rglob("*")):
+        if source.is_symlink():
+            raise ValueError(f"VAD fixture tree must not contain symlinks: {source}")
+        relative = source.relative_to(staged_dir)
+        destination = fixture_dir / relative
+        if source.is_dir():
+            ensure_safe_bundle_parent(model_dir, destination / ".fixture-placeholder")
+            continue
+        if not source.is_file():
+            raise ValueError(f"VAD fixture tree contains an unsupported entry: {source}")
+        ensure_safe_bundle_parent(model_dir, destination)
+        shutil.copy2(source, destination)
+
+    finalized_samples: list[dict] = []
+    for sample in source_samples:
+        audio_path = fixture_dir / str(sample["audio"])
+        finalized_samples.append(
+            {
+                **sample,
+                "audio_path": str(audio_path),
+                "sha256": sha256(audio_path),
+                "size_bytes": audio_path.stat().st_size,
+            }
+        )
+    finalized_manifest = {
+        **fixture_manifest,
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(model_dir),
+        "task_type": "vad",
+        "staged_dir": str(fixture_dir),
+        "staged_path": str(fixture_dir),
+        "gt_jsonl": str(fixture_dir / "gt.jsonl"),
+        "samples": finalized_samples,
+        "sha256": fixture_tree_identity(fixture_dir, relative_files),
+        "gt_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "expected_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "size_bytes": sum((fixture_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(finalized_samples),
+        "annotation_source": {
+            **annotation_source,
+            "staged_path": str(fixture_dir / "gt.jsonl"),
+            "bundled_path": str(fixture_dir / "gt.jsonl"),
+        },
+    }
+    write_identical(
+        run_dir / "artifacts" / "fixture_manifest.json",
+        json_bytes(finalized_manifest),
+    )
+    validate_fixture_manifest(finalized_manifest)
+
+
 def stage_fixture(run_dir: Path, model_dir: Path, resolved: dict) -> None:
     fixture_manifest = read_object(run_dir / "artifacts" / "fixture_manifest.json")
     task = str(resolved.get("task_type") or "asr").lower().replace("-", "_")
@@ -570,6 +719,9 @@ def stage_fixture(run_dir: Path, model_dir: Path, resolved: dict) -> None:
             fixture_manifest,
             task=task,
         )
+        return
+    if task == "vad":
+        stage_vad_fixture(run_dir, model_dir, resolved, fixture_manifest)
         return
     annotation_source_value = fixture_manifest.get("annotation_source")
     if not isinstance(annotation_source_value, dict):
@@ -899,6 +1051,73 @@ def validate_speaker_sample_output(
         raise ValueError(f"{label} sample_output key mismatch: missing={missing}, extra={extra}")
 
 
+def validate_vad_sample_output(sample: dict, contract: dict, fixture_manifest: dict) -> None:
+    rows = sample.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("VAD sample_output.json must be an object with a rows array")
+    fixture_samples = fixture_manifest.get("samples")
+    if not isinstance(fixture_samples, list):
+        raise ValueError("VAD fixture manifest has no samples")
+    references = {
+        str(item.get("key") or ""): item
+        for item in fixture_samples
+        if isinstance(item, dict) and item.get("key")
+    }
+    if len(references) != len(fixture_samples):
+        raise ValueError("VAD fixture manifest keys must be non-empty and unique")
+    required = contract.get("required_fields") if isinstance(contract.get("required_fields"), list) else []
+    outputs: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"VAD sample_output rows[{index}] must be an object")
+        key = str(row.get("key") or "")
+        if not key or key in outputs:
+            raise ValueError(f"VAD sample_output key is missing or duplicated: {key!r}")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"VAD sample_output key must be a safe identifier: {key!r}")
+        outputs.add(key)
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"VAD sample_output result for {key} must be an object")
+        unknown = sorted(str(field) for field in result if field not in VAD_OUTPUT_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"VAD sample_output result for {key} contains unapproved field(s): "
+                + ", ".join(unknown)
+            )
+        for field in required:
+            if isinstance(field, str) and field not in result:
+                raise ValueError(f"VAD sample_output result for {key} is missing {field}")
+        reference = references.get(key)
+        if not isinstance(reference, dict):
+            raise ValueError(f"VAD fixture manifest has no sample for {key}")
+        audio_path = Path(str(reference.get("audio_path") or ""))
+        wav_info = pcm_wav_info(audio_path)
+        validate_vad_intervals(
+            result.get("speech_segments"),
+            label=f"VAD sample_output result for {key}",
+            empty_allowed=bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        if "frame_scores" in result:
+            validate_vad_intervals(
+                result.get("frame_scores"),
+                label=f"VAD sample_output result for {key}",
+                frame_scores=True,
+                duration_sec=float(wav_info["duration_sec"]),
+            )
+        try:
+            json.dumps(result, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"VAD sample_output result for {key} is not strict JSON: {error}"
+            ) from error
+    missing = sorted(set(references) - outputs)
+    extra = sorted(outputs - set(references))
+    if missing or extra:
+        raise ValueError(f"VAD sample_output key mismatch: missing={missing}, extra={extra}")
+
+
 def forbidden_speaker_output_fields(value: object, path: str = "result") -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
@@ -1052,6 +1271,10 @@ def promote_sample_output(run_dir: Path) -> None:
         write_identical(artifacts / "sample_output.json", json_bytes(sample))
         return
     task = str(fixture_manifest.get("task_type") or "").lower().replace("-", "_")
+    if task == "vad":
+        validate_vad_sample_output(sample, contract, fixture_manifest)
+        write_identical(artifacts / "sample_output.json", json_bytes(sample))
+        return
     if task in SPEAKER_TASKS:
         validate_speaker_sample_output(
             sample,

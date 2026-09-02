@@ -13,6 +13,7 @@
 | VC | [VC.md](VC.md) | Seed-VC、音频到音频的 voice conversion |
 | KWS | [KWS.md](KWS.md) | keyword spotting、WekWS、唤醒词模型 |
 | SE | [SE.md](SE.md) | speech enhancement、speech denoising、acoustic noise suppression |
+| VAD | [VAD.md](VAD.md) | voice activity detection、speech activity detection、Silero VAD、FSMN-VAD |
 
 维护规则：
 

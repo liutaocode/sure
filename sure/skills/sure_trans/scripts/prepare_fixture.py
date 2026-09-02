@@ -16,10 +16,13 @@ AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 ANNOTATION_FIELDS = ("ground_truth", "target_text", "text", "segments", "label", "intent")
 KWS_OPERATING_THRESHOLD = 0.5
 SPEAKER_TASKS = {"sd", "sa_asr"}
-STRUCTURED_FIXTURE_TASKS = {"kws", "sa_asr", "sd", "se"}
+STRUCTURED_FIXTURE_TASKS = {"kws", "sa_asr", "sd", "se", "vad"}
 SPEAKER_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
 SD_SEGMENT_FIELDS = frozenset({"speaker", "start", "end", "duration"})
 SA_ASR_SEGMENT_FIELDS = frozenset({*SD_SEGMENT_FIELDS, "text"})
+VAD_OUTPUT_FIELDS = frozenset({"speech_segments", "frame_scores"})
+VAD_SEGMENT_FIELDS = frozenset({"start", "end"})
+VAD_FRAME_SCORE_FIELDS = frozenset({"start", "end", "score"})
 URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
@@ -309,6 +312,107 @@ def validate_speaker_segments(
     return segments
 
 
+def validate_vad_intervals(
+    value: object,
+    *,
+    label: str,
+    frame_scores: bool = False,
+    empty_allowed: bool = True,
+    duration_sec: float | None = None,
+) -> list[dict[str, Any]]:
+    interval_name = "frame_scores" if frame_scores else "speech_segments"
+    if not isinstance(value, list):
+        raise ValueError(f"{label} {interval_name} must be an array")
+    if frame_scores and not value:
+        raise ValueError(f"{label} frame_scores must cover the complete audio timebase")
+    if not frame_scores and not value and not empty_allowed:
+        raise ValueError(
+            f"{label} empty speech_segments are allowed only for pure-silence audio"
+        )
+    approved_fields = VAD_FRAME_SCORE_FIELDS if frame_scores else VAD_SEGMENT_FIELDS
+    intervals: list[dict[str, Any]] = []
+    previous_end: float | None = None
+    for index, interval in enumerate(value):
+        if not isinstance(interval, dict):
+            raise ValueError(f"{label} {interval_name}[{index}] must be an object")
+        unknown = sorted(str(field) for field in interval if field not in approved_fields)
+        if unknown:
+            raise ValueError(
+                f"{label} {interval_name}[{index}] contains unapproved field(s): "
+                + ", ".join(unknown)
+            )
+        required_fields = approved_fields
+        missing = sorted(field for field in required_fields if field not in interval)
+        if missing:
+            raise ValueError(
+                f"{label} {interval_name}[{index}] is missing field(s): "
+                + ", ".join(missing)
+            )
+        start = interval.get("start")
+        end = interval.get("end")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(float(start))
+            or float(start) < 0
+        ):
+            raise ValueError(
+                f"{label} {interval_name}[{index}].start must be finite and >= 0"
+            )
+        if (
+            isinstance(end, bool)
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(end))
+            or float(end) <= float(start)
+        ):
+            raise ValueError(
+                f"{label} {interval_name}[{index}].end must be finite and > start"
+            )
+        if frame_scores and index == 0 and not math.isclose(
+            float(start), 0.0, rel_tol=0, abs_tol=1e-6
+        ):
+            raise ValueError(f"{label} frame_scores must start at 0")
+        if previous_end is not None:
+            if frame_scores and not math.isclose(
+                float(start), previous_end, rel_tol=0, abs_tol=1e-6
+            ):
+                raise ValueError(
+                    f"{label} frame_scores must be ordered, contiguous, and non-overlapping"
+                )
+            if not frame_scores and float(start) < previous_end:
+                raise ValueError(
+                    f"{label} {interval_name} must be ordered and non-overlapping"
+                )
+        if duration_sec is not None and float(end) > duration_sec + 1e-6:
+            raise ValueError(
+                f"{label} {interval_name}[{index}].end exceeds WAV duration "
+                f"{duration_sec:.6f}"
+            )
+        if frame_scores:
+            score = interval.get("score")
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0 <= float(score) <= 1
+            ):
+                raise ValueError(
+                    f"{label} frame_scores[{index}].score must be finite and within [0, 1]"
+                )
+        previous_end = float(end)
+        intervals.append(dict(interval))
+    if (
+        frame_scores
+        and duration_sec is not None
+        and previous_end is not None
+        and not math.isclose(previous_end, duration_sec, rel_tol=0, abs_tol=1e-6)
+    ):
+        raise ValueError(
+            f"{label} frame_scores must end at WAV duration {duration_sec:.6f}"
+        )
+    return intervals
+
+
 def speaker_audio_source(
     source_dir: Path,
     value: object,
@@ -434,6 +538,117 @@ def prepare_speaker_fixture(
         "model_name": resolved["model_name"],
         "model_dir": str(run_dir),
         "task_type": task,
+        "source_dir": str(source_dir),
+        "staged_dir": str(staged_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": samples,
+        "source_path": str(source_dir),
+        "staged_path": str(staged_dir),
+        "sha256": fixture_tree_identity(staged_dir, list(relative_files)),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(samples),
+        "link_policy": "copy",
+        "annotation_source": {
+            "type": "fixture_gt_jsonl",
+            "source_path": str(source_gt.resolve()),
+            "staged_path": str(gt_jsonl),
+            "fallback": False,
+        },
+    }
+
+
+def prepare_vad_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str, Any]:
+    raw_source_dir = source.parent if source.is_file() else source
+    if raw_source_dir.is_symlink():
+        raise ValueError(f"VAD fixture root must not be a symlink: {raw_source_dir}")
+    if source.is_symlink():
+        raise ValueError(f"VAD fixture gt.jsonl must not be a symlink: {source}")
+    source_dir = raw_source_dir.resolve()
+    source_gt = source if source.is_file() else source_dir / "gt.jsonl"
+    if source_gt.name != "gt.jsonl" or source_gt.is_symlink() or not source_gt.is_file():
+        raise ValueError(f"VAD fixture must contain gt.jsonl: {source_dir}")
+    rows = read_jsonl(source_gt)
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("VAD smoke fixture must contain 1 to 5 bounded samples")
+
+    staged_dir = run_dir / "fixture" / "vad"
+    clear_directory(staged_dir, run_dir / "fixture")
+    seen_keys: set[str] = set()
+    staged_rows: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    relative_files: set[Path] = set()
+
+    for index, row in enumerate(rows, 1):
+        key = str(row.get("key") or "").strip()
+        if not key:
+            raise ValueError(f"VAD fixture row {index} requires a non-empty key")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"VAD fixture key must be a safe identifier: {key!r}")
+        if key in seen_keys:
+            raise ValueError(f"VAD fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        if "frame_scores" in row:
+            raise ValueError(
+                f"VAD fixture {key} must not contain prediction frame_scores"
+            )
+        relative_audio, audio_source = speaker_audio_source(
+            source_dir,
+            row.get("audio", row.get("wav")),
+            task="vad",
+            key=key,
+        )
+        wav_info = pcm_wav_info(audio_source)
+        speech_segments = validate_vad_intervals(
+            row.get("speech_segments"),
+            label=f"VAD fixture {key}",
+            empty_allowed=bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        destination = staged_dir / relative_audio
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            raise ValueError(f"VAD fixture destination must not be a symlink: {destination}")
+        shutil.copy2(audio_source, destination)
+        relative_files.add(relative_audio)
+        staged_row = {
+            **row,
+            "key": key,
+            "task_type": "vad",
+            "audio": relative_audio.as_posix(),
+            "speech_segments": speech_segments,
+        }
+        try:
+            json.dumps(staged_row, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"VAD fixture {key} must contain strict JSON: {error}") from error
+        staged_rows.append(staged_row)
+        samples.append(
+            {
+                "key": key,
+                "audio": relative_audio.as_posix(),
+                "audio_path": str(destination),
+                "annotation_fields": ["speech_segments"],
+                "segment_count": len(speech_segments),
+                **wav_info,
+                "sha256": sha256(destination),
+                "size_bytes": destination.stat().st_size,
+            }
+        )
+
+    gt_jsonl = staged_dir / "gt.jsonl"
+    with gt_jsonl.open("w", encoding="utf-8") as handle:
+        for row in staged_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    relative_files.add(Path("gt.jsonl"))
+    return {
+        "schema": "sure.trans.fixture_manifest.v1",
+        "status": "ready",
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(run_dir),
+        "task_type": "vad",
         "source_dir": str(source_dir),
         "staged_dir": str(staged_dir),
         "gt_jsonl": str(gt_jsonl),
@@ -768,6 +983,12 @@ def main() -> int:
         return 0
     if task == "se":
         payload = prepare_se_fixture(resolved, source, run_dir)
+        output = artifacts / "fixture_manifest.json"
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(output)
+        return 0
+    if task == "vad":
+        payload = prepare_vad_fixture(resolved, source, run_dir)
         output = artifacts / "fixture_manifest.json"
         output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(output)

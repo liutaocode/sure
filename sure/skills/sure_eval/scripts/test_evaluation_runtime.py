@@ -23,6 +23,7 @@ from evaluation_runtime import (
     _expected_binding,
     _sha256,
     _make_group_writable,
+    _verify,
     _wrapper,
     ensure_evaluation_runtime,
     evaluation_child_environment,
@@ -32,6 +33,40 @@ from evaluation_runtime import (
 
 
 class EvaluationRuntimeTests(unittest.TestCase):
+    def test_import_verification_runs_from_the_engine_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            engine = root / "engine"
+            engine.mkdir()
+            python = root / "bin" / "python"
+            python.parent.mkdir()
+            manifest_path = root / "runtime-manifest.json"
+            binding = {
+                "runtime_id": "test-runtime",
+                "runtime_type": "evaluation_python",
+                "runtime_version": "root-v1",
+                "materialization_version": 1,
+                "dynamic_loader": "/loader",
+                "lock_sha256": "a" * 64,
+                "engine_commit": "b" * 40,
+                "engine_pyproject_sha256": "c" * 64,
+                "harness_runtime_id": "harness-runtime",
+                "harness_runtime_root": str(root / "harness"),
+                "runtime_root": str(root),
+                "python_executable": str(python),
+                "manifest_path": str(manifest_path),
+                "engine_root": str(engine),
+                "required_imports": [],
+            }
+            python.write_text(_wrapper(binding), encoding="utf-8")
+            manifest_path.write_text(json.dumps(binding), encoding="utf-8")
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch("evaluation_runtime.subprocess.run", return_value=completed) as run:
+                ok, _ = _verify(binding)
+
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args.kwargs["cwd"], engine)
+
     def test_materialized_runtime_is_group_writable_without_inventing_execute_bits(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

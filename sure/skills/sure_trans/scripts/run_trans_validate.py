@@ -46,6 +46,9 @@ REFERENCE_OUTPUT_FIELDS = {
 SPEAKER_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
 SD_SEGMENT_FIELDS = frozenset({"speaker", "start", "end", "duration"})
 SA_ASR_SEGMENT_FIELDS = frozenset({*SD_SEGMENT_FIELDS, "text"})
+VAD_OUTPUT_FIELDS = frozenset({"speech_segments", "frame_scores"})
+VAD_SEGMENT_FIELDS = frozenset({"start", "end"})
+VAD_FRAME_SCORE_FIELDS = frozenset({"start", "end", "score"})
 URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
@@ -344,6 +347,37 @@ def validate_mcp_evidence(evidence_path: Path, tool_name: str) -> str | None:
                             "distinct speakers"
                         )
                 json.dumps(result, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                return str(error)
+    if tool_name == "detect_speech":
+        samples = call.get("samples")
+        if not isinstance(samples, list) or not 1 <= len(samples) <= 5:
+            return "VAD MCP smoke must record 1 to 5 keyed samples"
+        if call.get("expected_samples") != len(samples) or call.get("num_samples") != len(samples):
+            return "VAD MCP smoke sample counts do not match"
+        keys: set[str] = set()
+        for sample in samples:
+            if not isinstance(sample, dict) or sample.get("ok") is not True:
+                return "every VAD MCP smoke sample must pass"
+            key = str(sample.get("key") or "")
+            if not key or key in keys or looks_like_absolute_path_or_uri(key):
+                return "VAD MCP smoke samples require unique safe identifiers"
+            keys.add(key)
+            duration_sec = sample.get("audio_duration_sec")
+            if (
+                isinstance(duration_sec, bool)
+                or not isinstance(duration_sec, (int, float))
+                or not math.isfinite(float(duration_sec))
+                or float(duration_sec) <= 0
+            ):
+                return f"VAD MCP smoke sample {key} lacks WAV duration evidence"
+            try:
+                validate_vad_output(
+                    sample.get("result"),
+                    label=f"VAD sample {key}",
+                    empty_allowed=sample.get("audio_is_silence") is True,
+                    duration_sec=float(duration_sec),
+                )
             except (TypeError, ValueError) as error:
                 return str(error)
     return None
@@ -692,6 +726,214 @@ def compare_speaker_equivalence(
         return evidence, None
     return evidence, (
         f"baseline and adapter {task.upper()} outputs differ: "
+        f"missing={missing}, extra={extra}, mismatched={sorted(mismatches)}"
+    )
+
+
+def validate_vad_intervals(
+    value: object,
+    *,
+    label: str,
+    frame_scores: bool = False,
+    empty_allowed: bool = True,
+    duration_sec: float | None = None,
+) -> list[dict]:
+    interval_name = "frame_scores" if frame_scores else "speech_segments"
+    if not isinstance(value, list):
+        raise ValueError(f"{label} {interval_name} must be an array")
+    if frame_scores and not value:
+        raise ValueError(f"{label} frame_scores must cover the complete audio timebase")
+    if not frame_scores and not value and not empty_allowed:
+        raise ValueError(
+            f"{label} empty speech_segments are allowed only for pure-silence audio"
+        )
+    approved_fields = VAD_FRAME_SCORE_FIELDS if frame_scores else VAD_SEGMENT_FIELDS
+    intervals: list[dict] = []
+    previous_end: float | None = None
+    for index, interval in enumerate(value):
+        if not isinstance(interval, dict):
+            raise ValueError(f"{label} {interval_name}[{index}] must be an object")
+        unknown = sorted(str(field) for field in interval if field not in approved_fields)
+        if unknown:
+            raise ValueError(
+                f"{label} {interval_name}[{index}] contains unapproved field(s): "
+                + ", ".join(unknown)
+            )
+        missing = sorted(field for field in approved_fields if field not in interval)
+        if missing:
+            raise ValueError(
+                f"{label} {interval_name}[{index}] is missing field(s): "
+                + ", ".join(missing)
+            )
+        start = interval.get("start")
+        end = interval.get("end")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(float(start))
+            or float(start) < 0
+        ):
+            raise ValueError(
+                f"{label} {interval_name}[{index}].start must be finite and >= 0"
+            )
+        if (
+            isinstance(end, bool)
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(end))
+            or float(end) <= float(start)
+        ):
+            raise ValueError(
+                f"{label} {interval_name}[{index}].end must be finite and > start"
+            )
+        if frame_scores and index == 0 and not math.isclose(
+            float(start), 0.0, rel_tol=0, abs_tol=1e-6
+        ):
+            raise ValueError(f"{label} frame_scores must start at 0")
+        if previous_end is not None:
+            if frame_scores and not math.isclose(
+                float(start), previous_end, rel_tol=0, abs_tol=1e-6
+            ):
+                raise ValueError(
+                    f"{label} frame_scores must be ordered, contiguous, and non-overlapping"
+                )
+            if not frame_scores and float(start) < previous_end:
+                raise ValueError(
+                    f"{label} {interval_name} must be ordered and non-overlapping"
+                )
+        if duration_sec is not None and float(end) > duration_sec + 1e-6:
+            raise ValueError(
+                f"{label} {interval_name}[{index}].end exceeds WAV duration {duration_sec:.6f}"
+            )
+        if frame_scores:
+            score = interval.get("score")
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0 <= float(score) <= 1
+            ):
+                raise ValueError(
+                    f"{label} frame_scores[{index}].score must be finite and within [0, 1]"
+                )
+        previous_end = float(end)
+        intervals.append(interval)
+    if (
+        frame_scores
+        and duration_sec is not None
+        and previous_end is not None
+        and not math.isclose(previous_end, duration_sec, rel_tol=0, abs_tol=1e-6)
+    ):
+        raise ValueError(
+            f"{label} frame_scores must end at WAV duration {duration_sec:.6f}"
+        )
+    return intervals
+
+
+def validate_vad_output(
+    value: object,
+    *,
+    label: str,
+    empty_allowed: bool = False,
+    duration_sec: float | None = None,
+) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} result must be an object")
+    if "speech_segments" not in value:
+        raise ValueError(f"{label} result requires speech_segments")
+    unknown = sorted(str(field) for field in value if field not in VAD_OUTPUT_FIELDS)
+    if unknown:
+        raise ValueError(f"{label} result contains unapproved field(s): " + ", ".join(unknown))
+    validate_vad_intervals(
+        value.get("speech_segments"),
+        label=label,
+        empty_allowed=empty_allowed,
+        duration_sec=duration_sec,
+    )
+    if "frame_scores" in value:
+        validate_vad_intervals(
+            value.get("frame_scores"),
+            label=label,
+            frame_scores=True,
+            duration_sec=duration_sec,
+        )
+    try:
+        json.dumps(value, allow_nan=False, sort_keys=True)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} result must be strict JSON: {error}") from error
+    return value
+
+
+def vad_equivalence_rows(
+    path: Path,
+    *,
+    audio_info_by_key: dict[str, dict[str, object]],
+) -> dict[str, dict]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    rows = value.get("rows") if isinstance(value, dict) else value
+    if not isinstance(rows, list):
+        raise ValueError(f"{path} must contain a VAD rows array")
+    if not 1 <= len(rows) <= 5:
+        raise ValueError(f"{path} must contain 1 to 5 VAD rows")
+    normalized: dict[str, dict] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{path} rows[{index}] must be an object")
+        key = str(row.get("key") or "")
+        if not key or key in normalized:
+            raise ValueError(f"{path} has a missing or duplicate VAD key: {key!r}")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"{path} VAD key must be a safe identifier: {key!r}")
+        info = audio_info_by_key.get(key)
+        if not isinstance(info, dict):
+            raise ValueError(f"{path} VAD result for {key} has no fixture WAV evidence")
+        normalized[key] = validate_vad_output(
+            row.get("result"),
+            label=f"{path} VAD result for {key}",
+            empty_allowed=bool(info.get("audio_is_silence")),
+            duration_sec=float(info["duration_sec"]),
+        )
+    return normalized
+
+
+def compare_vad_equivalence(
+    baseline_path: Path,
+    adapter_path: Path,
+    policy: str,
+    *,
+    audio_info_by_key: dict[str, dict[str, object]],
+) -> tuple[dict, str | None]:
+    baseline = vad_equivalence_rows(
+        baseline_path,
+        audio_info_by_key=audio_info_by_key,
+    )
+    adapter = vad_equivalence_rows(
+        adapter_path,
+        audio_info_by_key=audio_info_by_key,
+    )
+    missing = sorted(set(baseline) - set(adapter))
+    extra = sorted(set(adapter) - set(baseline))
+    mismatches = {
+        key: {"baseline": baseline[key], "adapter": adapter[key]}
+        for key in sorted(set(baseline) & set(adapter))
+        if json.dumps(baseline[key], allow_nan=False, sort_keys=True, separators=(",", ":"))
+        != json.dumps(adapter[key], allow_nan=False, sort_keys=True, separators=(",", ":"))
+    }
+    match = not missing and not extra and not mismatches
+    evidence = {
+        "policy": policy,
+        "comparison": "keyed_vad_full_structured_json",
+        "primary_field": "speech_segments",
+        "baseline_rows": baseline,
+        "adapter_rows": adapter,
+        "missing_keys": missing,
+        "extra_keys": extra,
+        "mismatches": mismatches,
+        "match": match,
+    }
+    if match:
+        return evidence, None
+    return evidence, (
+        "baseline and adapter VAD outputs differ: "
         f"missing={missing}, extra={extra}, mismatched={sorted(mismatches)}"
     )
 
@@ -1052,6 +1294,8 @@ def compare_equivalence_outputs(run_dir: Path, data: dict) -> tuple[dict | None,
         contract = manifest.get("io_contract") if isinstance(manifest.get("io_contract"), dict) else {}
         if contract.get("output_type") == "keyword_detection":
             task_type = "kws"
+        elif contract.get("output_type") == "voice_activity_detection":
+            task_type = "vad"
     if task_type == "kws":
         try:
             return compare_kws_equivalence(
@@ -1088,6 +1332,26 @@ def compare_equivalence_outputs(run_dir: Path, data: dict) -> tuple[dict | None,
                 adapter_path,
                 policy,
                 task=task_type,
+                audio_info_by_key=speaker_fixture_wav_info(run_dir),
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            return None, str(error)
+    if task_type == "vad":
+        try:
+            baseline_path = controlled_speaker_output_document(
+                paths["baseline_output"], run_dir, "baseline"
+            )
+            adapter_path = controlled_speaker_output_document(
+                paths["adapter_output"], run_dir, "adapter"
+            )
+            if baseline_path.samefile(adapter_path):
+                raise ValueError(
+                    "structured baseline_output and adapter_output must be independent files"
+                )
+            return compare_vad_equivalence(
+                baseline_path,
+                adapter_path,
+                policy,
                 audio_info_by_key=speaker_fixture_wav_info(run_dir),
             )
         except (json.JSONDecodeError, ValueError) as error:

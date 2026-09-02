@@ -46,6 +46,7 @@ TASK_TYPES = {
     "sd",
     "ser",
     "se",
+    "vad",
     "tts",
     "vc",
     "kws",
@@ -67,6 +68,7 @@ ALL_TASK_PLAYBOOKS = [
     "references/task_playbooks/VC.md",
     "references/task_playbooks/KWS.md",
     "references/task_playbooks/SE.md",
+    "references/task_playbooks/VAD.md",
 ]
 ALL_ENV_PLAYBOOKS = [
     "references/playbooks/env_uv.md",
@@ -263,6 +265,8 @@ def task_playbooks_for(task_type: str) -> list[str]:
         return ["references/task_playbooks/KWS.md"]
     if task == "se":
         return ["references/task_playbooks/SE.md"]
+    if task == "vad":
+        return ["references/task_playbooks/VAD.md"]
     return []
 
 
@@ -344,8 +348,8 @@ def make_model_input_resolved(
         declared_contract = model_input.get("io_contract")
         if declared_contract is not None and declared_contract != task_contract["io_contract"]:
             raise ValueError(
-                "MODEL_INPUT io_contract conflicts with the canonical SD/SA-ASR "
-                "structured segments contract; regenerate the Feed handoff instead of overriding it"
+                "MODEL_INPUT io_contract conflicts with the canonical structured task "
+                "contract; regenerate the Feed handoff instead of overriding it"
             )
         for field in ("tool_name", "predict_method"):
             declared = model_input.get(field)

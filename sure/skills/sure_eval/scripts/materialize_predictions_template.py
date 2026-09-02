@@ -39,7 +39,9 @@ def _load_samples(jsonl_path: Path) -> list[dict[str, Any]]:
 
 
 def _default_metric(task: str | None, language: str | None) -> str:
-    task_name = (task or "").upper().replace("_", "-")
+    task_name = (task or "").strip().upper().replace("-", "_").replace(" ", "_")
+    if task_name in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
+        task_name = "VAD"
     language_name = (language or "").lower()
     if task_name in {"SER", "GR", "SLU"}:
         return "accuracy"
@@ -47,8 +49,10 @@ def _default_metric(task: str | None, language: str | None) -> str:
         return "bleu"
     if task_name == "SD":
         return "der"
-    if task_name == "SA-ASR":
+    if task_name == "SA_ASR":
         return "cpwer"
+    if task_name == "VAD":
+        return "f1"
     if task_name == "SE":
         return "si-sdr"
     if task_name == "TTS":

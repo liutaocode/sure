@@ -72,6 +72,18 @@ class TaskCompatibilityPolicyTests(unittest.TestCase):
                 [{"name": "asr-dataset", "task": "ASR"}],
             )
 
+    def test_vad_model_requires_vad_dataset(self) -> None:
+        with self.assertRaisesRegex(resolve_eval_input.EvalInputError, "Task mismatch"):
+            resolve_eval_input._check_task_compatibility(
+                {"name": "vad-model", "declared_task": "VAD"},
+                [{"name": "asr-dataset", "task": "ASR"}],
+            )
+        with self.assertRaisesRegex(resolve_eval_input.EvalInputError, "Task mismatch"):
+            resolve_eval_input._check_task_compatibility(
+                {"name": "asr-model", "declared_task": "ASR"},
+                [{"name": "vad-dataset", "task": "VAD"}],
+            )
+
     def test_asr_model_rejects_se_dataset(self) -> None:
         with self.assertRaisesRegex(resolve_eval_input.EvalInputError, "Task mismatch"):
             resolve_eval_input._check_task_compatibility(

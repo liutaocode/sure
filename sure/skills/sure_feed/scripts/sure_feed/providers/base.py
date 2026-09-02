@@ -70,6 +70,10 @@ def canonical_task(task: str) -> str:
         "speech enhancement": "se",
         "acoustic-noise-suppression": "se",
         "acoustic noise suppression": "se",
+        "voice-activity-detection": "vad",
+        "voice activity detection": "vad",
+        "speech-activity-detection": "vad",
+        "speech activity detection": "vad",
         "emotion-recognition": "ser",
         "speech-emotion-recognition": "ser",
         "speaker-diarization": "sd",
@@ -129,6 +133,19 @@ TASK_KEYWORDS: dict[str, tuple[str, ...]] = {
         "speech denoising",
         "speech-denoising",
     ),
+    "vad": (
+        "voice activity detection",
+        "voice-activity-detection",
+        "voice_activity_detection",
+        "speech activity detection",
+        "speech-activity-detection",
+        "speech_activity_detection",
+        "silero-vad",
+        "silero_vad",
+        "speech_fsmn_vad",
+        "fsmn-vad",
+        "get_speech_timestamps",
+    ),
 }
 
 
@@ -139,6 +156,8 @@ PIPELINE_TO_TASK = {
     "text-to-speech": "tts",
     "text-to-audio": "tts",
     "audio-to-audio": "vc",
+    "voice-activity-detection": "vad",
+    "speech-activity-detection": "vad",
 }
 
 BROAD_PIPELINE_TASKS = {"speech_understanding", "audio_to_audio"}
@@ -225,6 +244,31 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return any(term in lowered for term in terms)
 
 
+def _has_standalone_vad_evidence(haystack: dict[str, str]) -> bool:
+    activity_terms = TASK_KEYWORDS["vad"]
+    identity_text = "\n".join((haystack["model_id"], haystack["repo"])).lower()
+    metadata_text = "\n".join((haystack["tags"], haystack["tasks"])).lower()
+    competing_terms = (
+        *TASK_KEYWORDS["kws"],
+        *TASK_KEYWORDS["asr"],
+        *TASK_KEYWORDS["sd"],
+        *TASK_KEYWORDS["sa_asr"],
+        *TASK_KEYWORDS["se"],
+        *TASK_KEYWORDS["vc"],
+    )
+    normalized_identity = re.sub(r"[-_]+", " ", identity_text)
+    normalized_metadata = re.sub(r"[-_]+", " ", metadata_text)
+    normalized_activity = tuple(re.sub(r"[-_]+", " ", term) for term in activity_terms)
+    normalized_competing = tuple(re.sub(r"[-_]+", " ", term) for term in competing_terms)
+    return (
+        _contains_any(normalized_identity, normalized_activity)
+        and not _contains_any(normalized_identity, normalized_competing)
+    ) or (
+        _contains_any(normalized_metadata, normalized_activity)
+        and not _contains_any(normalized_metadata, normalized_competing)
+    )
+
+
 def _narrow_task_from_research(
     candidate: dict[str, Any],
     broad_task: str,
@@ -284,6 +328,8 @@ def _narrow_task_from_research(
     voice_conversion_terms = TASK_KEYWORDS["vc"]
     has_enhancement = _contains_any(combined, enhancement_terms)
     has_voice_conversion = _contains_any(combined, voice_conversion_terms)
+    activity_terms = TASK_KEYWORDS["vad"]
+    has_activity_detection = _has_standalone_vad_evidence(haystack)
 
     ev: list[dict[str, Any]] = []
     if broad_task in BROAD_PIPELINE_TASKS:
@@ -292,6 +338,9 @@ def _narrow_task_from_research(
         ev.append(evidence(source, "task_narrowing.broad_task", broad_task, "strong", url))
 
     if broad_task == "audio_to_audio":
+        if has_activity_detection and target in {"auto", "vad"}:
+            ev.append(evidence(source, "task_narrowing.final_task", "vad", "strong", url))
+            return "vad", 0.96, ev, "research_narrowing"
         if has_transcription and target in {"auto", "asr"}:
             ev.append(evidence(source, "task_narrowing.final_task", "asr", "strong", url))
             return "asr", 0.96, ev, "research_narrowing"
@@ -347,6 +396,22 @@ def _narrow_task_from_research(
         ev.append(evidence(source, "task_narrowing.final_task", "sd", "strong", url))
         return "sd", 0.93, ev, "research_narrowing"
 
+    if has_activity_detection and target in {"auto", "vad"}:
+        for field, value in haystack.items():
+            if _contains_any(value, activity_terms):
+                ev.append(
+                    evidence(
+                        source,
+                        field,
+                        value[:500],
+                        "strong" if field in {"model_id", "tags", "tasks"} else "medium",
+                        url,
+                    )
+                )
+                break
+        ev.append(evidence(source, "task_narrowing.final_task", "vad", "strong", url))
+        return "vad", 0.93, ev, "research_narrowing"
+
     if has_transcription and target in {"auto", "asr", "speech_understanding"}:
         ev.append(evidence(source, "task_narrowing.final_task", "asr", "medium", url))
         return "asr", 0.88, ev, "research_narrowing"
@@ -378,7 +443,7 @@ def infer_task(candidate: dict[str, Any], requested_task: str) -> tuple[bool, st
             url,
         )
     )
-    if specialized in {"sa_asr", "sd"}:
+    if specialized in {"sa_asr", "sd", "vad"}:
         return (
             True,
             specialized,
@@ -412,19 +477,22 @@ def infer_task(candidate: dict[str, Any], requested_task: str) -> tuple[bool, st
         ev.append(evidence(source, "pipeline_tag", pipeline_tag, "strong", url))
         return True, target, 0.95, ev, "pipeline_tag"
 
+    haystack_fields = _candidate_haystack(candidate)
     for task_value in candidate.get("tasks") or []:
         text = str(task_value).lower()
         canonical = canonical_task(text)
+        if canonical == "vad" and not _has_standalone_vad_evidence(haystack_fields):
+            continue
         if target == "auto" and canonical != "auto":
             ev.append(evidence(source, "tasks", task_value, "strong", url))
             return True, canonical, 0.9, ev, "tasks"
         if canonical_task(text) == target or any(keyword in text for keyword in TASK_KEYWORDS.get(target, ())):
             ev.append(evidence(source, "tasks", task_value, "strong", url))
             return True, target, 0.9, ev, "tasks"
-
-    haystack_fields = _candidate_haystack(candidate)
     if target == "auto":
         for task_name, keywords in TASK_KEYWORDS.items():
+            if task_name == "vad" and not _has_standalone_vad_evidence(haystack_fields):
+                continue
             for field, value in haystack_fields.items():
                 lowered = value.lower()
                 for keyword in keywords:
@@ -435,6 +503,8 @@ def infer_task(candidate: dict[str, Any], requested_task: str) -> tuple[bool, st
         return False, "auto", 0.0, ev, ""
 
     keywords = TASK_KEYWORDS.get(target, (target,))
+    if target == "vad" and not _has_standalone_vad_evidence(haystack_fields):
+        return False, target, 0.0, ev, ""
     for field, value in haystack_fields.items():
         lowered = value.lower()
         for keyword in keywords:
@@ -448,6 +518,14 @@ def infer_task(candidate: dict[str, Any], requested_task: str) -> tuple[bool, st
 
 def task_defaults(task: str) -> dict[str, Any]:
     normalized = canonical_task(task)
+    if normalized == "vad":
+        return {
+            "io_contract": io_contract_for_task(normalized),
+            "infer_test": (
+                "model.detect_speech("
+                "'fixtures/tasks/vad/librispeech_vad_smoke/librispeech_vad_001.wav')"
+            ),
+        }
     if normalized in {"sd", "sa_asr"}:
         method = "diarize" if normalized == "sd" else "transcribe_with_speakers"
         fixture_task = "sd" if normalized == "sd" else "sa_asr"
@@ -707,6 +785,8 @@ def _derive_entrypoints(
             ".enhance(",
             ".denoise(",
             ".diarize(",
+            ".detect_speech(",
+            "get_speech_timestamps(",
             "transcribe_with_speakers(",
             ".infer(",
             "pipeline(",
@@ -889,7 +969,7 @@ def _derive_fixture_and_contract(
             fixture["provider_fixture_hint"] = provider_fixture_hint
 
     normalized_task = canonical_task(task_type)
-    if normalized_task in {"sd", "sa_asr"}:
+    if normalized_task in {"vad", "sd", "sa_asr"}:
         io_contract = registry_contract
     elif outputs_audio or normalized_task in {"tts", "vc", "se"}:
         input_type = "text_with_reference_audio" if fixture.get("text") and fixture.get("reference_audio") else "text"

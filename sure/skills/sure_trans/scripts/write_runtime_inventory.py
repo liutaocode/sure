@@ -77,6 +77,7 @@ def main() -> int:
         "se": "enhance_speech",
         "s2tt": "translate_audio",
         "tts": "synthesize_speech",
+        "vad": "detect_speech",
         "vc": "convert_voice",
     }
     tool_name = args.tool_name or default_tools.get(task_type, "transcribe_audio")

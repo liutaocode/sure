@@ -32,6 +32,11 @@ def normalize_task(task: str) -> str:
         return "sd"
     if value in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
+    if value in {
+        "speech_activity_detection",
+        "voice_activity_detection",
+    }:
+        return "vad"
     return value
 
 
@@ -165,6 +170,7 @@ def _compact_sample(row: dict[str, Any], sample_dir: Path, repo_root: Path) -> d
         "annotation_format",
         "metric_format",
         "segments",
+        "speech_segments",
         "rttm",
         "stm",
         "uem",
@@ -217,6 +223,41 @@ def _prefer_gt_files(task: str, gt_files: list[Path], candidate_text: str) -> li
 
 def io_contract_for_task(task: str) -> dict[str, Any]:
     normalized = normalize_task(task)
+    if normalized == "vad":
+        return {
+            "input_type": "audio_path",
+            "output_type": "voice_activity_detection",
+            "input": {"audio_path": "string"},
+            "output": {
+                "speech_segments": "array<{start:number,end:number}>",
+                "frame_scores": "optional array<{start:number,end:number,score:number}>",
+            },
+            "primary_field": "speech_segments",
+            "required_fields": ["speech_segments"],
+            "nonempty_fields": [],
+            "allow_empty_primary": True,
+            "json_serializable": True,
+            "approved_output_fields": ["frame_scores", "speech_segments"],
+            "segment_schema": {
+                "type": "object",
+                "required": ["start", "end"],
+                "properties": {
+                    "start": {"type": "number", "minimum": 0},
+                    "end": {"type": "number", "exclusiveMinimum": 0},
+                },
+                "additionalProperties": False,
+            },
+            "frame_score_schema": {
+                "type": "object",
+                "required": ["start", "end", "score"],
+                "properties": {
+                    "start": {"type": "number", "minimum": 0},
+                    "end": {"type": "number", "exclusiveMinimum": 0},
+                    "score": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "additionalProperties": False,
+            },
+        }
     if normalized in {"sd", "sa_asr"}:
         sa_asr = normalized == "sa_asr"
         item_required = ["speaker", "start", "end", *(("text",) if sa_asr else ())]

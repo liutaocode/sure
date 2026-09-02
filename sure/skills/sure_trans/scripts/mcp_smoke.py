@@ -31,6 +31,9 @@ KWS_OPERATING_THRESHOLD = 0.5
 SPEAKER_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
 SD_SEGMENT_FIELDS = frozenset({"speaker", "start", "end", "duration"})
 SA_ASR_SEGMENT_FIELDS = frozenset({*SD_SEGMENT_FIELDS, "text"})
+VAD_OUTPUT_FIELDS = frozenset({"speech_segments", "frame_scores"})
+VAD_SEGMENT_FIELDS = frozenset({"start", "end"})
+VAD_FRAME_SCORE_FIELDS = frozenset({"start", "end", "score"})
 URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 REFERENCE_OUTPUT_FIELDS = {
     "answer",
@@ -171,6 +174,8 @@ def primary_output_field(tool: str) -> str:
         return "detected"
     if tool in {"diarize", "transcribe_with_speakers"}:
         return "segments"
+    if tool == "detect_speech":
+        return "speech_segments"
     return "text"
 
 
@@ -186,7 +191,7 @@ def output_is_nonempty(primary_field: str, value: object) -> bool:
             return False
         candidate = Path(value)
         return candidate.is_file() and candidate.stat().st_size > 0
-    if primary_field == "segments":
+    if primary_field in {"segments", "speech_segments"}:
         return isinstance(value, list)
     if isinstance(value, str):
         return bool(value.strip())
@@ -344,6 +349,199 @@ def load_se_fixture(path: Path) -> list[tuple[str, Path, dict, Path]]:
         rows.append((key, paths["noisy_audio"], row, paths["reference_audio"]))
     if not 1 <= len(rows) <= 5:
         raise ValueError("SE MCP smoke requires 1 to 5 noisy/clean samples")
+    return rows
+
+
+def validate_vad_intervals(
+    value: object,
+    *,
+    label: str,
+    frame_scores: bool = False,
+    empty_allowed: bool = True,
+    duration_sec: float | None = None,
+) -> list[str]:
+    interval_name = "frame_scores" if frame_scores else "speech_segments"
+    if not isinstance(value, list):
+        return [f"{label} {interval_name} must be an array"]
+    violations: list[str] = []
+    if frame_scores and not value:
+        violations.append(f"{label} frame_scores must cover the complete audio timebase")
+    if not frame_scores and not value and not empty_allowed:
+        violations.append(
+            f"{label} empty speech_segments are allowed only for pure-silence audio"
+        )
+    approved_fields = VAD_FRAME_SCORE_FIELDS if frame_scores else VAD_SEGMENT_FIELDS
+    previous_end: float | None = None
+    for index, interval in enumerate(value):
+        if not isinstance(interval, dict):
+            violations.append(f"{label} {interval_name}[{index}] must be an object")
+            continue
+        unknown = sorted(str(field) for field in interval if field not in approved_fields)
+        if unknown:
+            violations.append(
+                f"{label} {interval_name}[{index}] contains unapproved field(s): "
+                + ", ".join(unknown)
+            )
+        missing = sorted(field for field in approved_fields if field not in interval)
+        if missing:
+            violations.append(
+                f"{label} {interval_name}[{index}] is missing field(s): "
+                + ", ".join(missing)
+            )
+        start = interval.get("start")
+        end = interval.get("end")
+        start_valid = (
+            not isinstance(start, bool)
+            and isinstance(start, (int, float))
+            and math.isfinite(float(start))
+            and float(start) >= 0
+        )
+        if not start_valid:
+            violations.append(
+                f"{label} {interval_name}[{index}].start must be finite and >= 0"
+            )
+        end_valid = (
+            not isinstance(end, bool)
+            and isinstance(end, (int, float))
+            and math.isfinite(float(end))
+            and start_valid
+            and float(end) > float(start)
+        )
+        if not end_valid:
+            violations.append(
+                f"{label} {interval_name}[{index}].end must be finite and > start"
+            )
+        if (
+            frame_scores
+            and index == 0
+            and start_valid
+            and not math.isclose(float(start), 0.0, rel_tol=0, abs_tol=1e-6)
+        ):
+            violations.append(f"{label} frame_scores must start at 0")
+        if start_valid and previous_end is not None:
+            if frame_scores and not math.isclose(
+                float(start), previous_end, rel_tol=0, abs_tol=1e-6
+            ):
+                violations.append(
+                    f"{label} frame_scores must be ordered, contiguous, and non-overlapping"
+                )
+            if not frame_scores and float(start) < previous_end:
+                violations.append(
+                    f"{label} {interval_name} must be ordered and non-overlapping"
+                )
+        if end_valid and duration_sec is not None and float(end) > duration_sec + 1e-6:
+            violations.append(
+                f"{label} {interval_name}[{index}].end exceeds WAV duration {duration_sec:.6f}"
+            )
+        if frame_scores:
+            score = interval.get("score")
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0 <= float(score) <= 1
+            ):
+                violations.append(
+                    f"{label} frame_scores[{index}].score must be finite and within [0, 1]"
+                )
+        if end_valid:
+            previous_end = float(end)
+    if (
+        frame_scores
+        and duration_sec is not None
+        and previous_end is not None
+        and not math.isclose(previous_end, duration_sec, rel_tol=0, abs_tol=1e-6)
+    ):
+        violations.append(f"{label} frame_scores must end at WAV duration {duration_sec:.6f}")
+    return violations
+
+
+def validate_vad_output(
+    value: object,
+    *,
+    empty_allowed: bool = False,
+    duration_sec: float | None = None,
+) -> list[str]:
+    if not isinstance(value, dict):
+        return ["VAD output must be an object"]
+    if "speech_segments" not in value:
+        return ["VAD output requires speech_segments"]
+    violations: list[str] = []
+    unknown = sorted(str(field) for field in value if field not in VAD_OUTPUT_FIELDS)
+    if unknown:
+        violations.append("VAD output contains unapproved field(s): " + ", ".join(unknown))
+    violations.extend(
+        validate_vad_intervals(
+            value.get("speech_segments"),
+            label="VAD",
+            empty_allowed=empty_allowed,
+            duration_sec=duration_sec,
+        )
+    )
+    if "frame_scores" in value:
+        violations.extend(
+            validate_vad_intervals(
+                value.get("frame_scores"),
+                label="VAD",
+                frame_scores=True,
+                duration_sec=duration_sec,
+            )
+        )
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        violations.append(f"VAD output must be strict JSON: {error}")
+    return violations
+
+
+def load_vad_fixture(path: Path) -> list[tuple[str, Path, dict, None]]:
+    rows: list[tuple[str, Path, dict, None]] = []
+    seen: set[str] = set()
+    if path.is_symlink():
+        raise ValueError("VAD fixture gt.jsonl must not be a symlink")
+    fixture_root = path.parent.resolve()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"VAD fixture line {line_number} must be an object")
+        key = str(row.get("key") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"VAD fixture key is missing or duplicated: {key!r}")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"VAD fixture key must be a safe identifier: {key!r}")
+        seen.add(key)
+        audio = row.get("audio") or row.get("wav")
+        if not isinstance(audio, str) or not audio.strip():
+            raise ValueError(f"VAD fixture {key} requires audio or wav")
+        relative = Path(audio)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in audio:
+            raise ValueError(f"VAD fixture {key} audio path must be relative and contained")
+        current = path.parent
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"VAD fixture {key} audio must not traverse a symlink")
+        audio_path = (path.parent / relative).resolve()
+        if (
+            not audio_path.is_file()
+            or audio_path.stat().st_size <= 0
+            or not audio_path.is_relative_to(fixture_root)
+        ):
+            raise ValueError(f"VAD fixture {key} audio is missing or unsafe")
+        wav_info = pcm_wav_info(audio_path)
+        violations = validate_vad_intervals(
+            row.get("speech_segments"),
+            label=f"VAD fixture {key}",
+            empty_allowed=bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        if violations:
+            raise ValueError("; ".join(violations))
+        rows.append((key, audio_path, row, None))
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("VAD MCP smoke requires 1 to 5 samples")
     return rows
 
 
@@ -730,10 +928,12 @@ def main() -> int:
                 calls = load_se_fixture(fixture_gt_jsonl)
             elif args.tool in {"diarize", "transcribe_with_speakers"}:
                 calls = load_speaker_fixture(fixture_gt_jsonl, tool=args.tool)
+            elif args.tool == "detect_speech":
+                calls = load_vad_fixture(fixture_gt_jsonl)
             else:
                 raise ValueError(
                     "--fixture-gt-jsonl is only valid with --tool kws_predict, enhance_speech, "
-                    "diarize, or transcribe_with_speakers"
+                    "diarize, transcribe_with_speakers, or detect_speech"
                 )
         else:
             assert audio is not None
@@ -817,17 +1017,26 @@ def main() -> int:
                 if args.tool == "kws_predict" and fixture_row is not None
                 else []
             )
-            speaker_wav_info: dict[str, object] | None = None
+            structured_wav_info: dict[str, object] | None = None
             if args.tool in {"diarize", "transcribe_with_speakers"}:
-                speaker_wav_info = pcm_wav_info(call_audio)
+                structured_wav_info = pcm_wav_info(call_audio)
                 violations.extend(
                     validate_speaker_output(
                         parsed,
                         tool=args.tool,
                         empty_sd_allowed=(
-                            args.tool == "diarize" and bool(speaker_wav_info["audio_is_silence"])
+                            args.tool == "diarize" and bool(structured_wav_info["audio_is_silence"])
                         ),
-                        duration_sec=float(speaker_wav_info["duration_sec"]),
+                        duration_sec=float(structured_wav_info["duration_sec"]),
+                    )
+                )
+            if args.tool == "detect_speech":
+                structured_wav_info = pcm_wav_info(call_audio)
+                violations.extend(
+                    validate_vad_output(
+                        parsed,
+                        empty_allowed=bool(structured_wav_info["audio_is_silence"]),
+                        duration_sec=float(structured_wav_info["duration_sec"]),
                     )
                 )
             generated_audio: Path | None = None
@@ -864,6 +1073,8 @@ def main() -> int:
                 )
             if args.tool in {"diarize", "transcribe_with_speakers"}:
                 result_preview = parsed if isinstance(parsed, dict) else None
+            if args.tool == "detect_speech":
+                result_preview = parsed if isinstance(parsed, dict) else None
             sample_evidence.append(
                 {
                     "key": key,
@@ -878,18 +1089,18 @@ def main() -> int:
                     ),
                     "audio_sha256": sha256_file(call_audio),
                     "audio_is_silence": (
-                        bool(speaker_wav_info["audio_is_silence"])
-                        if speaker_wav_info is not None
+                        bool(structured_wav_info["audio_is_silence"])
+                        if structured_wav_info is not None
                         else pcm_wav_is_silence(call_audio)
                     ),
                     "audio_duration_sec": (
-                        speaker_wav_info["duration_sec"]
-                        if speaker_wav_info is not None
+                        structured_wav_info["duration_sec"]
+                        if structured_wav_info is not None
                         else None
                     ),
                     "audio_sample_rate": (
-                        speaker_wav_info["sample_rate"]
-                        if speaker_wav_info is not None
+                        structured_wav_info["sample_rate"]
+                        if structured_wav_info is not None
                         else None
                     ),
                     "reference_audio": (

@@ -172,6 +172,8 @@ def _canonical_task_type(task_type: str) -> str:
     normalized = value.replace("-", "_").replace(" ", "_")
     if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
+    if normalized in {"speech_activity_detection", "voice_activity_detection"}:
+        return "vad"
     if normalized in {
         "sa_asr",
         "saasr",
@@ -196,6 +198,7 @@ def _sure_task_name(task_type: str) -> str:
         "sa_asr": "SA-ASR",
         "tts": "TTS",
         "se": "SE",
+        "vad": "VAD",
     }
     return mapping.get(task_type.lower(), task_type.upper())
 
@@ -212,13 +215,14 @@ def _default_tool_name(task_type: str) -> str:
         "tts": "tts_synthesize",
         "kws": "kws_predict",
         "se": "enhance_speech",
+        "vad": "detect_speech",
     }
     return mapping.get(task_type.lower(), f"{task_type.lower()}_predict")
 
 
 def _io_contract_for_task(task_type: str) -> dict[str, Any]:
     task = task_type.lower()
-    if task in {"sd", "sa_asr"}:
+    if task in {"vad", "sd", "sa_asr"}:
         return {"input_field": "audio_path", **io_contract_for_task(task)}
     if task == "tts":
         return {
@@ -259,12 +263,20 @@ def _io_contract_for_task(task_type: str) -> dict[str, Any]:
 
 def _tool_input_schema_for_task(task_type: str) -> dict[str, Any]:
     task = task_type.lower()
-    if task in {"sd", "sa_asr"}:
-        return {
+    if task in {"vad", "sd", "sa_asr"}:
+        schema = {
             "type": "object",
-            "properties": {"audio_path": {"type": "string"}},
+            "properties": {
+                "audio_path": {
+                    "type": "string",
+                    **({"minLength": 1} if task == "vad" else {}),
+                }
+            },
             "required": ["audio_path"],
         }
+        if task == "vad":
+            schema["additionalProperties"] = False
+        return schema
     if task == "kws":
         return {
             "type": "object",
@@ -328,6 +340,7 @@ def _default_model_spec_yaml(
             "allow_empty_segments",
             "approved_output_fields",
             "segment_schema",
+            "frame_score_schema",
         )
         if field in io_contract
     ]
@@ -418,7 +431,7 @@ def _default_config_yaml(
     io_contract = _io_contract_for_task(task_type)
     input_field = io_contract["input_field"]
     input_description = "Text to synthesize" if input_field == "text" else "Path to an audio file"
-    if task_type in {"kws", "se", "sd", "sa_asr"}:
+    if task_type in {"kws", "se", "vad", "sd", "sa_asr"}:
         input_schema_block = (
             "    input_schema: "
             + json.dumps(_tool_input_schema_for_task(task_type), ensure_ascii=False, separators=(",", ":"))
@@ -529,6 +542,7 @@ __all__ = ["ModelWrapper", "PredictionResult"]
 def _default_model_py(manifest: dict[str, Any]) -> str:
     source = _require_mapping(manifest["source"], "source")
     task_type = _canonical_task_type(str(manifest["task_type"]))
+    to_dict_body = "        return asdict(self)"
     if task_type == "tts":
         predict_body = '''        text = input_data.get("text") if isinstance(input_data, dict) else input_data
         if not text:
@@ -583,6 +597,21 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         raise NotImplementedError("SURE tool-agent must implement speech enhancement inference.")'''
         result_fields = '''    audio_path: str = ""
     raw: dict[str, Any] | None = None'''
+    elif task_type == "vad":
+        predict_body = '''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            raise ValueError("audio_path is required")
+        if not Path(audio_path).is_file():
+            raise FileNotFoundError(audio_path)
+        if not self.model_loaded:
+            self.load()
+        raise NotImplementedError("SURE tool-agent must implement VAD inference.")'''
+        result_fields = '''    speech_segments: list[dict[str, Any]] = field(default_factory=list)
+    frame_scores: list[dict[str, Any]] | None = None'''
+        to_dict_body = '''        result = asdict(self)
+        if result["frame_scores"] is None:
+            del result["frame_scores"]
+        return result'''
     elif task_type in {"sd", "sa_asr"}:
         task_label = "SD" if task_type == "sd" else "SA-ASR"
         method = "diarization" if task_type == "sd" else "speaker-attributed transcription"
@@ -629,7 +658,7 @@ class PredictionResult:
 {result_fields}
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+{to_dict_body}
 
 
 class ModelWrapper:
@@ -661,14 +690,20 @@ def _default_server_py(task_type: str) -> str:
     tool_name = _default_tool_name(task_type)
     io_contract = _io_contract_for_task(task_type)
     content_field = io_contract["primary_field"]
-    input_schema = json.dumps(
-        _tool_input_schema_for_task(task_type), ensure_ascii=False, separators=(",", ":")
-    )
+    input_schema = repr(_tool_input_schema_for_task(task_type))
     content_value = (
         "json.dumps(result, ensure_ascii=False)"
-        if task_type.lower() in {"kws", "se", "sd", "sa_asr"}
+        if task_type.lower() in {"kws", "se", "vad", "sd", "sa_asr"}
         else f'str(result.get("{content_field}", ""))'
     )
+    result_validation = ""
+    if task_type.lower() == "vad":
+        result_validation = '''                if not isinstance(result, dict):
+                    raise ValueError("VAD prediction must be an object")
+                if result.get("frame_scores") is None:
+                    result.pop("frame_scores", None)
+                elif not isinstance(result["frame_scores"], list) or not result["frame_scores"]:
+                    raise ValueError("VAD frame_scores must be a non-empty list when provided")'''
     return f'''#!/usr/bin/env python3
 """Minimal MCP-style server scaffold generated by sure_feed."""
 
@@ -720,6 +755,7 @@ class MCPServer:
             arguments = params.get("arguments", {{}})
             try:
                 result = self._load_model().predict(arguments).to_dict()
+{result_validation}
                 return {{
                     "jsonrpc": "2.0",
                     "id": request_id,

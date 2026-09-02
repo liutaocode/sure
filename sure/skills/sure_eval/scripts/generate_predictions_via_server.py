@@ -209,7 +209,11 @@ def _normalize_tts_language(language: str | None) -> str:
 
 
 def _normalize_task(value: Any) -> str:
-    normalized = str(value or "").strip().upper().replace("-", "_")
+    normalized = (
+        str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    )
+    if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
+        return "VAD"
     return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
@@ -302,7 +306,7 @@ def _se_run_output_path(output_audio_dir: Path, key: str) -> Path:
     return output
 
 
-def _validate_pcm_wav(path: Path, *, label: str) -> None:
+def _validate_pcm_wav(path: Path, *, label: str) -> float:
     if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
         raise ValueError(f"{label} must be a real non-empty file: {path}")
     try:
@@ -315,8 +319,10 @@ def _validate_pcm_wav(path: Path, *, label: str) -> None:
                 or handle.getnframes() < 1
             ):
                 raise ValueError(f"{label} must be a readable non-empty PCM WAV: {path}")
+            duration = handle.getnframes() / handle.getframerate()
     except (EOFError, OSError, wave.Error) as exc:
         raise ValueError(f"{label} must be a readable non-empty PCM WAV: {path}") from exc
+    return duration
 
 
 def _validate_kws_threshold(value: Any, *, source: str) -> float:
@@ -406,6 +412,74 @@ def _validate_annotation_prediction_segments(value: Any, *, task: str) -> list[d
             raise ValueError(f"{canonical_task} prediction contains a duplicate segment")
         seen.add(identity)
     return value
+
+
+def _validate_vad_intervals(
+    value: Any,
+    *,
+    role: str,
+    duration: float | None = None,
+    with_score: bool = False,
+) -> list[dict[str, float]]:
+    if not isinstance(value, list):
+        raise ValueError(f"VAD {role} must be a list")
+    if with_score and not value:
+        raise ValueError("VAD frame_scores must not be empty when provided")
+    allowed_fields = {"start", "end", "score"} if with_score else {"start", "end"}
+    normalized: list[dict[str, float]] = []
+    previous_end: float | None = None
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"VAD {role}[{index}] must be an object")
+        unknown = sorted(str(field) for field in item if field not in allowed_fields)
+        if unknown:
+            raise ValueError(
+                f"VAD {role}[{index}] contains unapproved field(s): "
+                + ", ".join(unknown)
+            )
+        if set(item) != allowed_fields:
+            missing = sorted(allowed_fields - set(item))
+            raise ValueError(f"VAD {role}[{index}] is missing field(s): {', '.join(missing)}")
+        start = item["start"]
+        end = item["end"]
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(start))
+            or not math.isfinite(float(end))
+        ):
+            raise ValueError(f"VAD {role}[{index}] times must be finite numbers")
+        start_value = float(start)
+        end_value = float(end)
+        if start_value < 0 or end_value <= start_value:
+            raise ValueError(f"VAD {role}[{index}] requires 0 <= start < end")
+        if duration is not None and end_value > duration + 1e-6:
+            raise ValueError(f"VAD {role}[{index}] exceeds audio duration {duration}")
+        if previous_end is not None and start_value < previous_end - 1e-12:
+            raise ValueError(f"VAD {role} must be ordered and non-overlapping")
+        if with_score and (
+            (previous_end is None and start_value > 1e-6)
+            or (previous_end is not None and abs(start_value - previous_end) > 1e-6)
+        ):
+            raise ValueError("VAD frame_scores must continuously cover the audio timebase")
+        row = {"start": start_value, "end": end_value}
+        if with_score:
+            score = item["score"]
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0.0 <= float(score) <= 1.0
+            ):
+                raise ValueError(f"VAD frame_scores[{index}].score must be within [0, 1]")
+            row["score"] = float(score)
+        normalized.append(row)
+        previous_end = end_value
+    if with_score and duration is not None and abs((previous_end or 0.0) - duration) > 1e-6:
+        raise ValueError("VAD frame_scores must continuously cover the audio timebase")
+    return normalized
 
 
 def _build_tool_arguments(
@@ -505,6 +579,12 @@ def _build_tool_arguments(
             arguments["threshold"] = sample["threshold"]
         if tool_args and "threshold" in tool_args:
             _validate_kws_threshold(tool_args["threshold"], source="tool argument")
+        if tool_args:
+            arguments.update(tool_args)
+        return arguments
+
+    if task_name == "VAD":
+        arguments = {argument_name: str(audio_path)}
         if tool_args:
             arguments.update(tool_args)
         return arguments
@@ -841,10 +921,14 @@ def _normalize_prediction_payload(
     task: str,
     kws_require_score: bool = False,
     expected_audio_output: str | Path | None = None,
+    vad_duration: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     task_name = _normalize_task(task)
     if isinstance(payload, dict):
-        prediction = dict(payload.get("prediction") or {})
+        nested_prediction = payload.get("prediction")
+        if nested_prediction is not None and not isinstance(nested_prediction, dict):
+            raise ValueError(f"{task_name or 'model'} prediction envelope must contain an object")
+        prediction = dict(nested_prediction or {})
         if not prediction:
             prediction = dict(payload)
         if task_name in {"ASR", "S2TT"}:
@@ -952,6 +1036,49 @@ def _normalize_prediction_payload(
                 json.dumps(segments, ensure_ascii=False, allow_nan=False),
                 normalized,
             )
+        if task_name == "VAD":
+            if isinstance(payload.get("prediction"), dict):
+                envelope_fields = sorted(str(field) for field in payload if field != "prediction")
+                if envelope_fields:
+                    raise ValueError(
+                        "VAD prediction envelope contains unapproved field(s): "
+                        + ", ".join(envelope_fields)
+                    )
+            unknown_fields = sorted(
+                str(field)
+                for field in prediction
+                if field not in {"speech_segments", "frame_scores"}
+            )
+            if unknown_fields:
+                raise ValueError(
+                    "VAD prediction contains unapproved field(s): "
+                    + ", ".join(unknown_fields)
+                )
+            if "speech_segments" not in prediction:
+                raise ValueError("VAD prediction is missing speech_segments")
+            normalized = {
+                "speech_segments": _validate_vad_intervals(
+                    prediction["speech_segments"],
+                    role="speech_segments",
+                    duration=vad_duration,
+                )
+            }
+            if "frame_scores" in prediction:
+                normalized["frame_scores"] = _validate_vad_intervals(
+                    prediction["frame_scores"],
+                    role="frame_scores",
+                    duration=vad_duration,
+                    with_score=True,
+                )
+            return (
+                json.dumps(
+                    normalized,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ),
+                normalized,
+            )
         if task_name == "KWS":
             required_fields = ("detected", "keyword", "score")
             missing_fields = [field for field in required_fields if field not in prediction]
@@ -1017,6 +1144,8 @@ def _normalize_prediction_payload(
         return value, {"label": value}
     if task_name in {"SD", "SA-ASR"}:
         raise ValueError(f"{task_name} prediction payload must be a JSON object with segments")
+    if task_name == "VAD":
+        raise ValueError("VAD prediction payload must be a JSON object with speech_segments")
     if task_name == "SE":
         raise ValueError("SE prediction payload must be a JSON object with an audio path")
     if task_name == "KWS":
@@ -1583,18 +1712,28 @@ def main() -> int:
                     next_id += 1
                     raw_payload = _extract_response_payload(response)
                     raw_response_types.add(type(raw_payload).__name__)
-                    if isinstance(raw_payload, dict):
-                        raw_response_keys.update(str(key) for key in raw_payload)
                     prediction, normalized_prediction = _normalize_prediction_payload(
                         raw_payload,
                         task=sample_task,
                         kws_require_score=_kws_metrics_require_scores(generation_metrics),
                         expected_audio_output=arguments.get("output_path") if sample_task == "SE" else None,
+                        vad_duration=(
+                            _validate_pcm_wav(audio_path, label="VAD input audio")
+                            if sample_task == "VAD"
+                            else None
+                        ),
                     )
+                    if isinstance(raw_payload, dict):
+                        observed_payload = (
+                            normalized_prediction
+                            if sample_task in {"SD", "SA-ASR", "VAD"}
+                            else raw_payload
+                        )
+                        raw_response_keys.update(str(key) for key in observed_payload)
                     prediction_map[key] = prediction
                     raw_response_evidence = (
                         normalized_prediction
-                        if sample_task in {"SD", "SA-ASR"}
+                        if sample_task in {"SD", "SA-ASR", "VAD"}
                         else raw_payload
                     )
                     structured_map[key] = {

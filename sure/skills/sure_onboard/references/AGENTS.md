@@ -311,6 +311,7 @@ references/templates/
 | TTS 接入手册 | `task_playbooks/TTS.md`，仅 TTS 路由命中时读取 |
 | VC 接入手册 | `task_playbooks/VC.md`，仅 VC 路由命中时读取 |
 | KWS 接入手册 | `task_playbooks/KWS.md`，仅 KWS 路由命中时读取 |
+| VAD 接入手册 | `task_playbooks/VAD.md`，仅 VAD 路由命中时读取 |
 | 环境 playbook 路由 | `playbooks/env_ROUTING.md` |
 | UV 环境策略 | `playbooks/env_uv.md`，仅 uv 路由命中时读取 |
 | Pip 环境策略 | `playbooks/env_pip.md`，仅 pip 路由命中时读取 |

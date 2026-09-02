@@ -60,6 +60,9 @@ REFERENCE_OUTPUT_FIELDS = {
 SPEAKER_OUTPUT_FIELDS = {"segments", "num_speakers"}
 SD_SEGMENT_FIELDS = {"speaker", "start", "end", "duration"}
 SA_ASR_SEGMENT_FIELDS = {*SD_SEGMENT_FIELDS, "text"}
+VAD_OUTPUT_FIELDS = {"speech_segments", "frame_scores"}
+VAD_SEGMENT_FIELDS = {"start", "end"}
+VAD_FRAME_SCORE_FIELDS = {"start", "end", "score"}
 URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
@@ -412,6 +415,228 @@ def run_se_fixture(wrapper: Any) -> dict[str, Any]:
         )
         result["audio_path"] = str(generated)
         output_rows.append({"key": key, "sample_id": key, "result": result})
+    return {"rows": output_rows}
+
+
+def vad_fixture_rows() -> list[tuple[Path, dict[str, Any]]]:
+    fixture_root = MODEL_DIR / "fixture" / "vad"
+    if fixture_root.is_symlink():
+        raise ValueError("VAD fixture root must not be a symlink")
+    rows: list[tuple[Path, dict[str, Any]]] = []
+    for gt_path in sorted(fixture_root.glob("**/gt.jsonl")):
+        if gt_path.is_symlink():
+            raise ValueError("VAD gt.jsonl must not be a symlink")
+        for line_number, line in enumerate(gt_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"{gt_path}:{line_number} must be a JSON object")
+            rows.append((gt_path, row))
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("VAD validation requires 1 to 5 fixture rows")
+    return rows
+
+
+def vad_fixture_audio(gt_path: Path, row: dict[str, Any], *, key: str) -> Path:
+    audio = row.get("audio") or row.get("wav")
+    if not isinstance(audio, str) or not audio.strip():
+        raise ValueError(f"VAD fixture {key} requires audio or wav")
+    relative = Path(audio)
+    if relative.is_absolute() or ".." in relative.parts or "\\" in audio:
+        raise ValueError(f"VAD fixture {key} audio path must be relative and contained")
+    current = gt_path.parent
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"VAD fixture {key} audio must not traverse a symlink")
+    audio_path = (gt_path.parent / relative).resolve()
+    if (
+        not audio_path.is_file()
+        or audio_path.stat().st_size <= 0
+        or not audio_path.is_relative_to(gt_path.parent.resolve())
+    ):
+        raise ValueError(f"VAD fixture {key} audio is missing or unsafe")
+    return audio_path
+
+
+def validate_vad_intervals(
+    value: Any,
+    *,
+    label: str,
+    frame_scores: bool = False,
+    empty_allowed: bool = True,
+    duration_sec: float | None = None,
+) -> list[str]:
+    interval_name = "frame_scores" if frame_scores else "speech_segments"
+    if not isinstance(value, list):
+        return [f"{label} {interval_name} must be an array"]
+    violations: list[str] = []
+    if frame_scores and not value:
+        violations.append(f"{label} frame_scores must cover the complete audio timebase")
+    if not frame_scores and not value and not empty_allowed:
+        violations.append(
+            f"{label} empty speech_segments are allowed only for pure-silence audio"
+        )
+    approved_fields = VAD_FRAME_SCORE_FIELDS if frame_scores else VAD_SEGMENT_FIELDS
+    previous_end: float | None = None
+    for index, interval in enumerate(value):
+        if not isinstance(interval, dict):
+            violations.append(f"{label} {interval_name}[{index}] must be an object")
+            continue
+        unknown = sorted(str(field) for field in interval if field not in approved_fields)
+        if unknown:
+            violations.append(
+                f"{label} {interval_name}[{index}] contains unapproved field(s): "
+                + ", ".join(unknown)
+            )
+        missing = sorted(field for field in approved_fields if field not in interval)
+        if missing:
+            violations.append(
+                f"{label} {interval_name}[{index}] is missing field(s): "
+                + ", ".join(missing)
+            )
+        start = interval.get("start")
+        end = interval.get("end")
+        start_valid = (
+            not isinstance(start, bool)
+            and isinstance(start, (int, float))
+            and math.isfinite(float(start))
+            and float(start) >= 0
+        )
+        if not start_valid:
+            violations.append(
+                f"{label} {interval_name}[{index}].start must be finite and >= 0"
+            )
+        end_valid = (
+            not isinstance(end, bool)
+            and isinstance(end, (int, float))
+            and math.isfinite(float(end))
+            and start_valid
+            and float(end) > float(start)
+        )
+        if not end_valid:
+            violations.append(
+                f"{label} {interval_name}[{index}].end must be finite and > start"
+            )
+        if (
+            frame_scores
+            and index == 0
+            and start_valid
+            and not math.isclose(float(start), 0.0, rel_tol=0, abs_tol=1e-6)
+        ):
+            violations.append(f"{label} frame_scores must start at 0")
+        if start_valid and previous_end is not None:
+            if frame_scores and not math.isclose(
+                float(start), previous_end, rel_tol=0, abs_tol=1e-6
+            ):
+                violations.append(
+                    f"{label} frame_scores must be ordered, contiguous, and non-overlapping"
+                )
+            if not frame_scores and float(start) < previous_end:
+                violations.append(
+                    f"{label} {interval_name} must be ordered and non-overlapping"
+                )
+        if end_valid and duration_sec is not None and float(end) > duration_sec + 1e-6:
+            violations.append(
+                f"{label} {interval_name}[{index}].end exceeds WAV duration {duration_sec:.6f}"
+            )
+        if frame_scores:
+            score = interval.get("score")
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+                or not 0 <= float(score) <= 1
+            ):
+                violations.append(
+                    f"{label} frame_scores[{index}].score must be finite and within [0, 1]"
+                )
+        if end_valid:
+            previous_end = float(end)
+    if (
+        frame_scores
+        and duration_sec is not None
+        and previous_end is not None
+        and not math.isclose(previous_end, duration_sec, rel_tol=0, abs_tol=1e-6)
+    ):
+        violations.append(f"{label} frame_scores must end at WAV duration {duration_sec:.6f}")
+    return violations
+
+
+def validate_vad_result(
+    result: Any,
+    *,
+    label: str,
+    empty_allowed: bool = False,
+    duration_sec: float | None = None,
+) -> list[str]:
+    if not isinstance(result, dict):
+        return [f"{label} result must be an object"]
+    if "speech_segments" not in result:
+        return [f"{label} result requires speech_segments"]
+    violations: list[str] = []
+    unknown = sorted(str(field) for field in result if field not in VAD_OUTPUT_FIELDS)
+    if unknown:
+        violations.append(f"{label} result contains unapproved field(s): " + ", ".join(unknown))
+    violations.extend(
+        validate_vad_intervals(
+            result.get("speech_segments"),
+            label=label,
+            empty_allowed=empty_allowed,
+            duration_sec=duration_sec,
+        )
+    )
+    if "frame_scores" in result:
+        violations.extend(
+            validate_vad_intervals(
+                result.get("frame_scores"),
+                label=label,
+                frame_scores=True,
+                duration_sec=duration_sec,
+            )
+        )
+    try:
+        json.dumps(result, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        violations.append(f"{label} result must be strict JSON: {error}")
+    return violations
+
+
+def run_vad_fixture(wrapper: Any) -> dict[str, Any]:
+    output_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for gt_path, reference in vad_fixture_rows():
+        key = str(reference.get("key") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"VAD fixture key is missing or duplicated: {key!r}")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"VAD fixture key must be a safe identifier: {key!r}")
+        seen.add(key)
+        audio_path = vad_fixture_audio(gt_path, reference, key=key)
+        wav_info = pcm_wav_info(audio_path)
+        reference_violations = validate_vad_intervals(
+            reference.get("speech_segments"),
+            label=f"VAD fixture {key}",
+            empty_allowed=bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        if reference_violations:
+            raise ValueError("; ".join(reference_violations))
+        result = run_predict(
+            wrapper,
+            {"audio_path": str(audio_path)},
+            scalar_fallback=False,
+        )
+        violations = validate_vad_result(
+            result,
+            label=f"VAD sample {key}",
+            empty_allowed=bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        if violations:
+            raise AssertionError("; ".join(violations))
+        output_rows.append({"key": key, "result": result})
     return {"rows": output_rows}
 
 
@@ -946,6 +1171,64 @@ def validate_speaker_output_document(
     return violations
 
 
+def validate_vad_output_document(
+    sample: dict[str, Any], contract: dict[str, Any]
+) -> list[str]:
+    rows = sample.get("rows")
+    if not isinstance(rows, list):
+        return ["VAD sample_output.json must be an object with a rows array"]
+    references: dict[str, dict[str, Any]] = {}
+    for gt_path, reference in vad_fixture_rows():
+        key = str(reference.get("key") or "")
+        if not key or key in references:
+            return [f"VAD fixture key is missing or duplicated: {key!r}"]
+        try:
+            audio_path = vad_fixture_audio(gt_path, reference, key=key)
+            references[key] = pcm_wav_info(audio_path)
+        except ValueError as error:
+            return [str(error)]
+    outputs: set[str] = set()
+    violations: list[str] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            violations.append(f"rows[{index}] must be an object")
+            continue
+        key = str(row.get("key") or "")
+        if not key or key in outputs:
+            violations.append(f"VAD output key is missing or duplicated: {key!r}")
+            continue
+        if looks_like_absolute_path_or_uri(key):
+            violations.append(f"VAD output key must be a safe identifier: {key!r}")
+        outputs.add(key)
+        result = row.get("result")
+        if not isinstance(result, dict):
+            violations.append(f"VAD output {key} result must be an object")
+            continue
+        violations.extend(
+            f"VAD output {key}: {item}" for item in validate_contract(result, contract)
+        )
+        wav_info = references.get(key, {})
+        violations.extend(
+            validate_vad_result(
+                result,
+                label=f"VAD output {key}",
+                empty_allowed=key in references and bool(wav_info.get("audio_is_silence")),
+                duration_sec=(
+                    float(wav_info["duration_sec"])
+                    if isinstance(wav_info.get("duration_sec"), (int, float))
+                    else None
+                ),
+            )
+        )
+    missing = sorted(set(references) - outputs)
+    extra = sorted(outputs - set(references))
+    if missing:
+        violations.append(f"missing VAD output keys: {', '.join(missing)}")
+    if extra:
+        violations.append(f"unexpected VAD output keys: {', '.join(extra)}")
+    return violations
+
+
 def stage_import() -> bool:
     started = time.time()
     try:
@@ -981,6 +1264,8 @@ def stage_infer() -> bool:
             sample = run_kws_fixture(wrapper)
         elif task == "se":
             sample = run_se_fixture(wrapper)
+        elif task == "vad":
+            sample = run_vad_fixture(wrapper)
         elif task in {"sd", "sa_asr"}:
             sample = run_speaker_fixture(wrapper, task=task)
         else:
@@ -1026,6 +1311,8 @@ def stage_contract() -> bool:
             violations = validate_kws_output_document(sample, contract)
         elif task == "se":
             violations = validate_se_output_document(sample, contract)
+        elif task == "vad":
+            violations = validate_vad_output_document(sample, contract)
         elif task in {"sd", "sa_asr"}:
             violations = validate_speaker_output_document(sample, contract, task=task)
         else:

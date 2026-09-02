@@ -38,7 +38,7 @@ MODEL_FRAMEWORK_ALIASES = {
 }
 MODEL_FRAMEWORK = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
-TASK_TYPES = {"asr", "kws", "s2tt", "sa_asr", "sd", "se", "tts", "vc"}
+TASK_TYPES = {"asr", "kws", "s2tt", "sa_asr", "sd", "se", "tts", "vad", "vc"}
 TASK_TYPE_ALIASES = {
     "acoustic noise suppression": "se",
     "acoustic-noise-suppression": "se",
@@ -68,6 +68,12 @@ TASK_TYPE_ALIASES = {
     "transcribe-diarize": "sa_asr",
     "transcription diarization": "sa_asr",
     "transcription-diarization": "sa_asr",
+    "speech activity detection": "vad",
+    "speech-activity-detection": "vad",
+    "speech_activity_detection": "vad",
+    "voice activity detection": "vad",
+    "voice-activity-detection": "vad",
+    "voice_activity_detection": "vad",
 }
 TASK_MARKERS = {
     "asr": ("asr", "transcribe", "speech recognition", "speech_recognition"),
@@ -122,6 +128,17 @@ TASK_MARKERS = {
     ),
     "s2tt": ("s2tt", "speech translation", "translate_audio", "speech_to_text_translation"),
     "tts": ("tts", "text to speech", "text-to-speech", "synthesize_speech"),
+    "vad": (
+        "vad",
+        "voice activity detection",
+        "voice-activity-detection",
+        "voice_activity_detection",
+        "speech activity detection",
+        "speech-activity-detection",
+        "speech_activity_detection",
+        "detect_speech",
+        "get_speech_timestamps",
+    ),
     "vc": ("voice conversion", "voice_conversion", "convert_voice", "reference_audio_path"),
 }
 
@@ -207,7 +224,7 @@ def resolve_task_type(explicit: str | None, inference_entrypoint: Path, model_pa
     if len(winners) != 1:
         raise ValueError(
             "task_type could not be inferred unambiguously; pass "
-            "task_type=asr|kws|s2tt|sa_asr|sd|se|tts|vc"
+            "task_type=asr|kws|s2tt|sa_asr|sd|se|tts|vad|vc"
         )
     return winners[0]
 

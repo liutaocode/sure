@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
-from structured_segments import canonical_task, is_structured_task, pcm_wav_info, validate_segments
+from structured_segments import (
+    canonical_task,
+    is_structured_task,
+    pcm_wav_info,
+    reference_segments_field,
+    validate_segments,
+)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -81,16 +88,23 @@ def validate_structured_source_tree(source_dir: Path) -> None:
     symlink_component = first_symlink_component(source_dir)
     if symlink_component is not None:
         raise ValueError(
-            f"SD/SA-ASR fixture source path must not traverse a symlink: {symlink_component}"
+            f"structured fixture source path must not traverse a symlink: {symlink_component}"
         )
     if not source_dir.is_dir():
-        raise ValueError(f"SD/SA-ASR fixture source must be a directory: {source_dir}")
+        raise ValueError(f"structured fixture source must be a directory: {source_dir}")
     gt = source_dir / "gt.jsonl"
     if gt.is_symlink() or not gt.is_file():
-        raise ValueError(f"SD/SA-ASR fixture must contain a regular gt.jsonl: {source_dir}")
+        raise ValueError(f"structured fixture must contain a regular gt.jsonl: {source_dir}")
     symlinks = [path for path in source_dir.rglob("*") if path.is_symlink()]
     if symlinks:
-        raise ValueError(f"SD/SA-ASR fixture source tree must not contain symlinks: {symlinks[0]}")
+        raise ValueError(f"structured fixture source tree must not contain symlinks: {symlinks[0]}")
+
+
+def require_vad_single_link_file(path: Path, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"VAD {label} must be a regular file: {path}")
+    if path.stat().st_nlink != 1:
+        raise ValueError(f"VAD {label} must not be hard-linked: {path}")
 
 
 def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
@@ -98,6 +112,8 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
     if is_structured_task(task):
         validate_structured_source_tree(source_dir)
     gt = source_dir / "gt.jsonl"
+    if task == "vad":
+        require_vad_single_link_file(gt, "gt.jsonl")
     samples: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
     for line_no, line in enumerate(gt.read_text(encoding="utf-8").splitlines(), 1):
@@ -109,7 +125,14 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
             raise ValueError(f"{gt}:{line_no} is not valid JSON: {exc}") from exc
         if not isinstance(row, dict):
             raise ValueError(f"{gt}:{line_no} must be a JSON object")
-        audio = row.get("audio") or row.get("wav") or row.get("prompt_audio") or row.get("reference_audio")
+        audio = (
+            row.get("audio") or row.get("wav")
+            if is_structured_task(task)
+            else row.get("audio")
+            or row.get("wav")
+            or row.get("prompt_audio")
+            or row.get("reference_audio")
+        )
         if not isinstance(audio, str) or not audio:
             raise ValueError(f"{gt}:{line_no} must contain a non-empty relative audio/wav field")
         audio_path = Path(audio)
@@ -118,6 +141,8 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
         resolved_audio = source_dir / audio_path
         if not resolved_audio.is_file():
             raise FileNotFoundError(f"Fixture audio referenced by {gt}:{line_no} does not exist: {audio}")
+        if task == "vad":
+            require_vad_single_link_file(resolved_audio, f"audio {audio!r}")
         reference_audio = row.get("reference_audio")
         reference_path: Path | None = None
         if task == "se":
@@ -147,6 +172,8 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
             raise ValueError(f"{gt}:{line_no} task sa_asr requires speaker-attributed segments")
         if task == "sd" and "segments" not in row:
             raise ValueError(f"{gt}:{line_no} task sd requires speaker segments")
+        if task == "vad" and "speech_segments" not in row:
+            raise ValueError(f"{gt}:{line_no} task vad requires speech_segments")
         if is_structured_task(task) and row.get("task") is not None and canonical_task(row["task"]) != task:
             raise ValueError(f"{gt}:{line_no} declares task {row['task']!r}, expected {task!r}")
 
@@ -154,7 +181,7 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
         if is_structured_task(task):
             wav_info = pcm_wav_info(resolved_audio)
             segment_violations = validate_segments(
-                row.get("segments"),
+                row.get(reference_segments_field(task)),
                 task=task,
                 duration_sec=float(wav_info["duration_sec"]),
                 audio_is_silence=bool(wav_info["audio_is_silence"]),
@@ -164,9 +191,37 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
                     f"{gt}:{line_no} invalid {task} reference segments: "
                     + "; ".join(segment_violations)
                 )
+            declared_duration = row.get("duration_sec")
+            if declared_duration is not None and (
+                isinstance(declared_duration, bool)
+                or not isinstance(declared_duration, (int, float))
+                or not math.isfinite(float(declared_duration))
+                or not math.isclose(
+                    float(declared_duration),
+                    float(wav_info["duration_sec"]),
+                    rel_tol=0,
+                    abs_tol=1e-6,
+                )
+            ):
+                raise ValueError(
+                    f"{gt}:{line_no} duration_sec disagrees with the PCM WAV"
+                )
+            declared_sample_rate = row.get("sample_rate")
+            if declared_sample_rate is not None and declared_sample_rate != wav_info["sample_rate"]:
+                raise ValueError(
+                    f"{gt}:{line_no} sample_rate disagrees with the PCM WAV"
+                )
         annotation_fields = [
             field
-            for field in ("ground_truth", "target_text", "text", "segments", "label", "intent")
+            for field in (
+                "ground_truth",
+                "target_text",
+                "text",
+                "segments",
+                "speech_segments",
+                "label",
+                "intent",
+            )
             if field in row
         ]
         if task == "se" and isinstance(reference_audio, str) and reference_audio:
@@ -174,7 +229,7 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
         if not annotation_fields:
             raise ValueError(
                 f"{gt}:{line_no} must contain at least one annotation field "
-                "(ground_truth, target_text, text, segments, label, intent, or reference_audio)"
+                "(ground_truth, target_text, text, segments, speech_segments, label, intent, or reference_audio)"
             )
         sample = {
             "key": key,
@@ -213,15 +268,24 @@ def replace_structured_tree(
     source_dir: Path,
     staged_dir: Path,
     samples: list[dict[str, Any]],
+    *,
+    task: str | None = None,
 ) -> None:
     validate_structured_source_tree(source_dir)
+    vad = canonical_task(task) == "vad"
+    source_gt = source_dir / "gt.jsonl"
+    if vad:
+        require_vad_single_link_file(source_gt, "source gt.jsonl")
     if staged_dir.exists() or staged_dir.is_symlink():
         if staged_dir.is_symlink() or staged_dir.is_file():
             staged_dir.unlink()
         else:
             shutil.rmtree(staged_dir)
     staged_dir.mkdir(parents=True)
-    shutil.copy2(source_dir / "gt.jsonl", staged_dir / "gt.jsonl")
+    staged_gt = staged_dir / "gt.jsonl"
+    shutil.copy2(source_gt, staged_gt)
+    if vad:
+        require_vad_single_link_file(staged_gt, "staged gt.jsonl")
     copied: set[Path] = set()
     for sample in samples:
         relative = Path(str(sample["audio"]))
@@ -229,9 +293,13 @@ def replace_structured_tree(
             continue
         copied.add(relative)
         source = source_dir / relative
+        if vad:
+            require_vad_single_link_file(source, f"source audio {relative.as_posix()!r}")
         destination = staged_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
+        if vad:
+            require_vad_single_link_file(destination, f"staged audio {relative.as_posix()!r}")
 
 
 def main() -> int:
@@ -256,7 +324,7 @@ def main() -> int:
     task = canonical_task(task_raw)
     declared_model_dir = Path(model_dir_raw).expanduser()
     if is_structured_task(task) and declared_model_dir.is_symlink():
-        print("SD/SA-ASR model_dir must not be a symlink", file=sys.stderr)
+        print("structured-task model_dir must not be a symlink", file=sys.stderr)
         return 1
     model_dir = declared_model_dir.resolve()
     repo_root = infer_repo_root(model_dir)
@@ -268,7 +336,7 @@ def main() -> int:
         symlink_component = first_symlink_component(source_dir) if is_structured_task(task) else None
         if symlink_component is not None:
             print(
-                f"SD/SA-ASR fixture source path must not traverse a symlink: {symlink_component}",
+                f"structured fixture source path must not traverse a symlink: {symlink_component}",
                 file=sys.stderr,
             )
             return 1
@@ -289,9 +357,9 @@ def main() -> int:
     if is_structured_task(task):
         for parent in (model_dir / "fixture", model_dir / "fixture" / task):
             if parent.is_symlink():
-                print(f"SD/SA-ASR staged fixture parent must not be a symlink: {parent}", file=sys.stderr)
+                print(f"structured staged fixture parent must not be a symlink: {parent}", file=sys.stderr)
                 return 1
-        replace_structured_tree(source_dir, staged_dir, samples)
+        replace_structured_tree(source_dir, staged_dir, samples, task=task)
     else:
         replace_tree(source_dir, staged_dir)
 

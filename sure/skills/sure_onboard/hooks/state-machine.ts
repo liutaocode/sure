@@ -47,6 +47,7 @@ const TASK_TYPES = [
 	"sd",
 	"ser",
 	"se",
+	"vad",
 	"tts",
 	"vc",
 	"kws",

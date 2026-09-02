@@ -3,7 +3,7 @@
 
 model_id: ""
 model_name: ""
-task_type: ""         # asr / sd / sa_asr / ser / s2tt / slu / omni / api
+task_type: ""         # asr / sd / sa_asr / ser / s2tt / slu / vad / omni / api
 deployment_type: ""   # local / api
 
 repo:

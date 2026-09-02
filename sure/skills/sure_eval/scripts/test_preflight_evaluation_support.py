@@ -72,6 +72,14 @@ def _run_preflight(payload: dict):
 
 @unittest.skipUnless(ENGINE_ROOT.is_dir(), "sure-evaluation submodule is not checked out")
 class PreflightCliTests(unittest.TestCase):
+    def test_vad_detection_suite_is_supported(self):
+        metrics = ["f1", "p_fa", "p_miss", "dcf_nist"]
+        capabilities = _capabilities("VAD", "n/a")
+        self.assertTrue(set(metrics).issubset(capabilities["supported_metrics"]))
+        result, written = _run_preflight(_payload([_dataset("VAD", "n/a", metrics)]))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(written["supported"], written)
+
     def test_se_si_sdr_capability_and_preflight_are_supported(self):
         capabilities = _capabilities("SE", "n/a")
         self.assertEqual(capabilities["task"], "se")

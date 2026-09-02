@@ -1,0 +1,74 @@
+{
+  "schema": "sure.fixture_provenance.v1",
+  "dataset": {
+    "repository": "openslr/librispeech_asr",
+    "revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1",
+    "configuration": "clean",
+    "split": "test",
+    "metadata_sha256": "549fb1bc160952bec75d51d188632d80ac10ceec8519588fa85687565a7c6af0",
+    "license": "CC-BY-4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "source_url": "https://huggingface.co/datasets/openslr/librispeech_asr/tree/71cacbfb7e2354c4226d01e70d77d5fca3d04ba1/clean/test",
+    "citation_url": "https://www.openslr.org/12"
+  },
+  "derivation": {
+    "parent_fixture": "fixtures/tasks/sd/librispeech_2spk_smoke",
+    "parent_provenance_sha256": "b220381b0ab4706ff880f8f96b3decdefe80cc7725c8ce75c4149e166fe5ff3b",
+    "parent_gt_sha256": "6c986896dcffc5e23894b7eaf212e8e387ba8b4d505c5bf95d38ed3907aabcb3",
+    "selection_rule": "reuse the first two locked LibriSpeech recordings and add one deterministic silence control",
+    "sample_rate": 16000,
+    "transforms": [
+      "copy the selected mono 16 kHz PCM16 WAV bytes without re-encoding",
+      "drop speaker identity and retain each source utterance boundary as a VAD speech segment",
+      "generate the silence control as exactly 16000 zero-valued PCM16 samples in a metadata-free mono WAV"
+    ],
+    "source_utterances": [
+      {
+        "id": "1089-134686-0001",
+        "encoded_sha256": "3fc09ec6d4cc496c530b2019b17bd8fc8ef8a43d6697090971dd1d52cc3d4d89",
+        "pcm16le_sha256": "b52828469c97b5867391d346c440d7afa635b42e6040eaabdbe6ddc8d7ad525b",
+        "frames": 52400
+      },
+      {
+        "id": "1188-133604-0010",
+        "encoded_sha256": "22bda5e7b49d6964cb7cd63a32887eb2a06e537ff89f5130211bfabd10ea6b5b",
+        "pcm16le_sha256": "ec111ea4123ccad97a1afb7eb27e827f84d96ffd9d22394ade286c0b034d4e04",
+        "frames": 97520
+      },
+      {
+        "id": "121-121726-0001",
+        "encoded_sha256": "4d4459266056fcd052ced71563e093ecf74a420abfa3a402283fb6b8eb848441",
+        "pcm16le_sha256": "d716179eacf7c6e6d76814fbf75b32df4edb84b822bddfefd120903c4be65439",
+        "frames": 94800
+      },
+      {
+        "id": "1221-135766-0002",
+        "encoded_sha256": "1f02bae046f9567010f0163e8f204612fd1035a751383586a7aef6cb0fcc6e60",
+        "pcm16le_sha256": "81fc21a98ec5ebf393eab6c908c3d5a727f8bbef9f11ec9a374316c763d1a8c5",
+        "frames": 77200
+      }
+    ],
+    "output_sources": {
+      "librispeech_vad_001.wav": "librispeech_2spk_001.wav",
+      "librispeech_vad_002.wav": "librispeech_2spk_002.wav",
+      "librispeech_vad_silence.wav": "generated silence control"
+    }
+  },
+  "files": [
+    {
+      "path": "librispeech_vad_001.wav",
+      "role": "audio",
+      "sha256": "d4de0fb2f1fb562649fb0faa000e07fd34080fe0362374364acaed2d3de40ddb"
+    },
+    {
+      "path": "librispeech_vad_002.wav",
+      "role": "audio",
+      "sha256": "b365c18de362766985b3e17344cc87265a6bbcdd49b78c56204d5d150f9c4b99"
+    },
+    {
+      "path": "librispeech_vad_silence.wav",
+      "role": "generated_silence_control",
+      "sha256": "643f8a8dc8bd9c19225afffad2becfec5426180b3749cb208abdf1a6c8354efc"
+    }
+  ]
+}

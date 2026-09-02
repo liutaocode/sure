@@ -75,6 +75,7 @@ const TASK_TYPES = [
 	"sd",
 	"ser",
 	"se",
+	"vad",
 	"tts",
 	"vc",
 	"kws",
@@ -92,6 +93,9 @@ function canonicalTaskType(value: string): string {
 	const normalized = raw.replace(/-/g, "_");
 	if (normalized === "speech_enhancement" || normalized === "acoustic_noise_suppression") {
 		return "se";
+	}
+	if (normalized === "speech_activity_detection" || normalized === "voice_activity_detection") {
+		return "vad";
 	}
 	return raw;
 }

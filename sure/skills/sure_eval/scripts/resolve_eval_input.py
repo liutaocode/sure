@@ -58,6 +58,7 @@ TEXT_DEFAULT_METRICS = {
     "S2TT": "bleu",
     "SD": "der",
     "SA-ASR": "cpwer",
+    "VAD": "f1",
     "KWS": "accuracy",
     "SE": "si-sdr",
     "SER": "accuracy",
@@ -95,7 +96,11 @@ def _split_values(values: list[str] | None) -> list[str]:
 
 
 def _normalize_task(value: Any) -> str:
-    normalized = str(value or "").strip().upper().replace("-", "_")
+    normalized = (
+        str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    )
+    if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
+        return "VAD"
     return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
@@ -208,8 +213,8 @@ def _check_task_compatibility(model: dict[str, Any], datasets: list[dict[str, An
     for item in datasets:
         task = _normalize_task(item.get("task"))
         exact_task_mismatch = (
-            model_task in {"KWS", "SE", "SD", "SA-ASR"}
-            or task in {"KWS", "SE", "SD", "SA-ASR"}
+            model_task in {"KWS", "SE", "SD", "SA-ASR", "VAD"}
+            or task in {"KWS", "SE", "SD", "SA-ASR", "VAD"}
         ) and task != model_task
         synth_mismatch = (task in SYNTH_TASKS) != model_synth
         if task and task != "UNKNOWN" and (exact_task_mismatch or synth_mismatch):
@@ -645,6 +650,8 @@ def _default_metrics(task: str, language: str, engine_root: Path | None) -> list
     task_upper = _normalize_task(task)
     if task_upper == "SE":
         return ["si-sdr"]
+    if task_upper == "VAD":
+        return ["f1", "p_fa", "p_miss", "dcf_nist"]
     if engine_root is not None:
         try:
             if task_upper in {"TTS", "VC"}:

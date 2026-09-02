@@ -29,6 +29,7 @@ TASK_TYPES = {
     "sd",
     "ser",
     "se",
+    "vad",
     "tts",
     "vc",
     "kws",
@@ -116,7 +117,7 @@ def main() -> int:
         expected_contract = structured_task_contract(task_type)
         if data.get("task_contract") != expected_contract:
             print(
-                "LOAD_MODEL_INPUT gate: SD/SA-ASR requires the canonical structured segments task_contract.",
+                "LOAD_MODEL_INPUT gate: structured tasks require their canonical task_contract.",
                 file=sys.stderr,
             )
             return 1
@@ -127,7 +128,7 @@ def main() -> int:
         ):
             print(
                 "LOAD_MODEL_INPUT gate: normalized MODEL_INPUT must expose the canonical "
-                "SD/SA-ASR method and io_contract.",
+                "structured task method and io_contract.",
                 file=sys.stderr,
             )
             return 1

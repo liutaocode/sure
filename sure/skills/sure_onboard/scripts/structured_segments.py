@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared SD/SA-ASR contracts and bounded segment validation."""
+"""Shared structured speech-task contracts and bounded timeline validation."""
 
 from __future__ import annotations
 
@@ -11,10 +11,13 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
-STRUCTURED_TASKS = frozenset({"sd", "sa_asr"})
-APPROVED_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
+STRUCTURED_TASKS = frozenset({"vad", "sd", "sa_asr"})
+SPEAKER_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
+VAD_OUTPUT_FIELDS = frozenset({"speech_segments", "frame_scores"})
 SD_SEGMENT_FIELDS = frozenset({"speaker", "start", "end", "duration"})
 SA_ASR_SEGMENT_FIELDS = frozenset({*SD_SEGMENT_FIELDS, "text"})
+VAD_SEGMENT_FIELDS = frozenset({"start", "end"})
+VAD_FRAME_SCORE_FIELDS = frozenset({"start", "end", "score"})
 PUBLIC_INFERENCE_PARAMETERS = frozenset(
     {
         "batch_size",
@@ -76,9 +79,13 @@ URI_PREFIX = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
 def canonical_task(value: Any) -> str:
-    normalized = str(value or "").strip().lower().replace("-", "_")
+    normalized = (
+        str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    )
     if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
+    if normalized in {"speech_activity_detection", "voice_activity_detection"}:
+        return "vad"
     return normalized
 
 
@@ -89,7 +96,53 @@ def is_structured_task(value: Any) -> bool:
 def structured_task_contract(value: Any) -> dict[str, Any]:
     task = canonical_task(value)
     if task not in STRUCTURED_TASKS:
-        raise ValueError(f"task {value!r} does not use the structured segments contract")
+        raise ValueError(f"task {value!r} does not use a structured timeline contract")
+    if task == "vad":
+        return {
+            "tool_name": "detect_speech",
+            "predict_method": "detect_speech",
+            "input_fields": ["audio_path"],
+            "public_inference_parameters": [
+                "batch_size",
+                "min_duration_off",
+                "min_duration_on",
+                "vad_threshold",
+            ],
+            "io_contract": {
+                "input_type": "audio_path",
+                "output_type": "voice_activity_detection",
+                "input": {"audio_path": "string"},
+                "output": {
+                    "speech_segments": "array<{start:number,end:number}>",
+                    "frame_scores": "optional array<{start:number,end:number,score:number}>",
+                },
+                "primary_field": "speech_segments",
+                "required_fields": ["speech_segments"],
+                "nonempty_fields": [],
+                "allow_empty_primary": True,
+                "json_serializable": True,
+                "approved_output_fields": ["frame_scores", "speech_segments"],
+                "segment_schema": {
+                    "type": "object",
+                    "required": ["start", "end"],
+                    "properties": {
+                        "start": {"type": "number", "minimum": 0},
+                        "end": {"type": "number", "exclusiveMinimum": 0},
+                    },
+                    "additionalProperties": False,
+                },
+                "frame_score_schema": {
+                    "type": "object",
+                    "required": ["start", "end", "score"],
+                    "properties": {
+                        "start": {"type": "number", "minimum": 0},
+                        "end": {"type": "number", "exclusiveMinimum": 0},
+                        "score": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        }
     sa_asr = task == "sa_asr"
     segment_required = ["speaker", "start", "end"]
     if sa_asr:
@@ -130,10 +183,17 @@ def structured_task_contract(value: Any) -> dict[str, Any]:
             "allow_empty_primary": not sa_asr,
             "json_serializable": True,
             "allow_empty_segments": False if sa_asr else "silence_only",
-            "approved_output_fields": sorted(APPROVED_OUTPUT_FIELDS),
+            "approved_output_fields": sorted(SPEAKER_OUTPUT_FIELDS),
             "segment_schema": segment_schema,
         },
     }
+
+
+def reference_segments_field(value: Any) -> str:
+    task = canonical_task(value)
+    if task not in STRUCTURED_TASKS:
+        raise ValueError(f"task {value!r} does not use a structured timeline contract")
+    return "speech_segments" if task == "vad" else "segments"
 
 
 def pcm_wav_info(path: Path) -> dict[str, Any]:
@@ -200,6 +260,14 @@ def validate_segments(
     normalized_task = canonical_task(task)
     if normalized_task not in STRUCTURED_TASKS:
         return [f"task {task!r} does not use structured segments"]
+    if normalized_task == "vad":
+        return _validate_vad_intervals(
+            segments,
+            field="speech_segments",
+            duration_sec=duration_sec,
+            audio_is_silence=audio_is_silence,
+            require_score=False,
+        )
     if not isinstance(segments, list):
         return ["segments must be an array"]
     if not segments:
@@ -251,6 +319,81 @@ def validate_segments(
     return violations
 
 
+def _validate_vad_intervals(
+    intervals: Any,
+    *,
+    field: str,
+    duration_sec: float,
+    audio_is_silence: bool,
+    require_score: bool,
+) -> list[str]:
+    if not isinstance(intervals, list):
+        return [f"{field} must be an array"]
+    if not intervals:
+        if field == "speech_segments" and audio_is_silence:
+            return []
+        if field == "speech_segments":
+            return ["empty VAD speech_segments are allowed only for pure-silence audio"]
+        return ["frame_scores must be non-empty when provided"]
+
+    approved_fields = VAD_FRAME_SCORE_FIELDS if require_score else VAD_SEGMENT_FIELDS
+    violations: list[str] = []
+    previous_start: float | None = None
+    previous_end: float | None = None
+    for index, interval in enumerate(intervals, 1):
+        prefix = f"{field} item {index}"
+        if not isinstance(interval, dict):
+            violations.append(f"{prefix} must be an object")
+            continue
+        unknown_fields = sorted(str(key) for key in interval if key not in approved_fields)
+        if unknown_fields:
+            violations.append(
+                f"{prefix} contains unapproved field(s): " + ", ".join(unknown_fields)
+            )
+        start = interval.get("start")
+        end = interval.get("end")
+        if not _finite_number(start):
+            violations.append(f"{prefix} start must be a finite number")
+        elif float(start) < 0:
+            violations.append(f"{prefix} start must be >= 0")
+        if not _finite_number(end):
+            violations.append(f"{prefix} end must be a finite number")
+        elif _finite_number(start) and float(end) <= float(start):
+            violations.append(f"{prefix} end must be greater than start")
+        if _finite_number(end) and float(end) > duration_sec + 1e-6:
+            violations.append(
+                f"{prefix} end {float(end):.6f} exceeds WAV duration {duration_sec:.6f}"
+            )
+        if _finite_number(start):
+            current_start = float(start)
+            if require_score and index == 1 and not math.isclose(
+                current_start, 0.0, rel_tol=0, abs_tol=1e-9
+            ):
+                violations.append(f"{prefix} must start at 0")
+            if previous_start is not None and current_start < previous_start:
+                violations.append(f"{prefix} is not ordered by start time")
+            if previous_end is not None and current_start < previous_end - 1e-9:
+                violations.append(f"{prefix} overlaps the previous interval")
+            elif require_score and previous_end is not None and current_start > previous_end + 1e-9:
+                violations.append(f"{prefix} leaves a gap after the previous interval")
+            previous_start = current_start
+        if _finite_number(end):
+            previous_end = float(end)
+        if require_score:
+            score = interval.get("score")
+            if not _finite_number(score):
+                violations.append(f"{prefix} score must be a finite number")
+            elif not 0 <= float(score) <= 1:
+                violations.append(f"{prefix} score must be within [0, 1]")
+    if require_score and previous_end is not None and not math.isclose(
+        previous_end, duration_sec, rel_tol=0, abs_tol=1e-6
+    ):
+        violations.append(
+            f"frame_scores must end at WAV duration {duration_sec:.6f}"
+        )
+    return violations
+
+
 def _forbidden_output_paths(value: Any, path: str = "output") -> list[str]:
     found: list[str] = []
     if isinstance(value, dict):
@@ -280,7 +423,13 @@ def validate_structured_output(
 ) -> list[str]:
     if not isinstance(output, dict):
         return ["structured prediction must be an object"]
-    unknown_fields = sorted(str(key) for key in output if key not in APPROVED_OUTPUT_FIELDS)
+    normalized_task = canonical_task(task)
+    approved_output_fields = (
+        VAD_OUTPUT_FIELDS if normalized_task == "vad" else SPEAKER_OUTPUT_FIELDS
+    )
+    unknown_fields = sorted(
+        str(key) for key in output if key not in approved_output_fields
+    )
     violations = [
         f"model output must not expose reference or path field {path}"
         for path in _forbidden_output_paths(output)
@@ -291,16 +440,27 @@ def validate_structured_output(
         f"structured prediction contains absolute path or URI at {path}"
         for path in _unsafe_string_paths(output)
     )
+    segments_field = reference_segments_field(normalized_task)
     violations.extend(
         validate_segments(
-            output.get("segments"),
-            task=task,
+            output.get(segments_field),
+            task=normalized_task,
             duration_sec=duration_sec,
             audio_is_silence=audio_is_silence,
         )
     )
+    if normalized_task == "vad" and "frame_scores" in output:
+        violations.extend(
+            _validate_vad_intervals(
+                output["frame_scores"],
+                field="frame_scores",
+                duration_sec=duration_sec,
+                audio_is_silence=audio_is_silence,
+                require_score=True,
+            )
+        )
     num_speakers = output.get("num_speakers")
-    if num_speakers is not None:
+    if normalized_task != "vad" and num_speakers is not None:
         if isinstance(num_speakers, bool) or not isinstance(num_speakers, int) or num_speakers < 0:
             violations.append("num_speakers must be a non-negative integer when provided")
         elif isinstance(output.get("segments"), list):
@@ -332,8 +492,16 @@ def validate_structured_rows(
     if not isinstance(samples, list) or len(samples) != len(rows):
         return ["structured output rows must match fixture manifest samples"]
 
+    normalized_task = canonical_task(task)
     sample_by_key: dict[str, dict[str, Any]] = {}
     violations: list[str] = []
+    resolved_fixture_root = fixture_root.resolve() if fixture_root is not None else None
+    if normalized_task == "vad" and resolved_fixture_root is not None:
+        gt_jsonl = resolved_fixture_root / "gt.jsonl"
+        if gt_jsonl.is_symlink() or not gt_jsonl.is_file():
+            violations.append("VAD fixture gt.jsonl must be a regular file")
+        elif gt_jsonl.stat().st_nlink != 1:
+            violations.append("VAD fixture gt.jsonl must not be hard-linked")
     for index, sample in enumerate(samples, 1):
         if not isinstance(sample, dict):
             violations.append(f"fixture sample {index} must be an object")
@@ -343,8 +511,12 @@ def validate_structured_rows(
             violations.append(
                 f"fixture sample {index} exposes unapproved field(s): " + ", ".join(unexpected)
             )
-        if sample.get("annotation_fields") != ["segments"]:
-            violations.append(f"fixture sample {index} annotation_fields must equal ['segments']")
+        expected_annotation_fields = [reference_segments_field(normalized_task)]
+        if sample.get("annotation_fields") != expected_annotation_fields:
+            violations.append(
+                f"fixture sample {index} annotation_fields must equal "
+                f"{expected_annotation_fields!r}"
+            )
         key = sample.get("key")
         if not isinstance(key, str) or not key.strip():
             violations.append(f"fixture sample {index} requires a non-empty key")
@@ -402,9 +574,35 @@ def validate_structured_rows(
             violations.append(f"fixture sample {key!r} lacks resolved audio_path")
             continue
         resolved_sample_audio = Path(sample_audio_path).expanduser().resolve()
-        if fixture_root is not None and not resolved_sample_audio.is_relative_to(fixture_root.resolve()):
+        if resolved_fixture_root is not None and not resolved_sample_audio.is_relative_to(resolved_fixture_root):
             violations.append(f"fixture sample {key!r} audio_path escapes staged fixture root")
             continue
+        if normalized_task == "vad" and resolved_fixture_root is not None:
+            relative_audio = sample.get("audio")
+            if (
+                not isinstance(relative_audio, str)
+                or not relative_audio.strip()
+                or Path(relative_audio).is_absolute()
+                or ".." in Path(relative_audio).parts
+                or "\\" in relative_audio
+            ):
+                violations.append(f"fixture sample {key!r} audio must be a portable relative path")
+                continue
+            expected_audio = resolved_fixture_root / relative_audio
+            if (
+                not Path(sample_audio_path).is_absolute()
+                or resolved_sample_audio != expected_audio.resolve()
+            ):
+                violations.append(
+                    f"fixture sample {key!r} audio_path must resolve to fixture_root/sample.audio"
+                )
+                continue
+            if expected_audio.is_symlink() or not expected_audio.is_file():
+                violations.append(f"fixture sample {key!r} audio must be a regular file")
+                continue
+            if expected_audio.stat().st_nlink != 1:
+                violations.append(f"fixture sample {key!r} audio must not be hard-linked")
+                continue
         try:
             wav_info = pcm_wav_info(resolved_sample_audio)
         except ValueError as exc:
@@ -425,7 +623,7 @@ def validate_structured_rows(
             f"{prefix} {key!r}: {item}"
             for item in validate_structured_output(
                 row.get("output"),
-                task=task,
+                task=normalized_task,
                 duration_sec=float(duration),
                 audio_is_silence=silence,
             )

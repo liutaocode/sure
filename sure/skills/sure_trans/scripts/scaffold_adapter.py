@@ -317,6 +317,13 @@ def tool_contract(task_type: str) -> tuple[str, dict]:
             },
             "required": ["audio_path"],
         }
+    if task_type == "vad":
+        return "detect_speech", {
+            "type": "object",
+            "properties": {"audio_path": {"type": "string", "minLength": 1}},
+            "required": ["audio_path"],
+            "additionalProperties": False,
+        }
     if task_type == "sd":
         return "diarize", {
             "type": "object",
@@ -389,6 +396,41 @@ def io_contract_for(task_type: str) -> dict:
             "required_fields": ["audio_path"],
             "nonempty_fields": ["audio_path"],
             "json_serializable": True,
+        }
+    if task_type == "vad":
+        return {
+            "input_type": "audio_path",
+            "output_type": "voice_activity_detection",
+            "input": {"audio_path": "string"},
+            "output": {
+                "speech_segments": "array<{start:number,end:number}>",
+                "frame_scores": "optional array<{start:number,end:number,score:number}>",
+            },
+            "primary_field": "speech_segments",
+            "required_fields": ["speech_segments"],
+            "nonempty_fields": [],
+            "allow_empty_primary": True,
+            "json_serializable": True,
+            "approved_output_fields": ["frame_scores", "speech_segments"],
+            "segment_schema": {
+                "type": "object",
+                "required": ["start", "end"],
+                "properties": {
+                    "start": {"type": "number", "minimum": 0},
+                    "end": {"type": "number", "exclusiveMinimum": 0},
+                },
+                "additionalProperties": False,
+            },
+            "frame_score_schema": {
+                "type": "object",
+                "required": ["start", "end", "score"],
+                "properties": {
+                    "start": {"type": "number", "minimum": 0},
+                    "end": {"type": "number", "exclusiveMinimum": 0},
+                    "score": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "additionalProperties": False,
+            },
         }
     if task_type == "sd":
         return {
