@@ -86,7 +86,10 @@ def _to_plain(value: Any) -> Any:
 
 def _model_task(config: dict[str, Any]) -> str:
     model = config.get("model") if isinstance(config.get("model"), dict) else {}
-    return str(model.get("task") or config.get("task") or config.get("task_type") or "").strip().upper()
+    task = str(
+        model.get("task") or config.get("task") or config.get("task_type") or ""
+    ).strip().upper().replace("_", "-")
+    return task
 
 
 def _tool_names(config: dict[str, Any]) -> list[str]:
@@ -102,6 +105,8 @@ def _tool_names(config: dict[str, Any]) -> list[str]:
         "TTS": "synthesize_speech",
         "VC": "convert_voice",
         "SE": "enhance_speech",
+        "SD": "diarize",
+        "SA-ASR": "transcribe_with_speakers",
     }
     return [defaults.get(_model_task(config), "predict")]
 
@@ -136,6 +141,24 @@ def _tool_schema(task: str) -> dict[str, Any]:
         required = ["audio_path"]
         properties = {"audio_path": {"type": "string"}}
     return {"type": "object", "properties": properties, "required": required}
+
+
+def _call_model(model: Any, name: str, arguments: dict[str, Any]) -> Any:
+    structured_methods = {
+        "diarize": "diarize",
+        "transcribe_with_speakers": "transcribe_with_speakers",
+    }
+    method_name = structured_methods.get(name)
+    if method_name is None:
+        return model.predict(arguments)
+    method = getattr(model, method_name, None)
+    if method is None:
+        raise AttributeError(f"ModelWrapper must implement {method_name}() for tool {name}")
+    audio_path = arguments.get("audio_path")
+    if not isinstance(audio_path, str) or not audio_path.strip():
+        raise ValueError(f"tool {name} requires audio_path")
+    extra = {key: value for key, value in arguments.items() if key != "audio_path"}
+    return method(audio_path, **extra)
 
 
 def main() -> int:
@@ -196,7 +219,7 @@ def main() -> int:
                 if name == "healthcheck" and hasattr(model, "healthcheck"):
                     result = model.healthcheck()
                 else:
-                    result = model.predict(arguments)
+                    result = _call_model(model, name, arguments)
                 _respond(
                     {
                         "jsonrpc": "2.0",

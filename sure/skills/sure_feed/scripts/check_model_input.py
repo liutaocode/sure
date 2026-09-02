@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from sure_feed.fixture_registry import io_contract_for_task
+
 
 TASK_TYPES = {
     "asr",
@@ -271,8 +273,19 @@ def validate_model_input(model_input: Any, envelope_model_id: str, prefix: str) 
         nonempty = as_list(dotted_get(model_input, "io_contract.nonempty_fields"))
         if nonempty_string(primary) and primary not in required:
             errors.append(f"{prefix}.model_input.io_contract.primary_field must be in required_fields")
-        if nonempty_string(primary) and primary not in nonempty:
+        if (
+            nonempty_string(primary)
+            and primary not in nonempty
+            and model_input["io_contract"].get("allow_empty_segments") != "silence_only"
+        ):
             errors.append(f"{prefix}.model_input.io_contract.primary_field must be in nonempty_fields")
+        if task_type in {"sd", "sa-asr", "sa_asr"}:
+            expected_contract = io_contract_for_task(task_type)
+            if model_input["io_contract"] != expected_contract:
+                errors.append(
+                    f"{prefix}.model_input.io_contract for {task_type} must equal "
+                    "the canonical structured segments contract"
+                )
 
     return errors
 

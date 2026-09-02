@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from structured_segments import canonical_task, is_structured_task, pcm_wav_info, validate_segments
+
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -24,13 +26,6 @@ def load_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-
-
-def canonical_task(task: str) -> str:
-    normalized = task.replace("-", "_").lower()
-    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
-        return "se"
-    return normalized
 
 
 def infer_repo_root(model_dir: Path) -> Path:
@@ -72,9 +67,39 @@ def default_fixture_dir(repo_root: Path, task: str) -> Path | None:
     return options[0] if options else None
 
 
+def first_symlink_component(path: Path) -> Path | None:
+    absolute = path.expanduser().absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return current
+    return None
+
+
+def validate_structured_source_tree(source_dir: Path) -> None:
+    symlink_component = first_symlink_component(source_dir)
+    if symlink_component is not None:
+        raise ValueError(
+            f"SD/SA-ASR fixture source path must not traverse a symlink: {symlink_component}"
+        )
+    if not source_dir.is_dir():
+        raise ValueError(f"SD/SA-ASR fixture source must be a directory: {source_dir}")
+    gt = source_dir / "gt.jsonl"
+    if gt.is_symlink() or not gt.is_file():
+        raise ValueError(f"SD/SA-ASR fixture must contain a regular gt.jsonl: {source_dir}")
+    symlinks = [path for path in source_dir.rglob("*") if path.is_symlink()]
+    if symlinks:
+        raise ValueError(f"SD/SA-ASR fixture source tree must not contain symlinks: {symlinks[0]}")
+
+
 def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
+    task = canonical_task(task)
+    if is_structured_task(task):
+        validate_structured_source_tree(source_dir)
     gt = source_dir / "gt.jsonl"
     samples: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
     for line_no, line in enumerate(gt.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -90,7 +115,8 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
         audio_path = Path(audio)
         if audio_path.is_absolute() or ".." in audio_path.parts:
             raise ValueError(f"{gt}:{line_no} audio path must be relative and stay inside the fixture directory")
-        if not (source_dir / audio_path).exists():
+        resolved_audio = source_dir / audio_path
+        if not resolved_audio.is_file():
             raise FileNotFoundError(f"Fixture audio referenced by {gt}:{line_no} does not exist: {audio}")
         reference_audio = row.get("reference_audio")
         reference_path: Path | None = None
@@ -110,7 +136,34 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"{gt}:{line_no} task se audio and reference_audio must be independent files"
                 )
-        key = row.get("key") or row.get("id") or audio_path.stem
+        key = str(row.get("key") or row.get("id") or audio_path.stem).strip()
+        if not key:
+            raise ValueError(f"{gt}:{line_no} requires a non-empty key")
+        if key in seen_keys:
+            raise ValueError(f"{gt}:{line_no} duplicates fixture key {key!r}")
+        seen_keys.add(key)
+
+        if task == "sa_asr" and "segments" not in row:
+            raise ValueError(f"{gt}:{line_no} task sa_asr requires speaker-attributed segments")
+        if task == "sd" and "segments" not in row:
+            raise ValueError(f"{gt}:{line_no} task sd requires speaker segments")
+        if is_structured_task(task) and row.get("task") is not None and canonical_task(row["task"]) != task:
+            raise ValueError(f"{gt}:{line_no} declares task {row['task']!r}, expected {task!r}")
+
+        wav_info: dict[str, Any] | None = None
+        if is_structured_task(task):
+            wav_info = pcm_wav_info(resolved_audio)
+            segment_violations = validate_segments(
+                row.get("segments"),
+                task=task,
+                duration_sec=float(wav_info["duration_sec"]),
+                audio_is_silence=bool(wav_info["audio_is_silence"]),
+            )
+            if segment_violations:
+                raise ValueError(
+                    f"{gt}:{line_no} invalid {task} reference segments: "
+                    + "; ".join(segment_violations)
+                )
         annotation_fields = [
             field
             for field in ("ground_truth", "target_text", "text", "segments", "label", "intent")
@@ -124,17 +177,19 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
                 "(ground_truth, target_text, text, segments, label, intent, or reference_audio)"
             )
         sample = {
-            "key": str(key),
+            "key": key,
             "audio": audio,
-            "audio_path": str((source_dir / audio_path).resolve()),
+            "audio_path": str(resolved_audio.resolve()),
             "annotation_fields": annotation_fields,
         }
         if task == "se" and reference_path is not None:
             sample["reference_audio"] = str(reference_audio)
             sample["reference_audio_path"] = str((source_dir / reference_path).resolve())
-        if isinstance(row.get("duration_sec"), (int, float)):
+        if wav_info is not None:
+            sample.update(wav_info)
+        elif isinstance(row.get("duration_sec"), (int, float)):
             sample["duration_sec"] = row["duration_sec"]
-        if isinstance(row.get("sample_rate"), (int, float)):
+        if wav_info is None and isinstance(row.get("sample_rate"), (int, float)):
             sample["sample_rate"] = row["sample_rate"]
         samples.append(sample)
     if not samples:
@@ -152,6 +207,31 @@ def replace_tree(source_dir: Path, staged_dir: Path) -> None:
             shutil.rmtree(staged_dir)
     staged_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source_dir, staged_dir)
+
+
+def replace_structured_tree(
+    source_dir: Path,
+    staged_dir: Path,
+    samples: list[dict[str, Any]],
+) -> None:
+    validate_structured_source_tree(source_dir)
+    if staged_dir.exists() or staged_dir.is_symlink():
+        if staged_dir.is_symlink() or staged_dir.is_file():
+            staged_dir.unlink()
+        else:
+            shutil.rmtree(staged_dir)
+    staged_dir.mkdir(parents=True)
+    shutil.copy2(source_dir / "gt.jsonl", staged_dir / "gt.jsonl")
+    copied: set[Path] = set()
+    for sample in samples:
+        relative = Path(str(sample["audio"]))
+        if relative in copied:
+            continue
+        copied.add(relative)
+        source = source_dir / relative
+        destination = staged_dir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
 
 
 def main() -> int:
@@ -173,14 +253,25 @@ def main() -> int:
     if not isinstance(model_dir_raw, str) or not isinstance(task_raw, str):
         print("model_input_resolved.json must contain model_dir and task_type", file=sys.stderr)
         return 1
-    model_dir = Path(model_dir_raw).resolve()
     task = canonical_task(task_raw)
+    declared_model_dir = Path(model_dir_raw).expanduser()
+    if is_structured_task(task) and declared_model_dir.is_symlink():
+        print("SD/SA-ASR model_dir must not be a symlink", file=sys.stderr)
+        return 1
+    model_dir = declared_model_dir.resolve()
     repo_root = infer_repo_root(model_dir)
 
     if args.source_dir:
         source_dir = Path(args.source_dir)
         if not source_dir.is_absolute():
             source_dir = repo_root / source_dir
+        symlink_component = first_symlink_component(source_dir) if is_structured_task(task) else None
+        if symlink_component is not None:
+            print(
+                f"SD/SA-ASR fixture source path must not traverse a symlink: {symlink_component}",
+                file=sys.stderr,
+            )
+            return 1
         source_dir = source_dir.resolve()
     else:
         source_dir = candidate_from_spec(run_dir, repo_root, task_raw) or default_fixture_dir(repo_root, task_raw)
@@ -195,7 +286,14 @@ def main() -> int:
 
     samples = load_samples(source_dir, task)
     staged_dir = model_dir / "fixture" / task / source_dir.name
-    replace_tree(source_dir, staged_dir)
+    if is_structured_task(task):
+        for parent in (model_dir / "fixture", model_dir / "fixture" / task):
+            if parent.is_symlink():
+                print(f"SD/SA-ASR staged fixture parent must not be a symlink: {parent}", file=sys.stderr)
+                return 1
+        replace_structured_tree(source_dir, staged_dir, samples)
+    else:
+        replace_tree(source_dir, staged_dir)
 
     staged_samples = []
     for sample in load_samples(staged_dir, task):
@@ -213,6 +311,9 @@ def main() -> int:
         "link_policy": args.link_policy,
         "samples": staged_samples,
         "validation_payload_env": "SURE_VALIDATE_INPUT_JSON",
+        "validation_protocol_env": (
+            "SURE_VALIDATE_PROTOCOL_JSON" if is_structured_task(task) else None
+        ),
         "notes": "Fixture staged into model-local fixture directory for validate.py discovery.",
     }
     write_json(Path(args.produces), manifest)

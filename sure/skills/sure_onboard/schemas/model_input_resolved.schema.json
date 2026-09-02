@@ -61,6 +61,18 @@
 			},
 			"additionalProperties": true
 		},
+		"task_contract": {
+			"type": "object",
+			"required": ["tool_name", "predict_method", "input_fields", "public_inference_parameters", "io_contract"],
+			"properties": {
+				"tool_name": { "type": "string", "enum": ["diarize", "transcribe_with_speakers"] },
+				"predict_method": { "type": "string", "enum": ["diarize", "transcribe_with_speakers"] },
+				"input_fields": { "const": ["audio_path"] },
+				"public_inference_parameters": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+				"io_contract": { "type": "object" }
+			},
+			"additionalProperties": false
+		},
 		"source": {
 			"type": "object",
 			"properties": {

@@ -70,7 +70,15 @@ def main() -> int:
         raise ValueError("registry and every adapter validation stage must pass before writing runtime inventory")
     mount_target = str(resolved["model_mount_target"])
     task_type = str(resolved.get("task_type") or "asr").lower()
-    default_tools = {"tts": "synthesize_speech", "vc": "convert_voice", "s2tt": "translate_audio"}
+    default_tools = {
+        "kws": "kws_predict",
+        "sa_asr": "transcribe_with_speakers",
+        "sd": "diarize",
+        "se": "enhance_speech",
+        "s2tt": "translate_audio",
+        "tts": "synthesize_speech",
+        "vc": "convert_voice",
+    }
     tool_name = args.tool_name or default_tools.get(task_type, "transcribe_audio")
     harness = runtime_binding.get("runtimes", {}).get("harness", {}) if isinstance(runtime_binding, dict) else {}
     harness_binding = harness.get("binding") if isinstance(harness, dict) else None

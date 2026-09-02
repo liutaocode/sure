@@ -13,9 +13,23 @@ KWS_NEGATIVE_VALUES = {"reject", "rejected", "negative", "false", "0", "no"}
 
 
 def normalize_task(task: str) -> str:
-    value = str(task or "").strip().lower().replace("-", "_")
-    if value in {"sa_asr", "saasr"}:
+    value = (
+        str(task or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if value in {
+        "sa_asr",
+        "saasr",
+        "speaker_attributed_asr",
+        "speaker_aware_asr",
+        "transcribe_diarize",
+    }:
         return "sa_asr"
+    if value in {"sd", "speaker_diarization", "speaker_diarisation", "diarization", "diarisation"}:
+        return "sd"
     if value in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
     return value
@@ -203,6 +217,42 @@ def _prefer_gt_files(task: str, gt_files: list[Path], candidate_text: str) -> li
 
 def io_contract_for_task(task: str) -> dict[str, Any]:
     normalized = normalize_task(task)
+    if normalized in {"sd", "sa_asr"}:
+        sa_asr = normalized == "sa_asr"
+        item_required = ["speaker", "start", "end", *(("text",) if sa_asr else ())]
+        segment_schema = {
+            "type": "object",
+            "required": item_required,
+            "properties": {
+                "speaker": {"type": "string", "minLength": 1},
+                "start": {"type": "number", "minimum": 0},
+                "end": {"type": "number", "exclusiveMinimum": 0},
+                "duration": {"type": "number", "exclusiveMinimum": 0},
+                **({"text": {"type": "string", "minLength": 1}} if sa_asr else {}),
+            },
+            "additionalProperties": False,
+        }
+        return {
+            "input_type": "audio_path",
+            "output_type": "structured_segments",
+            "input": {"audio_path": "string"},
+            "output": {
+                "segments": (
+                    "array<{speaker:string,start:number,end:number,text:string}>"
+                    if sa_asr
+                    else "array<{speaker:string,start:number,end:number}>"
+                ),
+                "num_speakers": "optional integer",
+            },
+            "primary_field": "segments",
+            "required_fields": ["segments"],
+            "nonempty_fields": ["segments"] if sa_asr else [],
+            "allow_empty_primary": not sa_asr,
+            "json_serializable": True,
+            "allow_empty_segments": False if sa_asr else "silence_only",
+            "approved_output_fields": ["num_speakers", "segments"],
+            "segment_schema": segment_schema,
+        }
     if normalized in {"tts", "vc", "se"}:
         return {
             "input_type": (
@@ -231,8 +281,6 @@ def io_contract_for_task(task: str) -> dict[str, Any]:
         primary = "label"
     elif normalized == "slu":
         primary = "answer"
-    elif normalized in {"sd", "sa_asr"}:
-        primary = "segments"
     else:
         primary = "text"
     return {

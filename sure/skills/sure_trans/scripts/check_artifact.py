@@ -11,6 +11,14 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
+from mcp_smoke import validate_speaker_output
+from prepare_fixture import (
+    SPEAKER_TASKS,
+    looks_like_absolute_path_or_uri,
+    pcm_wav_info,
+    validate_speaker_segments,
+)
+from scaffold_adapter import io_contract_for
 from vc_exec import default_partition
 
 
@@ -325,6 +333,139 @@ def validate_se_fixture_manifest(
     )
 
 
+def validate_speaker_fixture_manifest(
+    value: dict,
+    *,
+    model_dir: Path,
+    staged_dir: Path,
+    gt_jsonl: Path,
+    task: str,
+) -> None:
+    require(task in SPEAKER_TASKS, f"unsupported speaker fixture task: {task}")
+    label = task.upper().replace("_", "-")
+    require(
+        staged_dir.is_relative_to(model_dir / "fixture"),
+        "fixture staged_dir must stay under model_dir/fixture",
+    )
+    require(
+        Path(str(value.get("staged_path") or "")).resolve() == staged_dir,
+        f"{label} staged_path must equal staged_dir",
+    )
+    require(
+        gt_jsonl.is_file() and gt_jsonl.parent == staged_dir,
+        f"{label} gt_jsonl must exist directly inside staged_dir",
+    )
+    require(value.get("gt_sha256") == sha256_file(gt_jsonl), f"{label} ground-truth checksum changed")
+    require(value.get("expected_sha256") == sha256_file(gt_jsonl), f"{label} reference checksum changed")
+
+    rows: list[dict] = []
+    for line_number, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{label} fixture gt_jsonl line {line_number} is invalid JSON: {error}") from error
+        require(isinstance(row, dict), f"{label} fixture gt_jsonl line {line_number} must be an object")
+        try:
+            json.dumps(row, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{label} fixture gt_jsonl line {line_number} must contain strict JSON: {error}"
+            ) from error
+        rows.append(row)
+    require(1 <= len(rows) <= 5, f"{label} smoke fixture must contain 1 to 5 samples")
+    samples = value.get("samples")
+    require(
+        isinstance(samples, list) and len(samples) == len(rows),
+        f"{label} samples must mirror gt_jsonl rows",
+    )
+    require(value.get("sample_count") == len(rows), f"{label} sample_count must match gt_jsonl")
+
+    seen_keys: set[str] = set()
+    relative_files = {Path("gt.jsonl")}
+    for index, (row, sample) in enumerate(zip(rows, samples)):
+        require(isinstance(sample, dict), f"{label} fixture sample {index} must be an object")
+        key = row.get("key")
+        require(
+            isinstance(key, str) and bool(key.strip()),
+            f"{label} fixture row {index} requires a non-empty key",
+        )
+        require(not looks_like_absolute_path_or_uri(key), f"{label} fixture key must be a safe token")
+        require(key not in seen_keys, f"{label} fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        require(row.get("task_type") == task, f"{label} fixture row {key} must use canonical task_type={task}")
+        require(sample.get("key") == key, f"{label} fixture sample {key} does not mirror gt_jsonl key")
+        require("segments" not in sample, f"{label} manifest samples must not duplicate reference segments")
+        audio = row.get("audio")
+        require(isinstance(audio, str) and bool(audio.strip()), f"{label} fixture {key} requires audio")
+        relative_audio = Path(audio)
+        require(
+            not relative_audio.is_absolute()
+            and ".." not in relative_audio.parts
+            and "\\" not in audio,
+            f"{label} fixture {key} audio path must be relative and contained",
+        )
+        audio_path = staged_dir / relative_audio
+        require(
+            audio_path.is_file()
+            and not audio_path.is_symlink()
+            and audio_path.stat().st_size > 0
+            and audio_path.resolve().is_relative_to(staged_dir),
+            f"{label} fixture {key} audio is missing or unsafe",
+        )
+        relative_files.add(relative_audio)
+        require(sample.get("audio") == relative_audio.as_posix(), f"{label} sample {key} audio path changed")
+        require(
+            Path(str(sample.get("audio_path") or "")).resolve() == audio_path.resolve(),
+            f"{label} sample {key} audio_path changed",
+        )
+        require(sample.get("sha256") == sha256_file(audio_path), f"{label} sample {key} checksum changed")
+        require(sample.get("size_bytes") == audio_path.stat().st_size, f"{label} sample {key} size changed")
+        wav_info = pcm_wav_info(audio_path)
+        for field in ("duration_sec", "sample_rate", "audio_is_silence"):
+            require(sample.get(field) == wav_info[field], f"{label} sample {key} {field} changed")
+        segments = validate_speaker_segments(
+            row.get("segments"),
+            task=task,
+            label=f"{label} fixture {key}",
+            empty_sd_allowed=task == "sd" and bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        require(sample.get("segment_count") == len(segments), f"{label} sample {key} segment_count changed")
+        require(sample.get("annotation_fields") == ["segments"], f"{label} sample {key} annotation_fields changed")
+
+    actual_files: set[Path] = set()
+    for path in staged_dir.rglob("*"):
+        require(not path.is_symlink(), f"{label} fixture tree must not contain symlinks: {path}")
+        if path.is_file():
+            actual_files.add(path.relative_to(staged_dir))
+    require(
+        actual_files == relative_files,
+        f"{label} fixture tree must contain only gt.jsonl and referenced audio",
+    )
+    require(
+        value.get("sha256") == fixture_tree_identity(staged_dir, relative_files),
+        f"{label} fixture tree checksum changed",
+    )
+    require(
+        value.get("size_bytes")
+        == sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        f"{label} fixture tree size changed",
+    )
+    annotation_source = value.get("annotation_source")
+    require(isinstance(annotation_source, dict), f"{label} annotation_source must be an object")
+    require(
+        annotation_source.get("type") == "fixture_gt_jsonl"
+        and annotation_source.get("fallback") is False,
+        f"{label} ground truth must come from fixture gt.jsonl",
+    )
+    require(
+        Path(str(annotation_source.get("staged_path") or "")).resolve() == gt_jsonl,
+        f"{label} annotation_source staged_path must match gt_jsonl",
+    )
+
+
 def validate_fixture_manifest(value: dict) -> None:
     require(value.get("status") == "ready", "fixture manifest is not ready")
     for key in ("model_dir", "staged_dir", "gt_jsonl", "samples", "annotation_source"):
@@ -350,6 +491,15 @@ def validate_fixture_manifest(value: dict) -> None:
             model_dir=model_dir,
             staged_dir=staged_dir,
             gt_jsonl=gt_jsonl,
+        )
+        return
+    if task in SPEAKER_TASKS:
+        validate_speaker_fixture_manifest(
+            value,
+            model_dir=model_dir,
+            staged_dir=staged_dir,
+            gt_jsonl=gt_jsonl,
+            task=task,
         )
         return
     require(staged_dir.is_relative_to(model_dir / "fixture"), "fixture staged_dir must stay under model_dir/fixture")
@@ -610,6 +760,44 @@ def main() -> int:
                     polarities == {False, True},
                     "post-pull KWS MCP smoke must prove positive and negative behavior",
                 )
+            if protocol.get("tool") in {"diarize", "transcribe_with_speakers"}:
+                tool = str(protocol["tool"])
+                task = "sd" if tool == "diarize" else "sa_asr"
+                call = protocol.get("tools_call") if isinstance(protocol.get("tools_call"), dict) else {}
+                samples = call.get("samples")
+                require(
+                    isinstance(samples, list) and 1 <= len(samples) <= 5,
+                    f"post-pull {task.upper()} MCP smoke must cover 1 to 5 samples",
+                )
+                require(
+                    call.get("expected_samples") == len(samples)
+                    and call.get("num_samples") == len(samples),
+                    f"post-pull {task.upper()} MCP smoke sample counts must match",
+                )
+                keys: set[str] = set()
+                for sample in samples:
+                    require(
+                        isinstance(sample, dict) and sample.get("ok") is True,
+                        f"every post-pull {task.upper()} MCP smoke sample must pass",
+                    )
+                    key = str(sample.get("key") or "")
+                    require(
+                        bool(key) and key not in keys,
+                        f"post-pull {task.upper()} MCP smoke samples require unique keys",
+                    )
+                    keys.add(key)
+                    violations = validate_speaker_output(
+                        sample.get("result"),
+                        tool=tool,
+                        empty_sd_allowed=(
+                            task == "sd" and sample.get("audio_is_silence") is True
+                        ),
+                    )
+                    require(
+                        not violations,
+                        f"post-pull {task.upper()} MCP smoke sample {key} is malformed: "
+                        + "; ".join(violations),
+                    )
     elif kind == "model_payload":
         require(value.get("status") == "ready", "model payload was not staged")
         require(Path(str(value.get("destination", ""))).is_dir(), "staged model directory is missing")
@@ -728,7 +916,8 @@ def main() -> int:
         )
         resolved_input_path = run_dir / "artifacts" / "trans_input_resolved.json"
         resolved_input = read_object(resolved_input_path) if resolved_input_path.is_file() else {}
-        if str(resolved_input.get("task_type") or "").lower() == "kws":
+        resolved_task = str(resolved_input.get("task_type") or "").lower().replace("-", "_")
+        if resolved_task == "kws":
             contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
             require(
                 contract.get("output_type") == "keyword_detection"
@@ -742,7 +931,7 @@ def main() -> int:
                 any(isinstance(tool, dict) and tool.get("name") == "kws_predict" for tool in tools),
                 "KWS adapter config must expose kws_predict",
             )
-        if str(resolved_input.get("task_type") or "").lower() == "se":
+        if resolved_task == "se":
             contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
             require(
                 contract.get("input_type") == "audio_path"
@@ -756,6 +945,36 @@ def main() -> int:
             require(
                 any(isinstance(tool, dict) and tool.get("name") == "enhance_speech" for tool in tools),
                 "SE adapter config must expose enhance_speech",
+            )
+        if resolved_task in SPEAKER_TASKS:
+            contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
+            require(
+                contract == io_contract_for(resolved_task),
+                f"{resolved_task.upper()} adapter io_contract must equal the canonical contract",
+            )
+            expected_nonempty = [] if resolved_task == "sd" else ["segments"]
+            require(
+                contract.get("input_type") == "audio_path"
+                and contract.get("output_type") == "structured_segments"
+                and contract.get("primary_field") == "segments"
+                and contract.get("required_fields") == ["segments"]
+                and contract.get("nonempty_fields") == expected_nonempty
+                and contract.get("allow_empty_primary") is (resolved_task == "sd")
+                and contract.get("allow_empty_segments")
+                == ("silence_only" if resolved_task == "sd" else False),
+                f"{resolved_task.upper()} adapter io_contract must require structured speaker segments",
+            )
+            require(
+                contract.get("approved_output_fields") == ["num_speakers", "segments"]
+                and isinstance(contract.get("segment_schema"), dict)
+                and contract["segment_schema"].get("additionalProperties") is False,
+                f"{resolved_task.upper()} adapter io_contract must close structured output fields",
+            )
+            expected_tool = "diarize" if resolved_task == "sd" else "transcribe_with_speakers"
+            tools = config.get("tools") if isinstance(config.get("tools"), list) else []
+            require(
+                any(isinstance(tool, dict) and tool.get("name") == expected_tool for tool in tools),
+                f"{resolved_task.upper()} adapter config must expose {expected_tool}",
             )
         require(
             "COPY --from=sure_harness_runtime" in dockerfile_text,

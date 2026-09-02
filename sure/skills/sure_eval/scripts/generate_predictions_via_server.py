@@ -209,7 +209,8 @@ def _normalize_tts_language(language: str | None) -> str:
 
 
 def _normalize_task(value: Any) -> str:
-    return str(value or "").strip().upper().replace("-", "_")
+    normalized = str(value or "").strip().upper().replace("-", "_")
+    return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
 def _split_metrics(value: str | None) -> list[str]:
@@ -334,6 +335,79 @@ def _validate_kws_threshold(value: Any, *, source: str) -> float:
     return threshold
 
 
+def _validate_annotation_prediction_segments(value: Any, *, task: str) -> list[dict[str, Any]]:
+    canonical_task = _normalize_task(task)
+    if not isinstance(value, list) or (canonical_task == "SA-ASR" and not value):
+        raise ValueError(f"{canonical_task} prediction segments must be a list")
+    seen: set[tuple[Any, ...]] = set()
+    for index, segment in enumerate(value):
+        if not isinstance(segment, dict):
+            raise ValueError(f"{canonical_task} prediction segment {index} must be an object")
+        allowed_fields = {"speaker", "start", "end", "duration"}
+        if canonical_task == "SA-ASR":
+            allowed_fields.add("text")
+        unknown_fields = sorted(str(field) for field in segment if field not in allowed_fields)
+        if unknown_fields:
+            raise ValueError(
+                f"{canonical_task} prediction segment {index} contains unapproved field(s): "
+                + ", ".join(unknown_fields)
+            )
+        speaker = segment.get("speaker")
+        start = segment.get("start")
+        end = segment.get("end")
+        if (
+            not isinstance(speaker, str)
+            or not speaker.strip()
+            or speaker != speaker.strip()
+            or speaker.startswith(";")
+            or speaker == "<NA>"
+            or any(ch.isspace() or ord(ch) < 32 for ch in speaker)
+        ):
+            raise ValueError(f"{canonical_task} prediction segment {index} has invalid speaker")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(start))
+            or not math.isfinite(float(end))
+            or float(start) < 0
+            or float(end) <= float(start)
+        ):
+            raise ValueError(f"{canonical_task} prediction segment {index} requires 0 <= start < end")
+        text = segment.get("text")
+        if canonical_task == "SA-ASR" and (
+            not isinstance(text, str)
+            or not text.strip()
+            or "\n" in text
+            or "\r" in text
+        ):
+            raise ValueError(f"SA-ASR prediction segment {index} requires non-empty text")
+        duration = segment.get("duration")
+        if duration is not None and (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or float(duration) <= 0
+            or not math.isclose(
+                float(duration), float(end) - float(start), rel_tol=0, abs_tol=1e-3
+            )
+        ):
+            raise ValueError(
+                f"{canonical_task} prediction segment {index} duration must equal end - start"
+            )
+        identity = (
+            speaker.strip(),
+            float(start),
+            float(end),
+            str(text or "").strip(),
+        )
+        if identity in seen:
+            raise ValueError(f"{canonical_task} prediction contains a duplicate segment")
+        seen.add(identity)
+    return value
+
+
 def _build_tool_arguments(
     *,
     repo_root: Path,
@@ -345,7 +419,7 @@ def _build_tool_arguments(
     output_audio_dir: Path,
     tool_args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    task_name = task.upper()
+    task_name = _normalize_task(task)
     if task_name == "SE":
         key = str(sample.get("key", "sample"))
         output_audio_path = str(_se_run_output_path(output_audio_dir, key))
@@ -768,7 +842,7 @@ def _normalize_prediction_payload(
     kws_require_score: bool = False,
     expected_audio_output: str | Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    task_name = task.upper()
+    task_name = _normalize_task(task)
     if isinstance(payload, dict):
         prediction = dict(payload.get("prediction") or {})
         if not prediction:
@@ -841,10 +915,43 @@ def _normalize_prediction_payload(
                 normalized["label"] = prediction["label"]
             return str(value), normalized
         if task_name in {"SD", "SA-ASR"}:
-            if prediction.get("segments") is not None:
-                return json.dumps(prediction["segments"], ensure_ascii=False), {"segments": prediction["segments"]}
-            value = prediction.get("annotation_path") or prediction.get("annotation") or payload.get("text") or ""
-            return str(value), {"annotation": value}
+            if isinstance(payload.get("prediction"), dict):
+                envelope_fields = sorted(str(field) for field in payload if field != "prediction")
+                if envelope_fields:
+                    raise ValueError(
+                        f"{task_name} prediction envelope contains unapproved field(s): "
+                        + ", ".join(envelope_fields)
+                    )
+            unknown_fields = sorted(
+                str(field) for field in prediction if field not in {"segments", "num_speakers"}
+            )
+            if unknown_fields:
+                raise ValueError(
+                    f"{task_name} prediction contains unapproved field(s): "
+                    + ", ".join(unknown_fields)
+                )
+            segments = _validate_annotation_prediction_segments(
+                prediction.get("segments"), task=task_name
+            )
+            num_speakers = prediction.get("num_speakers")
+            if num_speakers is not None:
+                speakers = {str(segment["speaker"]).strip() for segment in segments}
+                if (
+                    isinstance(num_speakers, bool)
+                    or not isinstance(num_speakers, int)
+                    or num_speakers < 0
+                    or num_speakers != len(speakers)
+                ):
+                    raise ValueError(
+                        f"{task_name} num_speakers must equal distinct segment speakers"
+                    )
+            normalized = {"segments": segments}
+            if num_speakers is not None:
+                normalized["num_speakers"] = num_speakers
+            return (
+                json.dumps(segments, ensure_ascii=False, allow_nan=False),
+                normalized,
+            )
         if task_name == "KWS":
             required_fields = ("detected", "keyword", "score")
             missing_fields = [field for field in required_fields if field not in prediction]
@@ -909,7 +1016,7 @@ def _normalize_prediction_payload(
     if task_name in {"SER", "GR"}:
         return value, {"label": value}
     if task_name in {"SD", "SA-ASR"}:
-        return value, {"annotation": value}
+        raise ValueError(f"{task_name} prediction payload must be a JSON object with segments")
     if task_name == "SE":
         raise ValueError("SE prediction payload must be a JSON object with an audio path")
     if task_name == "KWS":
@@ -1008,7 +1115,7 @@ def _write_prediction_snapshots(
                     "raw_response": None,
                 },
             )
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
     structured_tmp.replace(structured_prediction_path)
 
 
@@ -1485,6 +1592,11 @@ def main() -> int:
                         expected_audio_output=arguments.get("output_path") if sample_task == "SE" else None,
                     )
                     prediction_map[key] = prediction
+                    raw_response_evidence = (
+                        normalized_prediction
+                        if sample_task in {"SD", "SA-ASR"}
+                        else raw_payload
+                    )
                     structured_map[key] = {
                         "key": key,
                         "dataset": canonical_dataset,
@@ -1492,7 +1604,7 @@ def main() -> int:
                         "language": str(sample.get("language") or sample_language),
                         "prediction": normalized_prediction,
                         "normalized_prediction": prediction,
-                        "raw_response": raw_payload,
+                        "raw_response": raw_response_evidence,
                     }
                     result_log_handle.write(f"{key}\t{prediction}\n")
                     result_log_handle.flush()

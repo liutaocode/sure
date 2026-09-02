@@ -26,6 +26,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from check_artifact import validate_fixture_manifest
+from prepare_fixture import (
+    SPEAKER_OUTPUT_FIELDS,
+    SPEAKER_TASKS,
+    looks_like_absolute_path_or_uri,
+    pcm_wav_info,
+    validate_speaker_segments,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -66,7 +73,23 @@ TERMINAL_FILES = (
     "deployment_ready.json",
 )
 HOST_SHARED_PATH = re.compile(r"/(?:mnt/cloudstorfs|hpc_stor\d+|hpc_\d+|shared-storage)/")
+PORTABLE_CONTAINER_ROOTS = ("/fixture/", "/models/", "/opt/", "/validation/", "/workspace/")
+SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?:token|secret|password|passwd|credential|api[_-]?key|access[_-]?key)\s*[=:]\s*\S+",
+    re.IGNORECASE,
+)
 KWS_OPERATING_THRESHOLD = 0.5
+REFERENCE_OUTPUT_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "reference",
+    "reference_segments",
+    "reference_text",
+    "target",
+    "target_segments",
+    "target_text",
+}
 
 
 def now_iso() -> str:
@@ -407,14 +430,146 @@ def stage_se_fixture(
     validate_fixture_manifest(finalized_manifest)
 
 
+def stage_speaker_fixture(
+    run_dir: Path,
+    model_dir: Path,
+    resolved: dict,
+    fixture_manifest: dict,
+    *,
+    task: str,
+) -> None:
+    if task not in SPEAKER_TASKS:
+        raise ValueError(f"unsupported speaker fixture task: {task}")
+    label = task.upper().replace("_", "-")
+    samples = fixture_manifest.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError(f"{label} fixture manifest must declare samples")
+    validate_fixture_manifest(fixture_manifest)
+    declared_staged_dir = Path(str(fixture_manifest["staged_dir"])).resolve()
+    source_candidates = (declared_staged_dir, run_dir / "fixture" / task)
+    staged_dir = next(
+        (candidate.resolve() for candidate in source_candidates if (candidate / "gt.jsonl").is_file()),
+        None,
+    )
+    if staged_dir is None:
+        raise ValueError(f"prepared {label} fixture source is missing")
+    source_samples: list[dict] = []
+    relative_files = {Path("gt.jsonl")}
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError(f"{label} fixture samples must be objects")
+        relative_audio = Path(str(sample.get("audio") or ""))
+        if (
+            not str(relative_audio)
+            or relative_audio.is_absolute()
+            or ".." in relative_audio.parts
+            or "\\" in str(sample.get("audio") or "")
+        ):
+            raise ValueError(f"{label} fixture audio path must be portable: {relative_audio}")
+        audio_path = staged_dir / relative_audio
+        source_samples.append(
+            {
+                **sample,
+                "audio": relative_audio.as_posix(),
+                "audio_path": str(audio_path),
+                "sha256": sha256(audio_path),
+                "size_bytes": audio_path.stat().st_size,
+            }
+        )
+        relative_files.add(relative_audio)
+    annotation_source = fixture_manifest.get("annotation_source")
+    if not isinstance(annotation_source, dict):
+        raise ValueError(f"{label} fixture manifest is missing annotation_source")
+    source_manifest = {
+        **fixture_manifest,
+        "model_dir": str(run_dir if staged_dir.is_relative_to(run_dir) else model_dir),
+        "staged_dir": str(staged_dir),
+        "staged_path": str(staged_dir),
+        "gt_jsonl": str(staged_dir / "gt.jsonl"),
+        "samples": source_samples,
+        "sha256": fixture_tree_identity(staged_dir, relative_files),
+        "gt_sha256": sha256(staged_dir / "gt.jsonl"),
+        "expected_sha256": sha256(staged_dir / "gt.jsonl"),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(source_samples),
+        "annotation_source": {
+            **annotation_source,
+            "staged_path": str(staged_dir / "gt.jsonl"),
+        },
+    }
+    validate_fixture_manifest(source_manifest)
+
+    fixture_dir = model_dir / "fixture" / task
+    clear_directory(fixture_dir, model_dir / "fixture")
+    for source in sorted(staged_dir.rglob("*")):
+        if source.is_symlink():
+            raise ValueError(f"{label} fixture tree must not contain symlinks: {source}")
+        relative = source.relative_to(staged_dir)
+        destination = fixture_dir / relative
+        if source.is_dir():
+            ensure_safe_bundle_parent(model_dir, destination / ".fixture-placeholder")
+            continue
+        if not source.is_file():
+            raise ValueError(f"{label} fixture tree contains an unsupported entry: {source}")
+        ensure_safe_bundle_parent(model_dir, destination)
+        shutil.copy2(source, destination)
+
+    finalized_samples: list[dict] = []
+    for sample in source_samples:
+        audio_path = fixture_dir / str(sample["audio"])
+        finalized_samples.append(
+            {
+                **sample,
+                "audio_path": str(audio_path),
+                "sha256": sha256(audio_path),
+                "size_bytes": audio_path.stat().st_size,
+            }
+        )
+    finalized_manifest = {
+        **fixture_manifest,
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(model_dir),
+        "task_type": task,
+        "staged_dir": str(fixture_dir),
+        "staged_path": str(fixture_dir),
+        "gt_jsonl": str(fixture_dir / "gt.jsonl"),
+        "samples": finalized_samples,
+        "sha256": fixture_tree_identity(fixture_dir, relative_files),
+        "gt_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "expected_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "size_bytes": sum((fixture_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(finalized_samples),
+        "annotation_source": {
+            **annotation_source,
+            "staged_path": str(fixture_dir / "gt.jsonl"),
+            "bundled_path": str(fixture_dir / "gt.jsonl"),
+        },
+    }
+    write_identical(
+        run_dir / "artifacts" / "fixture_manifest.json",
+        json_bytes(finalized_manifest),
+    )
+    validate_fixture_manifest(finalized_manifest)
+
+
 def stage_fixture(run_dir: Path, model_dir: Path, resolved: dict) -> None:
     fixture_manifest = read_object(run_dir / "artifacts" / "fixture_manifest.json")
-    task = str(resolved.get("task_type") or "asr").lower()
+    task = str(resolved.get("task_type") or "asr").lower().replace("-", "_")
     if task == "kws":
         stage_kws_fixture(run_dir, model_dir, resolved, fixture_manifest)
         return
     if task == "se":
         stage_se_fixture(run_dir, model_dir, resolved, fixture_manifest)
+        return
+    if task in SPEAKER_TASKS:
+        stage_speaker_fixture(
+            run_dir,
+            model_dir,
+            resolved,
+            fixture_manifest,
+            task=task,
+        )
         return
     annotation_source_value = fixture_manifest.get("annotation_source")
     if not isinstance(annotation_source_value, dict):
@@ -646,6 +801,126 @@ def validate_se_sample_output(sample: dict, contract: dict, fixture_manifest: di
         raise ValueError(f"SE sample_output key mismatch: missing={missing}, extra={extra}")
 
 
+def validate_speaker_sample_output(
+    sample: dict,
+    contract: dict,
+    fixture_manifest: dict,
+    *,
+    task: str,
+) -> None:
+    if task not in SPEAKER_TASKS:
+        raise ValueError(f"unsupported speaker output task: {task}")
+    label = task.upper().replace("_", "-")
+    rows = sample.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError(f"{label} sample_output.json must be an object with a rows array")
+    fixture_samples = fixture_manifest.get("samples")
+    if not isinstance(fixture_samples, list):
+        raise ValueError(f"{label} fixture manifest has no samples")
+    references = {
+        str(item.get("key") or ""): item
+        for item in fixture_samples
+        if isinstance(item, dict) and item.get("key")
+    }
+    if len(references) != len(fixture_samples):
+        raise ValueError(f"{label} fixture manifest keys must be non-empty and unique")
+    required = contract.get("required_fields") if isinstance(contract.get("required_fields"), list) else []
+    nonempty = contract.get("nonempty_fields") if isinstance(contract.get("nonempty_fields"), list) else []
+    outputs: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{label} sample_output rows[{index}] must be an object")
+        key = str(row.get("key") or "")
+        if not key or key in outputs:
+            raise ValueError(f"{label} sample_output key is missing or duplicated: {key!r}")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"{label} sample_output key must be a safe token: {key!r}")
+        outputs.add(key)
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"{label} sample_output result for {key} must be an object")
+        forbidden = forbidden_speaker_output_fields(result)
+        if forbidden:
+            raise ValueError(
+                f"{label} sample_output result for {key} exposes reference or path fields: "
+                + ", ".join(forbidden)
+            )
+        unknown_fields = sorted(str(field) for field in result if field not in SPEAKER_OUTPUT_FIELDS)
+        if unknown_fields:
+            raise ValueError(
+                f"{label} sample_output result for {key} contains unapproved field(s): "
+                + ", ".join(unknown_fields)
+            )
+        for field in required:
+            if isinstance(field, str) and field not in result:
+                raise ValueError(f"{label} sample_output result for {key} is missing {field}")
+        for field in nonempty:
+            if isinstance(field, str) and not sample_value_is_nonempty(result.get(field)):
+                raise ValueError(f"{label} sample_output result for {key} has empty {field}")
+        reference = references.get(key)
+        if not isinstance(reference, dict):
+            raise ValueError(f"{label} fixture manifest has no sample for {key}")
+        audio_path = Path(str(reference.get("audio_path") or ""))
+        wav_info = pcm_wav_info(audio_path)
+        validate_speaker_segments(
+            result.get("segments"),
+            task=task,
+            label=f"{label} sample_output result for {key}",
+            empty_sd_allowed=(
+                task == "sd" and bool(wav_info["audio_is_silence"])
+            ),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        num_speakers = result.get("num_speakers")
+        if num_speakers is not None:
+            observed = {
+                segment["speaker"].strip()
+                for segment in result["segments"]
+                if isinstance(segment, dict)
+                and isinstance(segment.get("speaker"), str)
+                and segment["speaker"].strip()
+            }
+            if (
+                isinstance(num_speakers, bool)
+                or not isinstance(num_speakers, int)
+                or num_speakers < 0
+                or num_speakers != len(observed)
+            ):
+                raise ValueError(
+                    f"{label} sample_output num_speakers for {key} must match distinct speakers"
+                )
+        try:
+            json.dumps(result, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} sample_output result for {key} is not strict JSON: {error}") from error
+    missing = sorted(set(references) - outputs)
+    extra = sorted(outputs - set(references))
+    if missing or extra:
+        raise ValueError(f"{label} sample_output key mismatch: missing={missing}, extra={extra}")
+
+
+def forbidden_speaker_output_fields(value: object, path: str = "result") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            child = f"{path}.{key}"
+            if (
+                normalized in REFERENCE_OUTPUT_FIELDS
+                or normalized.startswith("reference_")
+                or normalized == "path"
+                or normalized.endswith("_path")
+            ):
+                found.append(child)
+            if normalized != "text" and isinstance(item, str) and looks_like_absolute_path_or_uri(item):
+                found.append(child)
+            found.extend(forbidden_speaker_output_fields(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(forbidden_speaker_output_fields(item, f"{path}[{index}]"))
+    return found
+
+
 def se_fixture_input_paths(fixture_manifest: dict) -> tuple[Path, ...]:
     samples = fixture_manifest.get("samples")
     if not isinstance(samples, list):
@@ -776,6 +1051,16 @@ def promote_sample_output(run_dir: Path) -> None:
             )
         write_identical(artifacts / "sample_output.json", json_bytes(sample))
         return
+    task = str(fixture_manifest.get("task_type") or "").lower().replace("-", "_")
+    if task in SPEAKER_TASKS:
+        validate_speaker_sample_output(
+            sample,
+            contract,
+            fixture_manifest,
+            task=task,
+        )
+        write_identical(artifacts / "sample_output.json", json_bytes(sample))
+        return
     required = contract.get("required_fields") if isinstance(contract.get("required_fields"), list) else []
     nonempty = contract.get("nonempty_fields") if isinstance(contract.get("nonempty_fields"), list) else []
     primary = contract.get("primary_field")
@@ -807,6 +1092,30 @@ def portableize_value(value: object, replacements: list[tuple[str, str]]) -> obj
     return portable
 
 
+def mcp_payload_violations(value: object, path: str = "mcp") -> list[str]:
+    violations: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}"
+            normalized = str(key).lower().replace("-", "_")
+            if any(part in normalized for part in ("token", "secret", "password", "credential", "api_key", "access_key")):
+                violations.append(f"sensitive key at {child}")
+            violations.extend(mcp_payload_violations(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            violations.extend(mcp_payload_violations(item, f"{path}[{index}]"))
+    elif isinstance(value, str) and not path.endswith(".text"):
+        if SENSITIVE_ASSIGNMENT.search(value):
+            violations.append(f"sensitive assignment at {path}")
+        portable_container_path = any(
+            value == root.rstrip("/") or value.startswith(root)
+            for root in PORTABLE_CONTAINER_ROOTS
+        )
+        if looks_like_absolute_path_or_uri(value) and not portable_container_path:
+            violations.append(f"host absolute path at {path}")
+    return violations
+
+
 def project_mcp_result(
     source: Path,
     destination: Path,
@@ -816,6 +1125,8 @@ def project_mcp_result(
     resolved: dict,
 ) -> None:
     payload = read_object(source)
+    payload.pop("server_stderr_tail", None)
+    payload.pop("stdout_junk_tail", None)
     roots: list[tuple[str, str]] = [
         (str(run_dir.resolve()), "<run_dir>"),
         (str(model_dir.resolve()), "<model_dir>"),
@@ -839,6 +1150,9 @@ def project_mcp_result(
         "portable_projection": True,
         "host_roots_replaced": sorted(replacement for _, replacement in replacements),
     }
+    violations = mcp_payload_violations(projected)
+    if violations:
+        raise ValueError("portable MCP result contains sensitive/non-portable content: " + "; ".join(violations))
     content = json_bytes(projected)
     if HOST_SHARED_PATH.search(content.decode("utf-8")):
         raise ValueError("portable MCP result still contains a host shared-storage path")

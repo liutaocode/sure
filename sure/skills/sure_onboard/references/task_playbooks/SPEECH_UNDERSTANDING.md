@@ -134,6 +134,12 @@ fixture/sa_asr/librispeech-two-speaker/gt.jsonl
 - SD: 输出必须是 MeetEval 可读取的 diarization annotation；推荐 DER 使用 RTTM。
 - SA-ASR: 输出必须是 MeetEval 可读取的 speaker-attributed ASR annotation；常用
   STM/CTM/SegLST，不能退化成普通 ASR `key<TAB>text`。
+- SD/SA-ASR 的 Onboard wrapper 输出统一为结构化 `segments`。每段包含非空
+  `speaker`、有限的 `start >= 0`、`end > start`，并且不能超过实际 WAV 时长；
+  SA-ASR 每段还必须有非空 `text`。只有字节级纯静音 SD 样本允许空 `segments`。
+- SD/SA-ASR fixture 中的 reference segments、text、`num_speakers`、`min_speakers`
+  和 `max_speakers` 不得进入模型调用。已知说话人数等显式推理约束只能通过
+  `SURE_VALIDATE_PROTOCOL_JSON` 提供，并记录在 infer/contract evidence 中。
 - 多任务 metric 脚本索引：
   - ASR task route: `src/sure_eval/evaluation/tasks/asr/`
   - S2TT task route: `src/sure_eval/evaluation/tasks/s2tt/`
@@ -168,7 +174,13 @@ ModelWrapper.translate(audio_path, ...)       # S2TT
 ModelWrapper.recognize_emotion(audio_path)    # SER
 ModelWrapper.understand(audio_path, prompt)   # SLU
 ModelWrapper.recognize_gender(audio_path)     # GR
+ModelWrapper.diarize(audio_path, **params)    # SD
+ModelWrapper.transcribe_with_speakers(audio_path, **params)  # SA-ASR
 ```
+
+SD/SA-ASR 不允许回退到通用 `predict()`。输出顶层只允许 `segments` 和可选的
+`num_speakers`；segment 只允许契约字段。`raw`、`debug`、reference/path 字段、
+绝对路径和 URI 都不能进入 `sample_output.json` 或 `sample_outputs.jsonl`。
 
 生成参数建议：
 
@@ -509,6 +521,8 @@ key=deixis_resolution_34bad028-6bad-4086-855a-bac86cd5f253 expected=B got=C
 - [ ] `model.spec.yaml` 声明 `supported_tasks`。
 - [ ] 每个任务有独立 fixture，不用 ASR 样本替代 SER/SLU/GR。
 - [ ] SD/SA-ASR 如被支持，输出是 MeetEval-loadable annotation，不是普通 ASR 文本行。
+- [ ] SD/SA-ASR 的 1-5 条 fixture 全部通过结构、WAV 时间边界、key 唯一和防 reference 泄漏检查。
+- [ ] SD/SA-ASR fixture source 无 symlink，bundle 只包含 `gt.jsonl` 与引用音频。
 - [ ] wrapper 有 task-specific methods。
 - [ ] `validate_multitask.py` 是多任务唯一结论入口。
 - [ ] `validate.py` 如保留，明确只用于 ASR-only smoke。

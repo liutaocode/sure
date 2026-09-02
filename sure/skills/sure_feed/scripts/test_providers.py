@@ -12,13 +12,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sure_feed.providers.huggingface as hf_module  # noqa: E402
 import sure_feed.providers.base as base_module  # noqa: E402
-from sure_feed.fixture_registry import select_fixture_for_task  # noqa: E402
+import check_model_input as check_model_input_module  # noqa: E402
+from sure_feed.fixture_registry import normalize_task, select_fixture_for_task  # noqa: E402
 from sure_feed.providers.base import (  # noqa: E402
     ProviderNetworkError,
     ProviderRequest,
     canonical_task,
     infer_task,
     synthesize_model_input,
+    task_defaults,
     to_yaml,
 )
 from sure_feed.providers.huggingface import HuggingFaceProvider  # noqa: E402
@@ -563,6 +565,10 @@ sf.write("output.wav", enhanced, 16000)
         self.assertEqual(sd_fixture["audio"], "fixtures/tasks/sd/librispeech_2spk_smoke/librispeech_2spk_001.wav")
         self.assertEqual(sd_fixture["samples"][0]["speakers"], ["spk1", "spk2"])
         self.assertEqual(sd_contract["primary_field"], "segments")
+        self.assertEqual(
+            sd_contract["segment_schema"]["required"],
+            ["speaker", "start", "end"],
+        )
 
         sa_fixture, sa_contract, sa_issues, _sa_evidence = select_fixture_for_task(
             "sa_asr",
@@ -576,6 +582,159 @@ sf.write("output.wav", enhanced, 16000)
         self.assertEqual(sa_fixture["samples"][0]["speakers"], ["spk1", "spk2"])
         self.assertIn("text", sa_fixture["samples"][0]["segments"][0])
         self.assertEqual(sa_contract["primary_field"], "segments")
+        self.assertEqual(
+            sa_contract["segment_schema"]["required"],
+            ["speaker", "start", "end", "text"],
+        )
+
+    def test_sd_and_sa_asr_aliases_are_canonical_across_provider_and_fixture_registry(self) -> None:
+        for alias in ("sd", "speaker-diarization", "speaker diarization", "diarisation"):
+            with self.subTest(alias=alias):
+                self.assertEqual(canonical_task(alias), "sd")
+                self.assertEqual(normalize_task(alias), "sd")
+        for alias in (
+            "sa-asr",
+            "sa_asr",
+            "speaker-attributed-asr",
+            "speaker attributed asr",
+            "transcribe-diarize",
+        ):
+            with self.subTest(alias=alias):
+                self.assertEqual(canonical_task(alias), "sa_asr")
+                self.assertEqual(normalize_task(alias), "sa_asr")
+
+    def test_direct_asr_pipeline_yields_to_explicit_diarization_models(self) -> None:
+        candidates = (
+            {
+                "model_id": "pyannote/speaker-diarization-community-1",
+                "pipeline_tag": "automatic-speech-recognition",
+                "tasks": ["automatic-speech-recognition"],
+                "tags": ["speaker-diarization"],
+                "model_card_text": "Community-1 performs speaker diarization.",
+            },
+            {
+                "model_id": "nvidia/diar_streaming_sortformer_4spk-v2.1",
+                "pipeline_tag": "automatic-speech-recognition",
+                "tasks": ["automatic-speech-recognition"],
+                "tags": ["sortformer", "speaker-diarization", "streaming"],
+                "model_card_text": "Streaming Sortformer identifies speaker time segments.",
+            },
+        )
+        for candidate in candidates:
+            with self.subTest(model_id=candidate["model_id"]):
+                matched, task_type, score, evidence, match_source = infer_task(
+                    {"source": "huggingface", **candidate},
+                    "auto",
+                )
+                self.assertTrue(matched)
+                self.assertEqual(task_type, "sd")
+                self.assertEqual(match_source, "research_narrowing")
+                self.assertGreaterEqual(score, 0.9)
+                self.assertIn(
+                    "task_narrowing.final_task",
+                    {item.get("field") for item in evidence},
+                )
+
+    def test_joint_asr_and_diarization_evidence_yields_sa_asr(self) -> None:
+        matched, task_type, _score, evidence, match_source = infer_task(
+            {
+                "source": "huggingface",
+                "model_id": "owner/multitask-speech",
+                "pipeline_tag": "automatic-speech-recognition",
+                "tags": ["asr", "speaker-diarization"],
+                "model_card_text": "Returns speaker-attributed transcript segments.",
+            },
+            "auto",
+        )
+        self.assertTrue(matched)
+        self.assertEqual(task_type, "sa_asr")
+        self.assertEqual(match_source, "research_narrowing")
+        self.assertIn("tags", {item.get("field") for item in evidence})
+
+    def test_plain_asr_is_not_promoted_to_diarization(self) -> None:
+        matched, task_type, _score, _evidence, match_source = infer_task(
+            {
+                "source": "huggingface",
+                "model_id": "openai/whisper-large-v3",
+                "pipeline_tag": "automatic-speech-recognition",
+                "tasks": ["automatic-speech-recognition"],
+                "tags": ["asr", "transcription", "multilingual"],
+                "model_card_text": "Transcribes ordinary single- or multi-speaker recordings to text.",
+            },
+            "auto",
+        )
+        self.assertTrue(matched)
+        self.assertEqual(task_type, "asr")
+        self.assertEqual(match_source, "pipeline_tag")
+
+    def test_segment_task_defaults_never_fall_back_to_text(self) -> None:
+        for task, method, fields in (
+            ("sd", ".diarize(", ["speaker", "start", "end"]),
+            (
+                "sa_asr",
+                ".transcribe_with_speakers(",
+                ["speaker", "start", "end", "text"],
+            ),
+        ):
+            with self.subTest(task=task):
+                defaults = task_defaults(task)
+                contract = defaults["io_contract"]
+                self.assertEqual(contract["output_type"], "structured_segments")
+                self.assertEqual(contract["primary_field"], "segments")
+                self.assertEqual(contract["required_fields"], ["segments"])
+                self.assertEqual(
+                    contract["nonempty_fields"],
+                    [] if task == "sd" else ["segments"],
+                )
+                self.assertEqual(
+                    contract["allow_empty_segments"],
+                    "silence_only" if task == "sd" else False,
+                )
+                self.assertEqual(contract["segment_schema"]["required"], fields)
+                self.assertIn(method, defaults["infer_test"])
+
+    def test_synthesized_segment_contracts_pass_the_model_input_gate_and_schema(self) -> None:
+        schema = json.loads(
+            (Path(__file__).resolve().parents[1] / "schemas" / "model_input.schema.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "segment_schema",
+            schema["properties"]["io_contract"]["properties"],
+        )
+        for task, method, fields in (
+            ("sd", "diarize", ["speaker", "start", "end"]),
+            (
+                "sa_asr",
+                "transcribe_with_speakers",
+                ["speaker", "start", "end", "text"],
+            ),
+        ):
+            with self.subTest(task=task):
+                model_id = f"owner/{task}"
+                model_input, _weak_fields, _evidence = synthesize_model_input(
+                    {
+                        "source": "manual",
+                        "model_id": model_id,
+                        "repo": f"https://example.invalid/{model_id}",
+                        "commit": None,
+                        "import_test": "from package import Model",
+                        "load_test": "model = Model.from_pretrained('checkpoint')",
+                        "infer_test": f"model.{method}('sample.wav')",
+                    },
+                    task,
+                )
+                contract = model_input["io_contract"]
+                self.assertEqual(contract["primary_field"], "segments")
+                self.assertEqual(contract["segment_schema"]["required"], fields)
+                self.assertEqual(
+                    check_model_input_module.validate_model_input(
+                        model_input,
+                        model_id,
+                        "model_inputs[0]",
+                    ),
+                    [],
+                )
 
     def test_parse_direct_urls(self) -> None:
         self.assertEqual(

@@ -24,11 +24,12 @@ import importlib
 import json
 import math
 import os
+import re
 import sys
 import time
 import wave
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
@@ -49,13 +50,62 @@ IO_CONTRACT: dict[str, Any] = (
     {} if _IO_CONTRACT_JSON.startswith("__") else json.loads(_IO_CONTRACT_JSON)
 )
 KWS_OPERATING_THRESHOLD = 0.5
+STRUCTURED_TASKS = {"sd", "sa_asr"}
+STRUCTURED_APPROVED_OUTPUT_FIELDS = {"segments", "num_speakers"}
+STRUCTURED_SD_SEGMENT_FIELDS = {"speaker", "start", "end", "duration"}
+STRUCTURED_SA_ASR_SEGMENT_FIELDS = {*STRUCTURED_SD_SEGMENT_FIELDS, "text"}
+STRUCTURED_PUBLIC_INFERENCE_PARAMETERS = {
+    "batch_size",
+    "beam_size",
+    "clustering_threshold",
+    "language",
+    "max_speakers",
+    "min_duration_off",
+    "min_duration_on",
+    "min_speakers",
+    "num_speakers",
+    "segmentation_threshold",
+    "vad_threshold",
+}
+STRUCTURED_REFERENCE_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "reference",
+    "reference_annotation",
+    "reference_segments",
+    "reference_text",
+    "rttm",
+    "stm",
+    "target",
+    "target_segments",
+    "target_text",
+    "uem",
+}
+STRUCTURED_EVIDENCE_FIELDS = {
+    "audio",
+    "audio_is_silence",
+    "dataset",
+    "duration_sec",
+    "id",
+    "key",
+    "language",
+    "output",
+    "sample_rate",
+}
+STRUCTURED_URI_SCHEMES = {"file", "ftp", "git", "gs", "hf", "http", "https", "s3", "ssh"}
+STRUCTURED_URI_PREFIX = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
-def normalized_task_type() -> str:
-    normalized = TASK_TYPE.lower().replace("-", "_")
+def normalized_task_value(value: Any) -> str:
+    normalized = str(value or "").lower().replace("-", "_")
     if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
     return normalized
+
+
+def normalized_task_type() -> str:
+    return normalized_task_value(TASK_TYPE)
 
 
 def now_iso() -> str:
@@ -149,6 +199,40 @@ def fixture_payloads() -> list[dict[str, Any]]:
         parsed = json.loads(raw_payload)
         if not isinstance(parsed, dict):
             raise ValueError("SURE_VALIDATE_INPUT_JSON must decode to an object.")
+        if task in STRUCTURED_TASKS:
+            audio_path = parsed.get("audio_path")
+            if not isinstance(audio_path, str) or not audio_path.strip():
+                raise ValueError("SD/SA-ASR SURE_VALIDATE_INPUT_JSON requires audio_path")
+            info = structured_wav_info(Path(audio_path))
+            if "segments" in parsed:
+                violations = validate_structured_segments(
+                    parsed["segments"],
+                    task=task,
+                    duration_sec=float(info["duration_sec"]),
+                    audio_is_silence=bool(info["audio_is_silence"]),
+                )
+                if violations:
+                    raise ValueError("invalid explicit reference segments: " + "; ".join(violations))
+            if "inference_params" in parsed or any(
+                field in parsed for field in STRUCTURED_PUBLIC_INFERENCE_PARAMETERS
+            ):
+                raise ValueError(
+                    "SD/SA-ASR inference parameters must be supplied through "
+                    "SURE_VALIDATE_PROTOCOL_JSON, not fixture/reference input"
+                )
+            model_input = {"audio_path": audio_path}
+            model_input.update(structured_protocol_arguments())
+            return [
+                {
+                    "input": model_input,
+                    "fixture": {
+                        "key": str(parsed.get("key") or Path(audio_path).stem),
+                        "audio": parsed.get("audio") or Path(audio_path).name,
+                        "dataset": parsed.get("dataset"),
+                        **info,
+                    },
+                }
+            ]
         keywords = parsed.get("keywords")
         if (
             task == "kws"
@@ -199,6 +283,7 @@ def fixture_payloads() -> list[dict[str, Any]]:
     fixture_root = MODEL_DIR / "fixture"
     for gt_path in sorted(fixture_root.glob("**/gt.jsonl")):
         payloads: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
         for line in gt_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -207,7 +292,39 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 continue
             payload: dict[str, Any] = {}
             audio = item.get("audio") or item.get("wav") or item.get("prompt_audio") or item.get("reference_audio")
-            if task == "se":
+            if task in STRUCTURED_TASKS:
+                if not isinstance(audio, str) or not audio:
+                    raise ValueError("SD/SA-ASR fixture requires a non-empty audio field")
+                if item.get("task") is not None and normalized_task_value(item["task"]) != task:
+                    raise ValueError(
+                        f"Structured fixture declares task {item['task']!r}, expected {task!r}"
+                    )
+                if "inference_params" in item:
+                    raise ValueError(
+                        "SD/SA-ASR fixture rows must not declare inference_params; "
+                        "use SURE_VALIDATE_PROTOCOL_JSON"
+                    )
+                audio_path = (gt_path.parent / audio).resolve()
+                if not audio_path.is_file():
+                    raise FileNotFoundError(f"Structured fixture audio does not exist: {audio_path}")
+                info = structured_wav_info(audio_path)
+                violations = validate_structured_segments(
+                    item.get("segments"),
+                    task=task,
+                    duration_sec=float(info["duration_sec"]),
+                    audio_is_silence=bool(info["audio_is_silence"]),
+                )
+                if violations:
+                    raise ValueError("invalid fixture reference segments: " + "; ".join(violations))
+                key = str(item.get("key") or item.get("id") or audio_path.stem).strip()
+                if not key:
+                    raise ValueError("SD/SA-ASR fixture requires a non-empty key")
+                if key in seen_keys:
+                    raise ValueError(f"SD/SA-ASR fixture duplicates key {key!r}")
+                seen_keys.add(key)
+                payload["audio_path"] = str(audio_path)
+                payload.update(structured_protocol_arguments())
+            elif task == "se":
                 reference_audio = item.get("reference_audio")
                 if not isinstance(audio, str) or not audio:
                     raise ValueError("SE fixture requires a non-empty noisy audio field")
@@ -226,39 +343,49 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 payload["reference_audio_path"] = payload["audio_path"]
                 payload["ref_audio"] = payload["audio_path"]
             text = item.get("target_text") or item.get("text") or item.get("prompt_text") or item.get("ground_truth")
-            if task != "se" and isinstance(text, str):
+            if task not in {"se", *STRUCTURED_TASKS} and isinstance(text, str):
                 payload["text"] = text
                 payload["prompt_text"] = item.get("prompt_text", text)
-            if task != "se" and isinstance(item.get("language"), str):
+            if task not in {"se", *STRUCTURED_TASKS} and isinstance(item.get("language"), str):
                 payload["language"] = item["language"]
-            if task != "se" and "keywords" in item:
+            if task not in {"se", *STRUCTURED_TASKS} and "keywords" in item:
                 payload["keywords"] = item["keywords"]
-            if task != "se" and "threshold" in item:
+            if task not in {"se", *STRUCTURED_TASKS} and "threshold" in item:
                 if task == "kws" and not valid_kws_threshold(
                     item["threshold"]
                 ):
                     raise ValueError(f"KWS fixture threshold must equal {KWS_OPERATING_THRESHOLD}")
                 payload["threshold"] = item["threshold"]
             if payload:
-                fixture_metadata: dict[str, Any] = {
-                    "key": item.get("key"),
-                    "audio": item.get("audio"),
-                    "reference_audio": item.get("reference_audio"),
-                    "language": item.get("language"),
-                    "dataset": item.get("dataset"),
-                    "ground_truth": item.get("ground_truth"),
-                    "text": item.get("text"),
-                    "keywords": item.get("keywords"),
-                }
+                if task in STRUCTURED_TASKS:
+                    fixture_metadata = {
+                        "key": key,
+                        "audio": audio,
+                        "language": item.get("language"),
+                        "dataset": item.get("dataset"),
+                        **info,
+                    }
+                else:
+                    fixture_metadata = {
+                        "key": item.get("key"),
+                        "audio": item.get("audio"),
+                        "reference_audio": item.get("reference_audio"),
+                        "language": item.get("language"),
+                        "dataset": item.get("dataset"),
+                        "ground_truth": item.get("ground_truth"),
+                        "text": item.get("text"),
+                        "keywords": item.get("keywords"),
+                    }
                 if task == "se":
                     fixture_metadata["reference_audio_path"] = str(clean_path)
-                fixture_metadata.update(
-                    {
-                        field: item[field]
-                        for field in ("label", "expected", "expected_detected", "expected_keyword")
-                        if field in item
-                    }
-                )
+                if task not in STRUCTURED_TASKS:
+                    fixture_metadata.update(
+                        {
+                            field: item[field]
+                            for field in ("label", "expected", "expected_detected", "expected_keyword")
+                            if field in item
+                        }
+                    )
                 payloads.append(
                     {
                         "input": payload,
@@ -320,6 +447,20 @@ def to_plain(value: Any) -> Any:
 
 
 def run_predict(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    task = normalized_task_type()
+    if task in STRUCTURED_TASKS:
+        method_name = "transcribe_with_speakers" if task == "sa_asr" else "diarize"
+        predict = getattr(wrapper, method_name, None)
+        if predict is None:
+            raise AttributeError(f"SD/SA-ASR wrapper must implement {method_name}().")
+        audio_path = payload.get("audio_path")
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            raise ValueError("SD/SA-ASR prediction requires audio_path")
+        public_args = {key: value for key, value in payload.items() if key != "audio_path"}
+        result = predict(audio_path, **public_args)
+        plain = to_plain(result)
+        return plain if isinstance(plain, dict) else {"result": plain}
+
     predict = getattr(wrapper, PREDICT_METHOD, None) or getattr(wrapper, "predict", None)
     if predict is None:
         raise AttributeError(f"Wrapper has neither {PREDICT_METHOD!r} nor 'predict'.")
@@ -370,6 +511,314 @@ def is_nonempty(value: Any) -> bool:
     if isinstance(value, (list, tuple, dict, set)):
         return len(value) > 0
     return True
+
+
+def structured_protocol_arguments() -> dict[str, Any]:
+    raw = os.environ.get("SURE_VALIDATE_PROTOCOL_JSON")
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError("SURE_VALIDATE_PROTOCOL_JSON must decode to an object")
+    unknown = sorted(str(key) for key in parsed if key not in STRUCTURED_PUBLIC_INFERENCE_PARAMETERS)
+    if unknown:
+        raise ValueError("unsupported public inference parameter(s): " + ", ".join(unknown))
+    arguments: dict[str, Any] = {}
+    for key, value in parsed.items():
+        try:
+            json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"public inference parameter {key!r} must be finite JSON data") from exc
+        if key == "language" and (
+            not isinstance(value, str)
+            or not value.strip()
+            or structured_looks_like_absolute_path_or_uri(value)
+        ):
+            raise ValueError("public inference parameter 'language' must be a non-path string")
+        if key in {"batch_size", "beam_size", "min_speakers", "max_speakers", "num_speakers"} and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise ValueError(f"public inference parameter {key!r} must be a positive integer")
+        if key in {"clustering_threshold", "segmentation_threshold", "vad_threshold"} and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or not 0 <= float(value) <= 1
+        ):
+            raise ValueError(f"public inference parameter {key!r} must be within [0, 1]")
+        if key in {"min_duration_off", "min_duration_on"} and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise ValueError(f"public inference parameter {key!r} must be non-negative")
+        arguments[str(key)] = value
+    minimum = arguments.get("min_speakers")
+    maximum = arguments.get("max_speakers")
+    exact = arguments.get("num_speakers")
+    if isinstance(minimum, int) and isinstance(maximum, int) and minimum > maximum:
+        raise ValueError("min_speakers must be <= max_speakers")
+    if isinstance(exact, int) and isinstance(minimum, int) and exact < minimum:
+        raise ValueError("num_speakers must be >= min_speakers")
+    if isinstance(exact, int) and isinstance(maximum, int) and exact > maximum:
+        raise ValueError("num_speakers must be <= max_speakers")
+    return arguments
+
+
+def structured_wav_info(path: Path) -> dict[str, Any]:
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if handle.getcomptype() != "NONE":
+                raise ValueError("audio must be uncompressed PCM WAV")
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+            sample_rate = handle.getframerate()
+            frame_count = handle.getnframes()
+            if channels < 1 or sample_width not in {1, 2, 3, 4} or sample_rate < 1 or frame_count < 1:
+                raise ValueError("audio must be a non-empty PCM WAV")
+            frames = handle.readframes(frame_count)
+    except (EOFError, OSError, wave.Error) as exc:
+        raise ValueError(f"audio must be a readable PCM WAV: {path}: {exc}") from exc
+    expected_bytes = frame_count * channels * sample_width
+    if len(frames) != expected_bytes:
+        raise ValueError(
+            f"audio PCM data is truncated: expected {expected_bytes} bytes, read {len(frames)}"
+        )
+    silence_byte = b"\x80" if sample_width == 1 else b"\x00"
+    return {
+        "duration_sec": frame_count / sample_rate,
+        "sample_rate": sample_rate,
+        "audio_is_silence": bool(frames) and frames == silence_byte * len(frames),
+    }
+
+
+def structured_finite_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def structured_looks_like_absolute_path_or_uri(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    match = STRUCTURED_URI_PREFIX.match(stripped)
+    if match and (match.group(1).lower() in STRUCTURED_URI_SCHEMES or "://" in stripped):
+        return True
+    return (
+        Path(stripped).is_absolute()
+        or PureWindowsPath(stripped).is_absolute()
+        or stripped.startswith("\\\\")
+    )
+
+
+def structured_unsafe_string_paths(value: Any, path: str = "output") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, str) and structured_looks_like_absolute_path_or_uri(value):
+        found.append(path)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            found.extend(structured_unsafe_string_paths(item, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(structured_unsafe_string_paths(item, f"{path}[{index}]"))
+    return found
+
+
+def validate_structured_segments(
+    segments: Any,
+    *,
+    task: str,
+    duration_sec: float,
+    audio_is_silence: bool,
+) -> list[str]:
+    if not isinstance(segments, list):
+        return ["segments must be an array"]
+    if not segments:
+        if task == "sd" and audio_is_silence:
+            return []
+        if task == "sd":
+            return ["empty SD segments are allowed only for pure-silence audio"]
+        return ["SA-ASR segments must be non-empty"]
+    violations: list[str] = []
+    for index, segment in enumerate(segments, 1):
+        prefix = f"segment {index}"
+        if not isinstance(segment, dict):
+            violations.append(f"{prefix} must be an object")
+            continue
+        approved_fields = (
+            STRUCTURED_SA_ASR_SEGMENT_FIELDS
+            if task == "sa_asr"
+            else STRUCTURED_SD_SEGMENT_FIELDS
+        )
+        unknown_fields = sorted(str(key) for key in segment if key not in approved_fields)
+        if unknown_fields:
+            violations.append(f"{prefix} contains unapproved field(s): " + ", ".join(unknown_fields))
+        speaker = segment.get("speaker")
+        if not isinstance(speaker, str) or not speaker.strip():
+            violations.append(f"{prefix} speaker must be a non-empty string")
+        start = segment.get("start")
+        end = segment.get("end")
+        if not structured_finite_number(start):
+            violations.append(f"{prefix} start must be a finite number")
+        elif float(start) < 0:
+            violations.append(f"{prefix} start must be >= 0")
+        if not structured_finite_number(end):
+            violations.append(f"{prefix} end must be a finite number")
+        elif structured_finite_number(start) and float(end) <= float(start):
+            violations.append(f"{prefix} end must be greater than start")
+        if structured_finite_number(end) and float(end) > duration_sec + 1e-6:
+            violations.append(
+                f"{prefix} end {float(end):.6f} exceeds WAV duration {duration_sec:.6f}"
+            )
+        declared_duration = segment.get("duration")
+        if declared_duration is not None:
+            if not structured_finite_number(declared_duration) or float(declared_duration) <= 0:
+                violations.append(f"{prefix} duration must be a finite positive number")
+            elif structured_finite_number(start) and structured_finite_number(end) and not math.isclose(
+                float(declared_duration), float(end) - float(start), rel_tol=0, abs_tol=1e-3
+            ):
+                violations.append(f"{prefix} duration must equal end - start")
+        if task == "sa_asr":
+            text = segment.get("text")
+            if not isinstance(text, str) or not text.strip():
+                violations.append(f"{prefix} text must be a non-empty string for SA-ASR")
+    return violations
+
+
+def structured_forbidden_output_paths(value: Any, path: str = "output") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            child = f"{path}.{key}"
+            if (
+                normalized in STRUCTURED_REFERENCE_FIELDS
+                or normalized.startswith("reference_")
+                or normalized == "path"
+                or normalized.endswith("_path")
+            ):
+                found.append(child)
+            found.extend(structured_forbidden_output_paths(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(structured_forbidden_output_paths(item, f"{path}[{index}]"))
+    return found
+
+
+def validate_structured_output(
+    output: Any,
+    *,
+    task: str,
+    duration_sec: float,
+    audio_is_silence: bool,
+) -> list[str]:
+    if not isinstance(output, dict):
+        return ["structured prediction must be an object"]
+    unknown_fields = sorted(
+        str(key) for key in output if key not in STRUCTURED_APPROVED_OUTPUT_FIELDS
+    )
+    violations = [
+        f"model output must not expose reference or path field {path}"
+        for path in structured_forbidden_output_paths(output)
+    ]
+    if unknown_fields:
+        violations.append("structured prediction contains unapproved field(s): " + ", ".join(unknown_fields))
+    violations.extend(
+        f"structured prediction contains absolute path or URI at {path}"
+        for path in structured_unsafe_string_paths(output)
+    )
+    violations.extend(
+        validate_structured_segments(
+            output.get("segments"),
+            task=task,
+            duration_sec=duration_sec,
+            audio_is_silence=audio_is_silence,
+        )
+    )
+    num_speakers = output.get("num_speakers")
+    if num_speakers is not None:
+        if isinstance(num_speakers, bool) or not isinstance(num_speakers, int) or num_speakers < 0:
+            violations.append("num_speakers must be a non-negative integer when provided")
+        elif isinstance(output.get("segments"), list):
+            observed = {
+                segment.get("speaker").strip()
+                for segment in output["segments"]
+                if isinstance(segment, dict)
+                and isinstance(segment.get("speaker"), str)
+                and segment.get("speaker").strip()
+            }
+            if num_speakers != len(observed):
+                violations.append("num_speakers must equal the number of distinct output speakers")
+    try:
+        json.dumps(output, allow_nan=False)
+    except (TypeError, ValueError):
+        violations.append("structured prediction must contain finite JSON data")
+    return violations
+
+
+def validate_structured_rows(rows: Any, contract: dict[str, Any]) -> list[str]:
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 5:
+        return ["structured validation requires 1-5 output rows"]
+    task = normalized_task_type()
+    violations: list[str] = []
+    seen: set[str] = set()
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            violations.append(f"structured output row {index} must be an object")
+            continue
+        unexpected = sorted(str(key) for key in row if key not in STRUCTURED_EVIDENCE_FIELDS)
+        if unexpected:
+            violations.append(
+                f"structured output row {index} exposes non-portable/reference field(s): "
+                + ", ".join(unexpected)
+            )
+        row_id = row.get("id")
+        if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id < 1:
+            violations.append(f"structured output row {index} id must be a positive integer")
+        key = row.get("key")
+        prefix = f"structured output row {index}"
+        if not isinstance(key, str) or not key.strip():
+            violations.append(f"{prefix} requires a non-empty key")
+            continue
+        if structured_looks_like_absolute_path_or_uri(key):
+            violations.append(f"{prefix} key must not contain an absolute path or URI")
+        if key in seen:
+            violations.append(f"{prefix} duplicates key {key!r}")
+            continue
+        seen.add(key)
+        audio = row.get("audio")
+        if not isinstance(audio, str) or not audio.strip():
+            violations.append(f"{prefix} {key!r} requires a relative audio evidence path")
+        else:
+            audio_path = Path(audio)
+            if structured_looks_like_absolute_path_or_uri(audio) or ".." in audio_path.parts:
+                violations.append(f"{prefix} {key!r} audio evidence path must be portable")
+        for field in ("dataset", "language"):
+            value = row.get(field)
+            if value is not None and not isinstance(value, str):
+                violations.append(f"{prefix} {key!r} {field} must be a string or null")
+            elif isinstance(value, str) and structured_looks_like_absolute_path_or_uri(value):
+                violations.append(f"{prefix} {key!r} {field} must not contain an absolute path or URI")
+        duration = row.get("duration_sec")
+        silence = row.get("audio_is_silence")
+        if not structured_finite_number(duration) or float(duration) <= 0 or not isinstance(silence, bool):
+            violations.append(f"{prefix} {key!r} lacks trusted WAV duration/silence evidence")
+            continue
+        output = row.get("output")
+        if not isinstance(output, dict):
+            violations.append(f"{prefix} {key!r} result must be an object")
+            continue
+        violations.extend(f"{prefix} {key!r}: {item}" for item in validate_contract(output, contract))
+        violations.extend(
+            f"{prefix} {key!r}: {item}"
+            for item in validate_structured_output(
+                output,
+                task=task,
+                duration_sec=float(duration),
+                audio_is_silence=silence,
+            )
+        )
+    return violations
 
 
 def valid_keywords(value: Any) -> bool:
@@ -628,7 +1077,7 @@ def validate_contract(sample: dict[str, Any], contract: dict[str, Any]) -> list[
     if isinstance(primary, str) and primary:
         if primary not in required:
             required.append(primary)
-        if primary not in nonempty:
+        if primary not in nonempty and contract.get("allow_empty_segments") != "silence_only":
             nonempty.append(primary)
     for field in required:
         if field not in sample:
@@ -694,7 +1143,16 @@ def stage_infer() -> bool:
             sample = run_predict(wrapper, payload)
             if not sample:
                 raise AssertionError(f"prediction output is empty for fixture {index}")
-            if task == "se":
+            if task in STRUCTURED_TASKS:
+                violations = validate_structured_output(
+                    sample,
+                    task=task,
+                    duration_sec=float(fixture["fixture"]["duration_sec"]),
+                    audio_is_silence=bool(fixture["fixture"]["audio_is_silence"]),
+                )
+                if violations:
+                    raise AssertionError("; ".join(violations))
+            elif task == "se":
                 forbidden_inputs = [Path(str(payload["audio_path"]))]
                 reference_path = fixture["fixture"].get("reference_audio_path")
                 if isinstance(reference_path, str) and reference_path:
@@ -709,25 +1167,38 @@ def stage_infer() -> bool:
                 assert requested_output is not None
                 sample["audio_path"] = portable_se_output_path(requested_output)
             outputs.append(sample)
-            row = {
-                "id": index,
-                "key": fixture["fixture"].get("key")
-                or (str(index) if task in {"kws", "se"} else None),
-                "audio": fixture["fixture"].get("audio"),
-                "reference_audio": fixture["fixture"].get("reference_audio"),
-                "language": fixture["fixture"].get("language") or payload.get("language"),
-                "dataset": fixture["fixture"].get("dataset"),
-                "ground_truth": fixture["fixture"].get("ground_truth"),
-                "text": fixture["fixture"].get("text"),
-                "output": sample,
-            }
-            row.update(
-                {
-                    field: fixture["fixture"][field]
-                    for field in ("label", "expected", "expected_detected", "expected_keyword")
-                    if field in fixture["fixture"]
+            if task in STRUCTURED_TASKS:
+                row = {
+                    "id": index,
+                    "key": fixture["fixture"].get("key") or str(index),
+                    "audio": fixture["fixture"].get("audio"),
+                    "language": fixture["fixture"].get("language") or payload.get("language"),
+                    "dataset": fixture["fixture"].get("dataset"),
+                    "duration_sec": fixture["fixture"]["duration_sec"],
+                    "sample_rate": fixture["fixture"]["sample_rate"],
+                    "audio_is_silence": fixture["fixture"]["audio_is_silence"],
+                    "output": sample,
                 }
-            )
+            else:
+                row = {
+                    "id": index,
+                    "key": fixture["fixture"].get("key")
+                    or (str(index) if task in {"kws", "se"} else None),
+                    "audio": fixture["fixture"].get("audio"),
+                    "reference_audio": fixture["fixture"].get("reference_audio"),
+                    "language": fixture["fixture"].get("language") or payload.get("language"),
+                    "dataset": fixture["fixture"].get("dataset"),
+                    "ground_truth": fixture["fixture"].get("ground_truth"),
+                    "text": fixture["fixture"].get("text"),
+                    "output": sample,
+                }
+                row.update(
+                    {
+                        field: fixture["fixture"][field]
+                        for field in ("label", "expected", "expected_detected", "expected_keyword")
+                        if field in fixture["fixture"]
+                    }
+                )
             rows.append(row)
         write_json(SAMPLE_OUTPUT, outputs[0])
         write_jsonl(SAMPLE_OUTPUTS, rows)
@@ -736,27 +1207,55 @@ def stage_infer() -> bool:
         write_stage_result("infer", False, started, str(exc))
         return False
     append_log("VALIDATE_INFER", "passed", f"Inference passed for {len(outputs)} fixture sample(s).")
+    inference_evidence: dict[str, Any] = {}
+    if task in STRUCTURED_TASKS:
+        inference_evidence["protocol_arguments"] = structured_protocol_arguments()
     write_stage_result(
         "infer",
         True,
         started,
         output_summary=output_summary(outputs),
         sample_outputs_path="artifacts/sample_outputs.jsonl",
+        validated_sample_count=len(outputs),
+        **inference_evidence,
     )
     return True
 
 
 def stage_contract() -> bool:
     started = time.time()
+    task = normalized_task_type()
+    protocol_arguments: dict[str, Any] = {}
     try:
+        if task in STRUCTURED_TASKS:
+            protocol_arguments = structured_protocol_arguments()
         if not SAMPLE_OUTPUT.exists():
             raise FileNotFoundError(f"Missing sample output: {SAMPLE_OUTPUT}")
         sample = json.loads(SAMPLE_OUTPUT.read_text(encoding="utf-8"))
         if not isinstance(sample, dict):
             raise ValueError("sample_output.json must be an object")
         contract = load_io_contract()
-        task = normalized_task_type()
-        if task == "kws" and SAMPLE_OUTPUTS.is_file():
+        if task in STRUCTURED_TASKS:
+            if not SAMPLE_OUTPUTS.is_file():
+                violations = ["SD/SA-ASR contract validation requires sample_outputs.jsonl"]
+            else:
+                rows = [
+                    json.loads(line)
+                    for line in SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                violations = validate_structured_rows(rows, contract)
+                expected_keys = [
+                    str(fixture["fixture"].get("key") or index)
+                    for index, fixture in enumerate(fixture_payloads(), 1)
+                ]
+                observed_keys = [str(row.get("key") or "") for row in rows if isinstance(row, dict)]
+                if observed_keys != expected_keys:
+                    violations.append(
+                        "structured output rows must preserve every fixture key in order: "
+                        f"expected={expected_keys}, observed={observed_keys}"
+                    )
+        elif task == "kws" and SAMPLE_OUTPUTS.is_file():
             rows = [
                 json.loads(line)
                 for line in SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
@@ -788,6 +1287,8 @@ def stage_contract() -> bool:
             io_contract_satisfied=False,
             violations=[str(exc)],
             io_contract=IO_CONTRACT,
+            sample_outputs_path="artifacts/sample_outputs.jsonl",
+            **({"protocol_arguments": protocol_arguments} if task in STRUCTURED_TASKS else {}),
         )
         return False
     append_log("VALIDATE_CONTRACT", "passed", "Sample output satisfies io_contract.")
@@ -798,6 +1299,13 @@ def stage_contract() -> bool:
         io_contract_satisfied=True,
         violations=[],
         io_contract=contract,
+        sample_outputs_path="artifacts/sample_outputs.jsonl",
+        validated_sample_count=(
+            len(rows)
+            if task in {"kws", "se", *STRUCTURED_TASKS} and SAMPLE_OUTPUTS.is_file()
+            else 1
+        ),
+        **({"protocol_arguments": protocol_arguments} if task in STRUCTURED_TASKS else {}),
     )
     return True
 

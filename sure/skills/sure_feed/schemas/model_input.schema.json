@@ -118,6 +118,33 @@
 				"primary_field": { "type": "string" },
 				"required_fields": { "type": "array", "items": { "type": "string" } },
 				"nonempty_fields": { "type": "array", "items": { "type": "string" } },
+				"input": { "type": "object" },
+				"output": { "type": "object" },
+				"allow_empty_primary": { "type": "boolean" },
+				"allow_empty_segments": {
+					"oneOf": [{ "type": "boolean" }, { "const": "silence_only" }]
+				},
+				"approved_output_fields": {
+					"type": "array",
+					"items": { "type": "string" },
+					"uniqueItems": true
+				},
+				"segment_schema": {
+					"type": "object",
+					"required": ["type", "required", "properties", "additionalProperties"],
+					"properties": {
+						"type": { "const": "object" },
+						"required": {
+							"type": "array",
+							"items": { "type": "string" },
+							"minItems": 3,
+							"uniqueItems": true
+						},
+						"properties": { "type": "object" },
+						"additionalProperties": { "const": false }
+					},
+					"additionalProperties": false
+				},
 				"json_serializable": { "type": "boolean" }
 			},
 			"additionalProperties": true

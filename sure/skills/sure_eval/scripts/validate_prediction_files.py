@@ -32,6 +32,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 KWS_POSITIVE_LABELS = {"detect", "detected", "positive", "true", "1", "yes"}
 KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
 KWS_OPERATING_THRESHOLD = 0.5
+ANNOTATION_TASKS = {"SD", "SA-ASR"}
+STRUCTURED_REQUIRED_TASKS = {"KWS", "SE", *ANNOTATION_TASKS}
+
+
+def _normalize_task(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace("-", "_")
+    return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -82,6 +89,9 @@ def _load_structured_predictions(path: Path) -> tuple[dict[str, dict[str, Any]],
                 row = json.loads(raw_line)
             except json.JSONDecodeError:
                 invalid_rows.append(f"line:{index}")
+                continue
+            if not isinstance(row, dict):
+                invalid_rows.append(f"line:{index}:not_object")
                 continue
             key = str(row.get("key", ""))
             if not key:
@@ -172,6 +182,77 @@ def _kws_reference_contract_violation(sample: dict[str, Any]) -> bool:
     return not any(str(sample.get(field) or "").strip() for field in ("text", "txt"))
 
 
+def _valid_annotation_segments(
+    value: Any,
+    *,
+    task: str,
+    duration: float | None = None,
+) -> bool:
+    canonical_task = _normalize_task(task)
+    if not isinstance(value, list) or (canonical_task == "SA-ASR" and not value):
+        return False
+    seen: set[tuple[Any, ...]] = set()
+    for segment in value:
+        if not isinstance(segment, dict):
+            return False
+        allowed_fields = {"speaker", "start", "end", "duration"}
+        if canonical_task == "SA-ASR":
+            allowed_fields.add("text")
+        if any(field not in allowed_fields for field in segment):
+            return False
+        speaker = segment.get("speaker")
+        start = segment.get("start")
+        end = segment.get("end")
+        if (
+            not isinstance(speaker, str)
+            or not speaker.strip()
+            or speaker != speaker.strip()
+            or speaker.startswith(";")
+            or speaker == "<NA>"
+            or any(ch.isspace() or ord(ch) < 32 for ch in speaker)
+        ):
+            return False
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(start))
+            or not math.isfinite(float(end))
+            or float(start) < 0
+            or float(end) <= float(start)
+        ):
+            return False
+        if duration is not None and float(end) > duration + 0.001:
+            return False
+        text = segment.get("text")
+        if canonical_task == "SA-ASR" and (
+            not isinstance(text, str) or not text.strip() or "\n" in text or "\r" in text
+        ):
+            return False
+        declared_duration = segment.get("duration")
+        if declared_duration is not None and (
+            isinstance(declared_duration, bool)
+            or not isinstance(declared_duration, (int, float))
+            or not math.isfinite(float(declared_duration))
+            or float(declared_duration) <= 0
+            or not math.isclose(
+                float(declared_duration), float(end) - float(start), rel_tol=0, abs_tol=1e-3
+            )
+        ):
+            return False
+        identity = (
+            speaker.strip(),
+            float(start),
+            float(end),
+            str(text or "").strip(),
+        )
+        if identity in seen:
+            return False
+        seen.add(identity)
+    return True
+
+
 def _task_contract_violations(
     samples: list[dict[str, Any]],
     structured: dict[str, dict[str, Any]],
@@ -182,8 +263,16 @@ def _task_contract_violations(
     violations: list[str] = []
     sample_by_key = {str(sample.get("key", "")): sample for sample in samples}
     for key, row in structured.items():
-        sample = sample_by_key.get(key, {})
-        task = str(row.get("task") or sample.get("task") or "").upper()
+        sample = sample_by_key.get(key)
+        if not isinstance(sample, dict):
+            violations.append(key)
+            continue
+        sample_task = _normalize_task(sample.get("task"))
+        row_task = _normalize_task(row.get("task"))
+        if not sample_task or row_task != sample_task:
+            violations.append(key)
+            continue
+        task = sample_task
         prediction = row.get("prediction") if isinstance(row.get("prediction"), dict) else {}
         normalized = str(row.get("normalized_prediction") or "")
         if task in {"ASR", "S2TT"} and not (prediction.get("text") or normalized):
@@ -204,8 +293,48 @@ def _task_contract_violations(
             violations.append(key)
         elif task == "SLU" and not (prediction.get("text") or prediction.get("label") or normalized):
             violations.append(key)
-        elif task in {"SD", "SA-ASR"} and not (prediction.get("segments") or prediction.get("annotation") or normalized):
-            violations.append(key)
+        elif task in ANNOTATION_TASKS:
+            if any(field not in {"segments", "num_speakers"} for field in prediction):
+                violations.append(key)
+                continue
+            duration_field = next(
+                (field for field in ("duration_sec", "duration_seconds", "duration") if field in sample),
+                None,
+            )
+            raw_duration = sample.get(duration_field) if duration_field else None
+            duration_valid = duration_field is None or (
+                isinstance(raw_duration, (int, float))
+                and not isinstance(raw_duration, bool)
+                and math.isfinite(float(raw_duration))
+                and float(raw_duration) > 0
+            )
+            if not duration_valid:
+                violations.append(key)
+                continue
+            duration = float(raw_duration) if duration_field else None
+            reference_segments = sample.get("segments")
+            prediction_segments = prediction.get("segments")
+            if not _valid_annotation_segments(
+                reference_segments, task=task, duration=duration
+            ) or not _valid_annotation_segments(
+                prediction_segments, task=task, duration=duration
+            ):
+                violations.append(key)
+                continue
+            num_speakers = prediction.get("num_speakers")
+            if num_speakers is not None:
+                speakers = {
+                    segment["speaker"].strip()
+                    for segment in prediction_segments
+                    if isinstance(segment, dict) and isinstance(segment.get("speaker"), str)
+                }
+                if (
+                    isinstance(num_speakers, bool)
+                    or not isinstance(num_speakers, int)
+                    or num_speakers < 0
+                    or num_speakers != len(speakers)
+                ):
+                    violations.append(key)
         elif task == "KWS":
             if _kws_reference_contract_violation(sample) or not {
                 "detected",
@@ -281,6 +410,10 @@ def validate_prediction_file(
     predictions, duplicate_keys = _load_predictions(prediction_path)
     structured_path = prediction_path.with_suffix(".jsonl")
     structured_predictions, structured_duplicate_keys, invalid_structured_rows = _load_structured_predictions(structured_path)
+    structured_required = any(
+        _normalize_task(sample.get("task")) in STRUCTURED_REQUIRED_TASKS
+        for sample in samples
+    )
 
     expected_keys = [str(sample.get("key", "")) for sample in samples]
     expected_key_set = set(expected_keys)
@@ -292,7 +425,11 @@ def validate_prediction_file(
         key for key, prediction in predictions.items() if key in expected_key_set and prediction.strip() == ""
     )
     structured_key_set = set(structured_predictions.keys())
-    structured_missing_keys = sorted(expected_key_set - structured_key_set) if structured_path.exists() else []
+    structured_missing_keys = (
+        sorted(expected_key_set - structured_key_set)
+        if structured_path.exists() or structured_required
+        else []
+    )
     structured_extra_keys = sorted(structured_key_set - expected_key_set) if structured_path.exists() else []
     contract_violation_keys = (
         _task_contract_violations(
@@ -313,7 +450,7 @@ def validate_prediction_file(
     is_valid = not missing_keys and not extra_keys and not duplicate_keys
     if require_nonempty and empty_prediction_keys:
         is_valid = False
-    if structured_path.exists() and (
+    if (structured_path.exists() or structured_required) and (
         structured_missing_keys
         or structured_extra_keys
         or structured_duplicate_keys
@@ -329,6 +466,7 @@ def validate_prediction_file(
         "prediction_path": str(prediction_path),
         "prediction_jsonl_path": str(structured_path) if structured_path.exists() else None,
         "format_used": "jsonl+txt" if structured_path.exists() else "txt",
+        "structured_required": structured_required,
         "total_dataset_samples": len(all_samples),
         "max_samples": max_samples if max_samples > 0 else None,
         "expected_samples": len(expected_keys),

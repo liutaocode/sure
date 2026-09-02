@@ -22,7 +22,7 @@ import tempfile
 import wave
 from datetime import datetime, timezone
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -49,6 +49,7 @@ SURE_SUITES_ROOT = Path("data/datasets/sure_benchmark/SURE_Test_Suites")
 KWS_POSITIVE_LABELS = {"detect", "detected", "positive", "true", "1", "yes"}
 KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
 KWS_OPERATING_THRESHOLD = 0.5
+ANNOTATION_TASKS = {"SD", "SA-ASR", "SA_ASR"}
 
 LOWER_IS_BETTER_METRICS = {
     "wer",
@@ -105,6 +106,10 @@ def load_prediction_map(path: Path) -> dict[str, str]:
             parts = line.split(None, 1)
             key = parts[0]
             value = parts[1] if len(parts) > 1 else ""
+        if not key:
+            raise ValueError(f"Prediction row is missing key: {path}")
+        if key in predictions:
+            raise ValueError(f"Duplicate prediction key {key!r}: {path}")
         predictions[key] = value
     return predictions
 
@@ -138,9 +143,14 @@ def load_structured_prediction_map(path: Path) -> dict[str, dict[str, Any]]:
             if not line.strip():
                 continue
             row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"Structured prediction row must be an object: {path}")
             key = str(row.get("key", ""))
-            if key:
-                predictions[key] = row
+            if not key:
+                raise ValueError(f"Structured prediction row is missing key: {path}")
+            if key in predictions:
+                raise ValueError(f"Duplicate structured prediction key {key!r}: {path}")
+            predictions[key] = row
     return predictions
 
 
@@ -150,10 +160,24 @@ def _samples_with_predictions(
     *,
     dataset_name: str,
 ) -> list[dict[str, Any]]:
-    matched = [sample for sample in samples if str(sample.get("key", "")) in prediction_keys]
-    if not matched:
-        raise ValueError(f"No predictions match dataset samples: {dataset_name}")
-    return matched
+    expected_keys = [str(sample.get("key", "")) for sample in samples]
+    if not expected_keys or any(not key for key in expected_keys):
+        raise ValueError(f"Dataset samples have missing keys: {dataset_name}")
+    if len(set(expected_keys)) != len(expected_keys):
+        raise ValueError(f"Dataset samples have duplicate keys: {dataset_name}")
+    expected = set(expected_keys)
+    missing = sorted(expected - prediction_keys)
+    extra = sorted(prediction_keys - expected)
+    if missing or extra:
+        raise ValueError(
+            f"Prediction keys do not exactly cover dataset scope {dataset_name}: "
+            f"missing={missing}, extra={extra}"
+        )
+    return samples
+
+
+def _scoped_samples(samples: list[dict[str, Any]], max_samples: int) -> list[dict[str, Any]]:
+    return samples[:max_samples] if max_samples > 0 else samples
 
 
 def _write_eval_file(rows: list[str]) -> str:
@@ -388,6 +412,224 @@ def _sample_clean_reference_audio(sample: dict[str, Any]) -> str:
         or sample.get("target_audio_path")
         or ""
     )
+
+
+def _canonical_annotation_task(task: str) -> str:
+    normalized = str(task or "").strip().upper().replace("_", "-")
+    if normalized not in {"SD", "SA-ASR"}:
+        raise ValueError(f"Unsupported annotation task: {task!r}")
+    return normalized
+
+
+def _annotation_token(value: Any, *, label: str, key: str) -> str:
+    token = str(value or "").strip()
+    if (
+        not token
+        or token.startswith(";")
+        or token == "<NA>"
+        or Path(token).is_absolute()
+        or PureWindowsPath(token).is_absolute()
+        or "://" in token
+        or any(ch.isspace() or ord(ch) < 32 for ch in token)
+    ):
+        raise ValueError(f"{key} {label} must be one non-empty annotation token")
+    return token
+
+
+def _sample_duration_seconds(sample: dict[str, Any]) -> float | None:
+    for field in ("duration_sec", "duration_seconds", "duration"):
+        if field not in sample:
+            continue
+        value = sample.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise ValueError(f"sample duration field {field} must be a finite positive number")
+        return float(value)
+    return None
+
+
+def _validated_annotation_segments(
+    value: Any,
+    *,
+    task: str,
+    key: str,
+    role: str,
+    duration: float | None,
+) -> list[dict[str, Any]]:
+    canonical_task = _canonical_annotation_task(task)
+    if not isinstance(value, list):
+        raise ValueError(f"{canonical_task} {role} segments must be a list: {key}")
+    if canonical_task == "SA-ASR" and not value:
+        raise ValueError(f"SA-ASR {role} segments must not be empty: {key}")
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for index, segment in enumerate(value):
+        if not isinstance(segment, dict):
+            raise ValueError(f"{canonical_task} {role} segment {index} must be an object: {key}")
+        allowed_fields = {"speaker", "start", "end", "duration"}
+        if canonical_task == "SA-ASR":
+            allowed_fields.add("text")
+        unknown_fields = sorted(str(field) for field in segment if field not in allowed_fields)
+        if unknown_fields:
+            raise ValueError(
+                f"{canonical_task} {role} segment {index} contains unapproved field(s): "
+                + ", ".join(unknown_fields)
+            )
+        speaker = _annotation_token(segment.get("speaker"), label="speaker", key=key)
+        start = segment.get("start")
+        end = segment.get("end")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(start))
+            or not math.isfinite(float(end))
+        ):
+            raise ValueError(f"{canonical_task} {role} segment times must be finite numbers: {key}")
+        start_value = float(start)
+        end_value = float(end)
+        if start_value < 0 or end_value <= start_value:
+            raise ValueError(f"{canonical_task} {role} segment requires 0 <= start < end: {key}")
+        if duration is not None and end_value > duration + 0.001:
+            raise ValueError(
+                f"{canonical_task} {role} segment end exceeds sample duration {duration}: {key}"
+            )
+        text = ""
+        if canonical_task == "SA-ASR":
+            raw_text = segment.get("text")
+            if (
+                not isinstance(raw_text, str)
+                or not raw_text.strip()
+                or "\n" in raw_text
+                or "\r" in raw_text
+            ):
+                raise ValueError(f"SA-ASR {role} segment text must be non-empty: {key}")
+            text = " ".join(raw_text.split())
+        declared_duration = segment.get("duration")
+        if declared_duration is not None and (
+            isinstance(declared_duration, bool)
+            or not isinstance(declared_duration, (int, float))
+            or not math.isfinite(float(declared_duration))
+            or float(declared_duration) <= 0
+            or not math.isclose(
+                float(declared_duration), end_value - start_value, rel_tol=0, abs_tol=1e-3
+            )
+        ):
+            raise ValueError(
+                f"{canonical_task} {role} segment duration must equal end - start: {key}"
+            )
+        identity = (speaker, start_value, end_value, text)
+        if identity in seen:
+            raise ValueError(f"{canonical_task} {role} contains a duplicate segment: {key}")
+        seen.add(identity)
+        row = {"speaker": speaker, "start": start_value, "end": end_value}
+        if canonical_task == "SA-ASR":
+            row["text"] = text
+        normalized.append(row)
+    return normalized
+
+
+def _annotation_lines(task: str, session_id: str, segments: list[dict[str, Any]]) -> list[str]:
+    canonical_task = _canonical_annotation_task(task)
+    ordered = sorted(
+        segments,
+        key=lambda segment: (
+            float(segment["start"]),
+            float(segment["end"]),
+            str(segment["speaker"]),
+            str(segment.get("text") or ""),
+        ),
+    )
+    if canonical_task == "SD":
+        return [
+            "SPEAKER "
+            f"{session_id} 1 {segment['start']:.6f} "
+            f"{segment['end'] - segment['start']:.6f} <NA> <NA> "
+            f"{segment['speaker']} <NA> <NA>"
+            for segment in ordered
+        ]
+    return [
+        f"{session_id} 1 {segment['speaker']} {segment['start']:.6f} "
+        f"{segment['end']:.6f} {segment['text']}"
+        for segment in ordered
+    ]
+
+
+def _write_external_annotation_role_files(
+    *,
+    task: str,
+    samples: list[dict[str, Any]],
+    structured_predictions: dict[str, dict[str, Any]],
+    output_dir: Path,
+) -> tuple[Path, Path, Path]:
+    canonical_task = _canonical_annotation_task(task)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = ".rttm" if canonical_task == "SD" else ".stm"
+    reference_path = output_dir / f"reference{suffix}"
+    hypothesis_path = output_dir / f"hypothesis{suffix}"
+    manifest_path = output_dir / "annotation_conversion.json"
+    reference_lines: list[str] = []
+    hypothesis_lines: list[str] = []
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        key = str(sample.get("key") or "").strip()
+        session_id = _annotation_token(key, label="session_id", key=key or "sample")
+        duration = _sample_duration_seconds(sample)
+        reference_segments = _validated_annotation_segments(
+            sample.get("segments"),
+            task=canonical_task,
+            key=key,
+            role="reference",
+            duration=duration,
+        )
+        structured = structured_predictions.get(key)
+        if not isinstance(structured, dict):
+            raise ValueError(f"Missing structured prediction row for {canonical_task}: {key}")
+        prediction = structured.get("prediction")
+        if not isinstance(prediction, dict) or "segments" not in prediction:
+            raise ValueError(f"{canonical_task} structured prediction requires segments: {key}")
+        hypothesis_segments = _validated_annotation_segments(
+            prediction["segments"],
+            task=canonical_task,
+            key=key,
+            role="prediction",
+            duration=duration,
+        )
+        reference_lines.extend(_annotation_lines(canonical_task, session_id, reference_segments))
+        hypothesis_lines.extend(_annotation_lines(canonical_task, session_id, hypothesis_segments))
+        rows.append(
+            {
+                "key": key,
+                "session_id": session_id,
+                "reference_segments": len(reference_segments),
+                "prediction_segments": len(hypothesis_segments),
+            }
+        )
+    reference_path.write_text(
+        "\n".join(reference_lines) + ("\n" if reference_lines else ""), encoding="utf-8"
+    )
+    hypothesis_path.write_text(
+        "\n".join(hypothesis_lines) + ("\n" if hypothesis_lines else ""), encoding="utf-8"
+    )
+    manifest = {
+        "schema": "sure.eval.annotation_conversion.v1",
+        "task": canonical_task,
+        "format": "RTTM" if canonical_task == "SD" else "STM",
+        "roles": {"ref": reference_path.name, "hyp": hypothesis_path.name},
+        "rows": rows,
+        "reference_line_count": len(reference_lines),
+        "hypothesis_line_count": len(hypothesis_lines),
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return reference_path, hypothesis_path, manifest_path
 
 
 def _se_external_prediction_audio(value: Any, structured_prediction_path: Path) -> str:
@@ -929,13 +1171,15 @@ def evaluate_prediction_file_external(
     metric_override: str | None = None,
     pipeline_id_override: str | None = None,
     task_override: str | None = None,
+    max_samples: int = 0,
 ) -> dict[str, Any]:
     canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
     jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
     if not jsonl_path.exists():
         jsonl_path = dataset_manager.download_and_convert(canonical_name)
 
-    all_samples = load_jsonl(jsonl_path)
+    dataset_samples = load_jsonl(jsonl_path)
+    all_samples = _scoped_samples(dataset_samples, max_samples)
     predictions = load_prediction_map(prediction_path)
     if not all_samples:
         raise ValueError(f"Dataset has no samples: {canonical_name}")
@@ -1028,6 +1272,8 @@ def evaluate_prediction_file_external(
         "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
         "num_samples": len(samples),
         "expected_samples": len(all_samples),
+        "total_dataset_samples": len(dataset_samples),
+        "evaluation_max_samples": max_samples if max_samples > 0 else 0,
         "provided_predictions": len(samples),
         "evaluation_backend": "external",
         "evaluator_version": "sure-evaluation",
@@ -1057,6 +1303,161 @@ def evaluate_prediction_file_external(
     }
 
 
+def evaluate_annotation_prediction_file_external(
+    dataset_manager: DatasetManager,
+    sota_manager: SOTAManager,
+    dataset_name: str,
+    prediction_path: Path,
+    *,
+    engine_source: str,
+    engine_root: Path,
+    external_runs_dir: Path,
+    device: str,
+    cache_dir: str | None,
+    timeout: int,
+    metric_override: str | None,
+    pipeline_id_override: str | None = None,
+    task_override: str | None = None,
+    max_samples: int = 0,
+) -> dict[str, Any]:
+    canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
+    jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
+    if not jsonl_path.exists():
+        jsonl_path = dataset_manager.download_and_convert(canonical_name)
+    dataset_samples = load_jsonl(jsonl_path)
+    all_samples = _scoped_samples(dataset_samples, max_samples)
+    if not all_samples:
+        raise ValueError(f"Dataset has no samples: {canonical_name}")
+    dataset_task = str(all_samples[0].get("task") or "").upper()
+    task = _canonical_annotation_task(str(task_override or dataset_task))
+    language = str(all_samples[0].get("language") or ("n/a" if task == "SD" else "en"))
+    requested_metric = metric_override or _metric_from_sota(
+        sota_manager, canonical_name, fallback_names=_source_fallback_names(jsonl_path)
+    )
+    pipeline = _describe_external_pipeline(
+        engine_root=engine_root,
+        task=task,
+        language=language,
+        metric=None if pipeline_id_override else requested_metric,
+        pipeline_id=pipeline_id_override,
+        timeout=timeout,
+    )
+    if not _pipeline_uses_text_pair(pipeline):
+        raise ExternalEvaluationUnsupported(
+            f"task={task} metric={requested_metric or pipeline.get('metric')} "
+            "does not use MeetEval hyp/ref annotation roles"
+        )
+    structured_prediction_path = prediction_path.with_suffix(".jsonl")
+    structured_predictions = load_structured_prediction_map(structured_prediction_path)
+    if not structured_predictions:
+        raise ValueError(
+            f"{task} external evaluation requires structured predictions: "
+            f"{structured_prediction_path}"
+        )
+    samples = _samples_with_predictions(
+        all_samples,
+        set(structured_predictions),
+        dataset_name=canonical_name,
+    )
+    run_dir = _external_run_dir(
+        external_runs_dir,
+        canonical_name,
+        str(pipeline_id_override or requested_metric or "default"),
+    )
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ref_file, hyp_file, conversion_manifest = _write_external_annotation_role_files(
+        task=task,
+        samples=samples,
+        structured_predictions=structured_predictions,
+        output_dir=run_dir,
+    )
+    external_payload = _run_external_pipeline(
+        engine_root=engine_root,
+        request={
+            "task": task,
+            "language": language if language != "auto" else None,
+            "metric": None if pipeline_id_override else requested_metric,
+            "pipeline_id": pipeline_id_override,
+            "output_dir": str(run_dir.resolve()),
+            "ref_file": str(ref_file.resolve()),
+            "hyp_file": str(hyp_file.resolve()),
+            "samples_jsonl": None,
+            "device": device,
+            "cache_dir": cache_dir,
+            "pipeline": pipeline,
+        },
+        timeout=timeout,
+    )
+    summary = external_payload["summary"]
+    resolved_pipeline = external_payload["pipeline"]
+    report = external_payload.get("report") or {}
+    metric = str(summary.get("metric") or resolved_pipeline.get("metric") or requested_metric or "")
+    score = summary.get("score", report.get("score", 0.0))
+    rps, rps_status = _calculate_metric_rps(
+        sota_manager,
+        canonical_name,
+        metric,
+        score,
+        fallback_names=_source_fallback_names(jsonl_path),
+    )
+    return {
+        "dataset": canonical_name,
+        "jsonl_path": str(jsonl_path),
+        "prediction_path": str(prediction_path),
+        "prediction_jsonl_path": str(structured_prediction_path),
+        "task": task,
+        "language": str(summary.get("language") or language),
+        "metric": metric,
+        "score": score,
+        "rps": rps,
+        "rps_status": rps_status,
+        "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
+        "num_samples": len(samples),
+        "expected_samples": len(all_samples),
+        "total_dataset_samples": len(dataset_samples),
+        "evaluation_max_samples": max_samples if max_samples > 0 else 0,
+        "provided_predictions": len(samples),
+        "evaluation_backend": "external",
+        "evaluator_version": "sure-evaluation",
+        "pipeline_id": summary.get("pipeline_id") or resolved_pipeline.get("pipeline_id"),
+        "evaluation_context": {
+            "backend": "sure-evaluation",
+            "engine_source": engine_source,
+            "engine_root": str(engine_root),
+            "evaluation_runtime": _evaluation_runtime_binding(engine_root),
+            "dataset_task": dataset_task,
+            "pipeline_id": summary.get("pipeline_id") or resolved_pipeline.get("pipeline_id"),
+            "route_id": resolved_pipeline.get("route_id"),
+            "nodes": [node.get("node_id") for node in resolved_pipeline.get("nodes", [])],
+            "node_config_paths": summary.get("node_config_paths", []),
+            "external_output_dir": summary.get("output_dir"),
+            "annotation_roles": {
+                "ref": str(ref_file),
+                "hyp": str(hyp_file),
+            },
+            "annotation_conversion": str(conversion_manifest),
+            "requested_metric_source": (
+                "cli_pipeline_id"
+                if pipeline_id_override
+                else "cli_override"
+                if metric_override
+                else "sota_baseline"
+                if requested_metric
+                else "sure-evaluation_task_manifest"
+            ),
+            "requested_pipeline_id": pipeline_id_override,
+        },
+        "details": {
+            "summary": summary,
+            "report": report,
+            "pipeline": resolved_pipeline,
+            "annotation_conversion": _read_json_file(conversion_manifest),
+        },
+    }
+
+
 def evaluate_audio_prediction_file_external(
     dataset_manager: DatasetManager,
     sota_manager: SOTAManager,
@@ -1072,13 +1473,15 @@ def evaluate_audio_prediction_file_external(
     metric_override: str | None,
     pipeline_id_override: str | None = None,
     task_override: str | None = None,
+    max_samples: int = 0,
 ) -> dict[str, Any]:
     canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
     jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
     if not jsonl_path.exists():
         jsonl_path = dataset_manager.download_and_convert(canonical_name)
 
-    all_samples = load_jsonl(jsonl_path)
+    dataset_samples = load_jsonl(jsonl_path)
+    all_samples = _scoped_samples(dataset_samples, max_samples)
     if not all_samples:
         raise ValueError(f"Dataset has no samples: {canonical_name}")
     dataset_task = str(all_samples[0].get("task", "")).upper()
@@ -1185,6 +1588,8 @@ def evaluate_audio_prediction_file_external(
         "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
         "num_samples": len(samples),
         "expected_samples": len(all_samples),
+        "total_dataset_samples": len(dataset_samples),
+        "evaluation_max_samples": max_samples if max_samples > 0 else 0,
         "provided_predictions": len(samples),
         "evaluation_backend": "external",
         "evaluator_version": "sure-evaluation",
@@ -1230,13 +1635,15 @@ def evaluate_kws_prediction_file_external(
     metric_override: str | None,
     pipeline_id_override: str | None = None,
     task_override: str | None = None,
+    max_samples: int = 0,
 ) -> dict[str, Any]:
     canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
     jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
     if not jsonl_path.exists():
         jsonl_path = dataset_manager.download_and_convert(canonical_name)
 
-    all_samples = load_jsonl(jsonl_path)
+    dataset_samples = load_jsonl(jsonl_path)
+    all_samples = _scoped_samples(dataset_samples, max_samples)
     if not all_samples:
         raise ValueError(f"Dataset has no samples: {canonical_name}")
     dataset_task = str(all_samples[0].get("task", "")).upper()
@@ -1334,6 +1741,8 @@ def evaluate_kws_prediction_file_external(
         "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
         "num_samples": len(samples),
         "expected_samples": len(all_samples),
+        "total_dataset_samples": len(dataset_samples),
+        "evaluation_max_samples": max_samples if max_samples > 0 else 0,
         "provided_predictions": len(samples),
         "evaluation_backend": "external",
         "evaluator_version": "sure-evaluation",
@@ -1375,13 +1784,15 @@ def evaluate_prediction_file(
     dataset_name: str,
     prediction_path: Path,
     metric_override: str | None = None,
+    max_samples: int = 0,
 ) -> dict[str, Any]:
     canonical_name = dataset_manager.normalize_dataset_name(dataset_name)
     jsonl_path = dataset_manager.get_jsonl_path(canonical_name)
     if not jsonl_path.exists():
         jsonl_path = dataset_manager.download_and_convert(canonical_name)
 
-    all_samples = load_jsonl(jsonl_path)
+    dataset_samples = load_jsonl(jsonl_path)
+    all_samples = _scoped_samples(dataset_samples, max_samples)
     predictions = load_prediction_map(prediction_path)
     if not all_samples:
         raise ValueError(f"Dataset has no samples: {canonical_name}")
@@ -1446,6 +1857,8 @@ def evaluate_prediction_file(
         "rps_is_unbounded": isinstance(rps, float) and not math.isfinite(rps),
         "num_samples": len(samples),
         "expected_samples": len(all_samples),
+        "total_dataset_samples": len(dataset_samples),
+        "evaluation_max_samples": max_samples if max_samples > 0 else 0,
         "provided_predictions": len(samples),
         "evaluation_backend": "legacy",
         "evaluator_version": "sure_eval vendored v1.0",
@@ -1484,7 +1897,10 @@ def _primary_result(metric: str, score: Any, report: dict[str, Any] | None = Non
     numeric_score = score if isinstance(score, (int, float)) and math.isfinite(float(score)) else None
     result: dict[str, Any] = {"metric_name": metric, "score": numeric_score, "score_key": "score"}
     metric_name = str(metric).lower()
-    if metric_name.endswith("wer") or metric_name in {"wer", "tts_wer", "vc_wer", "wer_canonical"}:
+    if (
+        metric_name.endswith("wer")
+        or metric_name in {"wer", "tts_wer", "vc_wer", "wer_canonical"}
+    ) and metric_name not in {"cpwer", "cp_wer"}:
         result["wer"] = numeric_score
         result["score_key"] = "wer"
     if metric_name.endswith("cer") or metric_name in {"cer", "tts_cer", "vc_cer", "cer_canonical"}:
@@ -1508,6 +1924,12 @@ def _primary_result(metric: str, score: Any, report: dict[str, Any] | None = Non
     if metric_name in {"wv-mos", "utmos"}:
         result["mos"] = numeric_score
         result["score_key"] = "mos"
+    if metric_name == "der":
+        result["der"] = numeric_score
+        result["score_key"] = "der"
+    if metric_name in {"cpwer", "cp_wer"}:
+        result["cpwer"] = numeric_score
+        result["score_key"] = "cpwer"
     return result
 
 
@@ -1662,6 +2084,11 @@ def _dataset_metric_row(result: dict[str, Any]) -> dict[str, Any]:
         "evaluation_backend": result.get("evaluation_backend"),
         "evaluator_version": result.get("evaluator_version"),
         "num_samples": result.get("num_samples"),
+        "evaluation_scope": {
+            "max_samples": result.get("evaluation_max_samples") or None,
+            "evaluated_samples": result.get("expected_samples") or result.get("num_samples"),
+            "total_dataset_samples": result.get("total_dataset_samples"),
+        },
         "rps": rps,
         "rps_status": rps_status,
         "evaluation_context": context,
@@ -2438,6 +2865,25 @@ def _external_artifact_path(result: dict[str, Any], key: str) -> Path | None:
     return path if path.is_file() else None
 
 
+def _meeteval_per_session(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    trace = report.get("pipeline_trace")
+    if not isinstance(trace, list):
+        return {}
+    for node in trace:
+        if not isinstance(node, dict) or node.get("node_id") != "scoring/meeteval":
+            continue
+        details = node.get("details") if isinstance(node.get("details"), dict) else {}
+        result = details.get("result") if isinstance(details.get("result"), dict) else {}
+        per_session = result.get("per_session")
+        if isinstance(per_session, dict):
+            return {
+                str(key): dict(value)
+                for key, value in per_session.items()
+                if isinstance(value, dict)
+            }
+    return {}
+
+
 def _write_sample_report(
     *,
     output_path: Path,
@@ -2468,6 +2914,8 @@ def _write_sample_report(
         for item in report_rows
         if isinstance(item, dict) and (item.get("key") or item.get("sample_id"))
     }
+    if task in ANNOTATION_TASKS:
+        metric_details_by_key.update(_meeteval_per_session(report))
     with output_path.open("w", encoding="utf-8") as handle:
         for sample in samples:
             key = str(sample.get("key", ""))
@@ -2531,6 +2979,15 @@ def _write_sample_report(
                 }
                 if key in metric_details_by_key:
                     row["metric_details"] = metric_details_by_key[key]
+            elif task in ANNOTATION_TASKS:
+                structured = (structured_predictions or {}).get(key, {})
+                structured_prediction = structured.get("prediction")
+                row["prediction"] = {
+                    "segments": list(structured_prediction.get("segments") or [])
+                } if isinstance(structured_prediction, dict) else {"segments": []}
+                row["reference"] = {"segments": list(sample.get("segments") or [])}
+                if key in metric_details_by_key:
+                    row["metric_details"] = metric_details_by_key[key]
             else:
                 row["reference"] = sample.get("target") or sample.get("reference_text") or ""
             handle.write(json.dumps(_to_strict_jsonable(row), ensure_ascii=False) + "\n")
@@ -2583,6 +3040,9 @@ def _legacy_result_from_payload_row(row: dict[str, Any], payload_path: Path) -> 
     report_path = pipeline.get("report_path") or artifacts.get("report")
     description_path = pipeline.get("description_path") or artifacts.get("pipeline_description")
     rps, rps_status = _split_rps_result(row.get("rps"), row.get("rps_status"))
+    evaluation_scope = (
+        row.get("evaluation_scope") if isinstance(row.get("evaluation_scope"), dict) else {}
+    )
     internal = {
         "dataset": row.get("dataset"),
         "jsonl_path": str(_localize_path(jsonl_path, base_dir)) if jsonl_path else "",
@@ -2595,6 +3055,9 @@ def _legacy_result_from_payload_row(row: dict[str, Any], payload_path: Path) -> 
         "rps_status": rps_status,
         "rps_is_unbounded": False,
         "num_samples": row.get("num_samples") or metric_result.get("num_samples"),
+        "expected_samples": evaluation_scope.get("evaluated_samples"),
+        "total_dataset_samples": evaluation_scope.get("total_dataset_samples"),
+        "evaluation_max_samples": evaluation_scope.get("max_samples") or 0,
         "evaluation_backend": row.get("evaluation_backend") or "external",
         "evaluator_version": row.get("evaluator_version") or "sure-evaluation",
         "pipeline_id": row.get("pipeline_id") or pipeline.get("pipeline_id"),
@@ -2710,7 +3173,7 @@ def _record_evaluation_result(
         "details": result["details"],
     }
     task = str(result.get("task") or "").upper()
-    if task not in {"KWS", "SE"}:
+    if task not in {"KWS", "SE", "SD", "SA-ASR", "SA_ASR"}:
         return rps_manager.evaluate_and_record(
             tool_name=tool_name,
             dataset=result["dataset"],
@@ -2807,11 +3270,33 @@ def _write_run_artifacts(
             )
             prediction_keys = (
                 set(structured_predictions)
-                if str(result.get("task") or "").upper() in {"KWS", "SE"}
+                if str(result.get("task") or "").upper() in {
+                    "KWS",
+                    "SE",
+                    "SD",
+                    "SA-ASR",
+                    "SA_ASR",
+                }
                 else set(predictions)
             )
+            raw_max_samples = result.get("evaluation_max_samples", 0)
+            if raw_max_samples in (None, ""):
+                evaluation_max_samples = 0
+            elif (
+                isinstance(raw_max_samples, bool)
+                or not isinstance(raw_max_samples, int)
+                or raw_max_samples < 0
+            ):
+                raise ValueError(
+                    f"invalid evaluation_max_samples for dataset {dataset}: {raw_max_samples!r}"
+                )
+            else:
+                evaluation_max_samples = raw_max_samples
             samples = _samples_with_predictions(
-                load_jsonl(_localize_path(result["jsonl_path"])),
+                _scoped_samples(
+                    load_jsonl(_localize_path(result["jsonl_path"])),
+                    evaluation_max_samples,
+                ),
                 prediction_keys,
                 dataset_name=dataset,
             )
@@ -3144,8 +3629,20 @@ def main() -> int:
         evaluation_requests = [(metric, None) for metric in metric_overrides]
 
     results: list[dict[str, Any]] = []
+    validation_scopes = _validation_by_dataset(validation_payload)
     for requested_dataset in args.dataset:
         canonical_name = dataset_manager.normalize_dataset_name(requested_dataset)
+        validation_scope = validation_scopes.get(canonical_name, {})
+        if validation_scope and validation_scope.get("is_valid") is not True:
+            raise ValueError(f"Prediction validation did not pass for dataset: {canonical_name}")
+        raw_max_samples = validation_scope.get("max_samples")
+        evaluation_max_samples = (
+            int(raw_max_samples)
+            if isinstance(raw_max_samples, int)
+            and not isinstance(raw_max_samples, bool)
+            and raw_max_samples > 0
+            else 0
+        )
         dataset_task, dataset_language = _peek_dataset_task_language(dataset_manager, canonical_name)
         effective_task = _effective_audio_task(dataset_task, task_hint)
         prediction_path = explicit_preds.get(canonical_name)
@@ -3203,6 +3700,7 @@ def main() -> int:
                     canonical_name,
                     prediction_path,
                     metric_override=metric_override,
+                    max_samples=evaluation_max_samples,
                 )
                 if args.evaluation_backend == "auto" and resolved_engine is None:
                     result["evaluation_context"]["external_fallback_reason"] = "no standalone sure-evaluation engine resolved"
@@ -3232,6 +3730,24 @@ def main() -> int:
                             metric_override=metric_override,
                             pipeline_id_override=pipeline_id_override,
                             task_override=effective_task,
+                            max_samples=evaluation_max_samples,
+                        )
+                    elif effective_task in ANNOTATION_TASKS:
+                        result = evaluate_annotation_prediction_file_external(
+                            dataset_manager,
+                            sota_manager,
+                            canonical_name,
+                            prediction_path,
+                            engine_source=engine_source,
+                            engine_root=engine_root,
+                            external_runs_dir=external_runs_dir,
+                            device=args.evaluation_device,
+                            cache_dir=args.evaluation_cache_dir,
+                            timeout=args.evaluation_timeout,
+                            metric_override=metric_override,
+                            pipeline_id_override=pipeline_id_override,
+                            task_override=effective_task,
+                            max_samples=evaluation_max_samples,
                         )
                     elif _pipeline_uses_samples_jsonl(pipeline):
                         result = evaluate_audio_prediction_file_external(
@@ -3248,6 +3764,7 @@ def main() -> int:
                             metric_override=metric_override,
                             pipeline_id_override=pipeline_id_override,
                             task_override=effective_task,
+                            max_samples=evaluation_max_samples,
                         )
                     else:
                         result = evaluate_prediction_file_external(
@@ -3264,6 +3781,7 @@ def main() -> int:
                             metric_override=metric_override,
                             pipeline_id_override=pipeline_id_override,
                             task_override=effective_task,
+                            max_samples=evaluation_max_samples,
                         )
                 except ExternalEvaluationUnsupported as exc:
                     if args.evaluation_backend == "external":
@@ -3279,6 +3797,7 @@ def main() -> int:
                         canonical_name,
                         prediction_path,
                         metric_override=metric_override,
+                        max_samples=evaluation_max_samples,
                     )
                     result["evaluation_context"]["external_fallback_reason"] = str(exc)
             results.append(result)

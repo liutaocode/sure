@@ -95,7 +95,8 @@ def _split_values(values: list[str] | None) -> list[str]:
 
 
 def _normalize_task(value: Any) -> str:
-    return str(value or "").strip().upper().replace("-", "_")
+    normalized = str(value or "").strip().upper().replace("-", "_")
+    return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
 def _metric_task_hint(metrics: list[str]) -> str:
@@ -207,7 +208,8 @@ def _check_task_compatibility(model: dict[str, Any], datasets: list[dict[str, An
     for item in datasets:
         task = _normalize_task(item.get("task"))
         exact_task_mismatch = (
-            model_task in {"KWS", "SE"} or task in {"KWS", "SE"}
+            model_task in {"KWS", "SE", "SD", "SA-ASR"}
+            or task in {"KWS", "SE", "SD", "SA-ASR"}
         ) and task != model_task
         synth_mismatch = (task in SYNTH_TASKS) != model_synth
         if task and task != "UNKNOWN" and (exact_task_mismatch or synth_mismatch):
@@ -628,7 +630,7 @@ def _first_jsonl_sample(path: Path) -> dict[str, Any]:
 
 
 def _fallback_default_metrics(task: str, language: str) -> list[str]:
-    task_upper = task.upper()
+    task_upper = _normalize_task(task)
     language_lower = language.lower()
     if task_upper == "ASR":
         if language_lower == "cs":
@@ -640,7 +642,7 @@ def _fallback_default_metrics(task: str, language: str) -> list[str]:
 
 
 def _default_metrics(task: str, language: str, engine_root: Path | None) -> list[str]:
-    task_upper = task.upper()
+    task_upper = _normalize_task(task)
     if task_upper == "SE":
         return ["si-sdr"]
     if engine_root is not None:

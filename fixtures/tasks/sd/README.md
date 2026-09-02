@@ -17,6 +17,7 @@ speakers per smoke sample.
 Files:
 
 - `gt.jsonl`
+- `provenance.json`
 - `librispeech_2spk_001.wav`
 - `librispeech_2spk_002.wav`
 - `librispeech_2spk_003.wav`
@@ -29,3 +30,5 @@ two-speaker recording, an audio path, and speaker time segments:
 ```
 
 Speaker labels are local to each row and normalized to `spk1` and `spk2`.
+The provenance manifest fixes the six source utterances and the deterministic
+0.4-second silence concatenation used to build each WAV.

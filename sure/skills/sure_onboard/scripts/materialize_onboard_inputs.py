@@ -29,6 +29,8 @@ from sure.site.container_delivery import resolve_container_image, resolve_contai
 from sure.site.container_registry import resolve_image_version
 from sure.site.loader import load_site_policy
 
+from structured_segments import canonical_task, is_structured_task, structured_task_contract
+
 try:
     import yaml
 except Exception as exc:  # noqa: BLE001
@@ -239,11 +241,7 @@ def normalize_required_string(value: Any, field: str) -> str:
 
 
 def canonical_task_type(value: str) -> str:
-    raw = value.strip().lower()
-    normalized = raw.replace("-", "_")
-    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
-        return "se"
-    return raw
+    return canonical_task(value)
 
 
 def task_playbooks_for(task_type: str) -> list[str]:
@@ -339,6 +337,31 @@ def make_model_input_resolved(
     handoff_dir = handoff_dir_for(model_input_path)
     cuda_first = deployment_type == "local" and device in {"auto", "cuda"}
 
+    normalized_model_input = {**model_input, "task_type": task_type}
+    task_contract = None
+    if is_structured_task(task_type):
+        task_contract = structured_task_contract(task_type)
+        declared_contract = model_input.get("io_contract")
+        if declared_contract is not None and declared_contract != task_contract["io_contract"]:
+            raise ValueError(
+                "MODEL_INPUT io_contract conflicts with the canonical SD/SA-ASR "
+                "structured segments contract; regenerate the Feed handoff instead of overriding it"
+            )
+        for field in ("tool_name", "predict_method"):
+            declared = model_input.get(field)
+            if declared is not None and declared != task_contract[field]:
+                raise ValueError(
+                    f"MODEL_INPUT {field}={declared!r} conflicts with canonical "
+                    f"{field}={task_contract[field]!r}"
+                )
+        normalized_model_input.update(
+            {
+                "tool_name": task_contract["tool_name"],
+                "predict_method": task_contract["predict_method"],
+                "io_contract": task_contract["io_contract"],
+            }
+        )
+
     payload = {
         "timestamp": now_iso(),
         "model_input_path": str(model_input_path),
@@ -371,8 +394,10 @@ def make_model_input_resolved(
             "handoff_artifacts_dir": str(handoff_dir / "artifacts") if handoff_dir else None,
             "raw_args": raw_args,
         },
-        "normalized_model_input": {**model_input, "task_type": task_type},
+        "normalized_model_input": normalized_model_input,
     }
+    if task_contract is not None:
+        payload["task_contract"] = task_contract
     if package_profile == "docker-registry":
         site = load_site_policy(repository_root=repo_root, required=True) or {}
         policy = site.get("policy")

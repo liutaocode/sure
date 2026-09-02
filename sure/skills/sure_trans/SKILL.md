@@ -20,8 +20,8 @@ Convert an existing model delivery into the same Eval-ready contract produced by
 | `source_image_policy` | no | `auto` (default), `load`, or `build`. `auto` tries a tar below `build_context`, then falls back to Dockerfile build. |
 | `image_tar` | no | Explicit image archive absolute path. It must be inside `build_context`. |
 | `model_name` | yes | Must use `<organization>__<model-name>`; all bundle and image names use this value. |
-| `task_type` | no | Canonical values include `asr`, `kws`, `s2tt`, `se`, `tts`, and `vc`. Input aliases `speech-enhancement`, `speech_enhancement`, and `speech enhancement` normalize to `se`; artifacts only store `se`. Infer from evidence; require an explicit value when ambiguous. |
-| `fixture` | no | Absolute smoke input path. Most tasks require one audio file plus a same-stem `.expected.json`. KWS requires 2 to 5 keyed positive/negative rows. SE requires a directory or `gt.jsonl` with 1 to 5 keyed `audio` (noisy) + `reference_audio` (clean) pairs. |
+| `task_type` | no | Canonical values include `asr`, `kws`, `s2tt`, `sa_asr`, `sd`, `se`, `tts`, and `vc`. Speaker diarization aliases normalize to `sd`; SA-ASR and speaker-attributed ASR aliases normalize to `sa_asr`; speech-enhancement aliases normalize to `se`. Artifacts store canonical values only. |
+| `fixture` | no | Absolute smoke input path. Most tasks require one audio file plus a same-stem `.expected.json`. KWS requires 2 to 5 keyed positive/negative rows. SE requires 1 to 5 keyed noisy/clean pairs. SD and SA-ASR require 1 to 5 keyed `{audio,segments}` rows. |
 | `device` | no | `auto` (default), `cuda`, or `cpu`. `cpu` validates with local Docker only; `cuda` and GPU-capable `auto` submit VC jobs to the dedicated partition `<vc_default_partition>`. |
 | `model_mount_target` | no | Default to `/models/<model_name>`. |
 | `model_stage_policy` | no | `auto` (default), `copy`, or `hardlink`; materialize the model payload into the final bundle. |
@@ -47,6 +47,13 @@ SE example:
 
 ```text
 /sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/enhance.py framework=pytorch model_framework=custom model_name=organization__enhancer task_type=se fixture=/path/to/fixture/se
+```
+
+SD and SA-ASR examples:
+
+```text
+/sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/diarize.py framework=pytorch model_framework=custom model_name=organization__diarizer task_type=sd fixture=/path/to/fixture/sd
+/sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/sa_asr.py framework=pytorch model_framework=custom model_name=organization__sa_asr task_type=sa_asr fixture=/path/to/fixture/sa_asr
 ```
 
 ## Boundaries
@@ -131,7 +138,7 @@ Inspect the static dependency closure:
 
 `detect_framework.py` blocks only when static evidence cannot establish PyTorch as the primary computation framework. A non-Transformers PyTorch model remains `status=ready`; the script writes `architecture_clarification` and any detected architecture signals, and the final verdict carries the same review information.
 
-`prepare_fixture.py` copies both the selected audio and its same-stem `.expected.json`, writes `gt.jsonl` before the fixture gate runs, and records SHA256 for all three. For KWS it copies only `gt.jsonl` and its referenced nested audio paths, requires unique keys and explicit polarity, normalizes `expected_detected` / `expected_keyword`, derives WAV duration when needed, and records each file hash plus a fixture-tree identity. For SE it copies only the 1 to 5 explicitly referenced noisy/clean pairs, normalizes `audio` to the noisy role while preserving `reference_audio`, rejects path escape/symlink inputs, and hashes both roles plus the complete fixture tree. Model predictions and equivalence baselines are never accepted as ground truth.
+`prepare_fixture.py` copies both the selected audio and its same-stem `.expected.json`, writes `gt.jsonl` before the fixture gate runs, and records SHA256 for all three. For KWS it copies only `gt.jsonl` and its referenced nested audio paths, requires unique keys and explicit polarity, normalizes `expected_detected` / `expected_keyword`, derives WAV duration when needed, and records each file hash plus a fixture-tree identity. For SE it copies only the 1 to 5 explicitly referenced noisy/clean pairs, normalizes `audio` to the noisy role while preserving `reference_audio`, rejects path escape/symlink inputs, and hashes both roles plus the complete fixture tree. For SD/SA-ASR it copies 1 to 5 keyed audio rows, preserves structured reference segments only in staged `gt.jsonl`, and rejects duplicate keys, path escape, symlinks, or malformed segments. Model predictions and equivalence baselines are never accepted as ground truth.
 
 Materialize the source image with the resolved policy:
 
@@ -202,9 +209,15 @@ For KWS, expose `kws_predict` with `audio_path`, optional `keywords` (`string` o
 
 For SE, expose `enhance_speech` with required `audio_path` and optional `output_path`, and return `{audio_path: string}`. When `output_path` is supplied, write the enhanced PCM WAV there. Validation always supplies a deterministic path below `SURE_VALIDATE_ARTIFACTS_DIR/outputs`; returned files outside that writable directory, empty files, symlinks, or unreadable/non-PCM WAVs fail.
 
-The adapter image always bakes `/opt/sure_trans/mcp_smoke.py` (copied by `scaffold_adapter.py`). All MCP protocol verification runs that deterministic driver: it spawns `server.py`, drives `initialize` / `tools/list` / `tools/call` / `shutdown` over stdin with bounded deadlines, and writes `mcp_smoke.json` evidence. KWS runs it with `--fixture-gt-jsonl <fixture>/gt.jsonl --tool kws_predict`; the driver calls every bounded row and proves both polarities. SE uses the same fixture flag with `--tool enhance_speech`; the driver passes every noisy input, assigns a writable `outputs/` path, and hashes noisy, clean, and enhanced audio. Evidence records portable fixture-relative names and SHA256 values rather than host audio paths; finalization also projects run/model/repository roots out of `mcp_result.json`. Never write ad-hoc MCP test scripts, and never start the server bare without driving requests — a bare server waits on stdin forever. The MCP stdout channel must stay a pure JSON-RPC stream: the generated `server.py` redirects model-library stdout to stderr during `tools/call`, and `mcp_smoke.py` skips stray non-JSON stdout lines while reading responses (recording them as `stdout_junk_*` evidence) — model loading progress prints must never corrupt the protocol.
+For SD, expose `diarize` with only `audio_path` and return `{segments: [...]}`. Each segment requires finite numeric `start >= 0`, finite `end > start`, and a non-empty `speaker`. An empty segments array is valid for all-silence audio.
 
-Equivalence is decided by the gate, not by the command. Write `equivalence_result.json` with `baseline_output` and `adapter_output` as paths to recorded output documents. KWS files use keyed structured results. SE files use `{rows: [{key, result: {audio_path}}]}`; the gate aligns keys and compares audio content, never path strings. For integer PCM WAVs it requires matching format/frame metadata and permits at most one integer PCM LSB per sample. If either file is not comparable integer PCM WAV, equivalence falls back to exact content SHA256. Comparison evidence records parameters, tolerance, hashes, and mismatch keys without embedding audio paths. An exit code alone never proves equivalence.
+For SA-ASR, expose `transcribe_with_speakers` with only `audio_path` and return a non-empty `{segments: [...]}`. Each segment follows the SD fields and additionally requires non-empty `text`. The output schemas are `schemas/sd_output.schema.json` and `schemas/sa_asr_output.schema.json`; runtime gates additionally enforce finite values, `end > start`, and non-whitespace strings.
+
+Never pass fixture reference segments to `ModelWrapper.predict` or MCP `tools/call`. The generated validation and smoke drivers read references only to validate fixture integrity and align output keys; model arguments contain exactly `audio_path` for SD and SA-ASR.
+
+The adapter image always bakes `/opt/sure_trans/mcp_smoke.py` (copied by `scaffold_adapter.py`). All MCP protocol verification runs that deterministic driver: it spawns `server.py`, drives `initialize` / `tools/list` / one `tools/call` per fixture row / `shutdown` over stdin with bounded deadlines, and writes `mcp_smoke.json` evidence. KWS proves both polarities; SE assigns and hashes generated audio; SD and SA-ASR validate every structured result while passing only `audio_path`. Evidence records portable fixture-relative names and SHA256 values rather than host audio paths; finalization also projects run/model/repository roots out of `mcp_result.json`. Never write ad-hoc MCP test scripts, and never start the server bare without driving requests — a bare server waits on stdin forever. The MCP stdout channel must stay a pure JSON-RPC stream: the generated `server.py` redirects model-library stdout to stderr during `tools/call`, and `mcp_smoke.py` skips stray non-JSON stdout lines while reading responses (recording them as `stdout_junk_*` evidence) — model loading progress prints must never corrupt the protocol.
+
+Equivalence is decided by the gate, not by the command. Write `equivalence_result.json` with `baseline_output` and `adapter_output` as paths to recorded output documents. KWS files use keyed structured results. SE files use `{rows: [{key, result: {audio_path}}]}` and compare audio content. SD/SA-ASR files use keyed `{rows:[{key,result:{segments:[...]}}]}`; the gate compares the complete result JSON for every key, including ordering and extension fields, after validating the segment schema. An exit code alone never proves equivalence.
 
 ## Image Packaging
 
@@ -240,6 +253,8 @@ GPU-touching work never runs `docker run --gpus all` on the login node. Gates su
 ```
 
 For KWS, replace the smoke command's `--audio ...` with `--fixture-gt-jsonl /fixture/kws/gt.jsonl --tool kws_predict`. For SE use `--fixture-gt-jsonl /fixture/se/gt.jsonl --tool enhance_speech`. A single KWS audio cannot satisfy the positive/negative gate.
+
+For SD use `--fixture-gt-jsonl /fixture/sd/gt.jsonl --tool diarize`. For SA-ASR use `--fixture-gt-jsonl /fixture/sa_asr/gt.jsonl --tool transcribe_with_speakers`. Both commands call every bounded row.
 
 - `vc submit` takes `repo:tag` only: it answers `镜像不存在` to every `repo@sha256:...` reference, however well that digest pulls with docker. Submit the tag and pass `--expect-digest`; `vc_exec.py` pulls the tag, reads back the manifest digest the registry serves for it, and refuses to submit when it is not the pinned one. It records `image_ref` and `resolved_digest`, which is what the registry gate checks against `target_image_digest`. Copy both into `docker_registry_result.json` under `post_pull_smoke`. Never hand a digest-pinned reference to `vc submit`, and never write `resolved_digest` by hand.
 - Defaults: 1 GPU, 32 GiB, 8 CPUs, 1800 s poll timeout. `vc_memory_gb` and `vc_gpus` from the slash command override the memory/GPU defaults; the partition defaults to `<vc_default_partition>`.
@@ -299,7 +314,7 @@ Write a successful `verdict.json`, then run:
 
 This seals the already-staged model payload, adapter, and small evidence under `sure/models/<model_name>/`. The sealed bundle matches the `/sure_onboard` product layout: wrapper set plus `Dockerfile.sure` at the bundle root, `fixture/<task>/` with `gt.jsonl`, and `artifacts/` carrying `package_gate.json` (`sure.onboard.package_gate.v2`), `artifact_manifest.json` (`sure.onboard.artifact_manifest.v1`), `runtime_inventory.json`, `verdict.json`, `docker_registry_result.json`, and `deployment_ready.json` (`sure.onboard.deployment_ready.v1`, written identically to the run directory). Ready bundles declare `integrity_profile=manifest-complete-v1` and `weights_integrity=bundled`; the deployment hashes cover every required wrapper, fixture, evidence file, generated sample output, and staged payload file. The terminal gate re-verifies the payload manifest, terminal timeline, hashes, bundle identity, portable paths, Dockerfile hash, and digest-pinned execution policy.
 
-The generated `validate.py` keeps the same CLI contract as `/sure_onboard`: `--stage import|load|infer|contract|all`, writing `<stage>_result.json` and, during infer, `sample_output.json` into `SURE_VALIDATE_ARTIFACTS_DIR`, then validating that sample against the filled `io_contract` in the contract stage — from the same directory. KWS and SE evaluate every bounded fixture row and write keyed `{rows: [{key, result}...]}` documents. SE generated audio, like TTS/VC output, must live below `$SURE_VALIDATE_ARTIFACTS_DIR/outputs`; finalization promotes every file and rewrites its path into the bundle. The adapter image embeds the locked Harness Runtime; `runtime_inventory.harness_runtime.required=true`, so `/sure_eval` uses the image binding and does not mount the repository Harness Runtime into the model container.
+The generated `validate.py` keeps the same CLI contract as `/sure_onboard`: `--stage import|load|infer|contract|all`, writing `<stage>_result.json` and, during infer, `sample_output.json` into `SURE_VALIDATE_ARTIFACTS_DIR`, then validating that sample against the filled `io_contract` in the contract stage — from the same directory. KWS, SE, SD, and SA-ASR evaluate every bounded fixture row and write keyed `{rows: [{key, result}...]}` documents. SD permits an empty result segments array only when the PCM WAV is proven to contain pure silence; SA-ASR does not. The adapter image embeds the locked Harness Runtime; `runtime_inventory.harness_runtime.required=true`, so `/sure_eval` uses the image binding and does not mount the repository Harness Runtime into the model container.
 
 After completion, run evaluation locally or through VC without changing the model protocol:
 
@@ -342,6 +357,7 @@ what you recorded.
 - Block when the adapter reloads a large model for every sample without explicit acceptance.
 - Block KWS when the fixture lacks unique keyed positive and negative samples, or when any result omits/mistypes `detected`, `keyword`, or `score`.
 - Block SE when any fixture row lacks a safe noisy/clean pair, when generated audio escapes validation outputs, or when PCM/content equivalence exceeds the declared tolerance.
+- Block SD/SA-ASR on duplicate keys, unsafe audio paths, malformed segments, reference leakage into model arguments, missing output keys, or any full-structure equivalence mismatch. SD alone permits an empty segments array for all-silence audio.
 - Block when MCP output differs from original inference on the fixture: the equivalence gate compares the two recorded output files itself and fails on a mismatch even when the command exited 0.
 - Block when the MCP gate has no `mcp_smoke.json` protocol evidence (initialize/tools/list/tools/call all passed with a non-empty task primary output; a `*_path` output must name a file the smoke can stat); placeholder `run_command` values such as `/bin/true` or `print(...)` are rejected.
 - Block when registry push, digest resolution, exact pull, or post-pull MCP validation fails.

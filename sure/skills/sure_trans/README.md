@@ -11,7 +11,7 @@
 | Digest 固定 | 所有交接引用使用 `image@sha256:...`,禁止可变 tag;registry push 后必须按 digest 精确 pull 并复验。 |
 | 站点解析交付 | source/adapter 仓库由活动站点策略统一解析,agent 不拼接 namespace;解析结果和策略身份写入 `trans_input_resolved.json`。 |
 | Container-only | Eval 运行时完全在容器内:`host_python_fallback=false`、`image_override_allowed=false`,模型 payload 以只读方式挂载。 |
-| IO contract | 按任务生成。ASR 使用 `text`;KWS 使用 `kws_predict` 和 `detected/keyword/score`;SE 使用 `enhance_speech(audio_path, output_path?) -> audio_path`。生成音频必须位于 validation `outputs/`。 |
+| IO contract | 按任务生成。ASR 使用 `text`;KWS 使用 `kws_predict` 和 `detected/keyword/score`;SE 使用 `enhance_speech(audio_path, output_path?) -> audio_path`;SD 使用 `diarize -> segments`;SA-ASR 使用 `transcribe_with_speakers -> segments`。 |
 | 模型 bundle | 最终交接目录 `sure/models/<model_name>/`:wrapper 五件套 + `Dockerfile.sure` + 模型 payload + `fixture/<task>/` + `artifacts/` terminal sidecar。`/sure_eval` 只挂载该目录,外部绝对路径不是可执行交接。 |
 
 ## 参数
@@ -23,12 +23,12 @@
 | `inference_entrypoint` | 是 | 既有推理入口绝对路径,别名 `inference_code`。 |
 | `framework` | 是 | 计算框架，必须为 `pytorch`；接受 `torch` 别名。 |
 | `model_framework` | 是 | 模型实现框架，推荐 `transformers`，也可填写 `wenet`、`funasr`、`custom` 等安全标识符。非 Transformers 不会单独阻断。 |
-| `task_type` | 否 | canonical 包含 `se`;输入别名 `speech-enhancement`、`speech_enhancement`、`speech enhancement` 会规范化为 `se`,artifact 不保存别名。 |
+| `task_type` | 否 | canonical 包含 `sd`、`sa_asr`、`se`;speaker diarization 别名规范化为 `sd`,SA-ASR/speaker-attributed ASR 别名规范化为 `sa_asr`,artifact 不保存别名。 |
 | `source_image_policy` | 否 | `auto`(默认)/`load`/`build`。`auto` 先找 build context 下的镜像 tar,失败回退 build。 |
 | `build_context` | 否 | 默认取 Dockerfile 父目录。 |
 | `image_tar` | 否 | 显式指定镜像 tar,必须位于 `build_context` 内。 |
 | `model_name` | 是 | 必须使用 `<组织>__<模型名称>` 格式；后续 bundle、镜像和 registry 命名均使用此值。 |
-| `fixture` | 否 | 冒烟输入绝对路径。KWS 使用正负 `gt.jsonl`;SE 使用 1-5 条 `{key,audio,reference_audio}` noisy/clean 配对。 |
+| `fixture` | 否 | 冒烟输入绝对路径。KWS 使用正负 `gt.jsonl`;SE 使用 1-5 条 `{key,audio,reference_audio}` noisy/clean 配对;SD/SA-ASR 使用 1-5 条 `{key,audio,segments}`。 |
 | `device` | 否 | `auto`(默认)/`cuda`/`cpu`。`cpu` 只用本地 Docker;`cuda` 和 `auto` 先通过 VC 做 GPU 验证,符合条件的 `auto` 才可回退本地 CPU。 |
 | `vc_partition` | 否 | GPU 验证分区;默认取活动站点策略的 `execution.vc_default_partition`。 |
 | `vc_memory_gb` / `vc_gpus` | 否 | GPU 验证资源覆盖;默认 32 GiB、1 GPU。 |
@@ -53,6 +53,13 @@ SE 示例:
 
 ```text
 /sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/enhance.py framework=pytorch model_framework=custom model_name=organization__enhancer task_type=se fixture=/path/to/fixture/se
+```
+
+SD 与 SA-ASR 示例:
+
+```text
+/sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/diarize.py framework=pytorch model_framework=custom model_name=organization__diarizer task_type=sd fixture=/path/to/fixture/sd
+/sure_trans dockerfile=/path/to/Dockerfile model=/path/to/model inference_entrypoint=/path/to/sa_asr.py framework=pytorch model_framework=custom model_name=organization__sa_asr task_type=sa_asr fixture=/path/to/fixture/sa_asr
 ```
 
 `examples/minimal-input.json` 是同一组参数的 JSON 形式。
@@ -133,6 +140,8 @@ sure/models/<model_name>/
 
 模型 payload(权重等文件)落在 bundle 根目录。SE 的 `fixture/se/gt.jsonl` 同时保留 noisy `audio`/`noisy_audio` 与 clean `reference_audio`;增强结果提升到 `artifacts/outputs/` 并纳入最终 hash manifest。
 
+SD/SA-ASR 的 reference segments 只保存在 `fixture/<task>/gt.jsonl`。生成的 validate 与 MCP driver 调用模型时只传 `audio_path`,不会把 reference segments 传给模型。预测写成 keyed `{rows:[{key,result:{segments:[...]}}]}`;等价 gate 对齐 key 后比较完整 result JSON,包括每个 segment 的扩展字段。
+
 ### Gate 校验点
 
 `check_artifact.py` 各 `--kind` 的语义校验与 `/sure_onboard` 的确定性脚本一一对应:
@@ -141,6 +150,7 @@ sure/models/<model_name>/
 - `framework`:静态分析必须检测到 PyTorch；Transformers 是推荐项而非硬门槛，其他模型框架必须写入架构澄清。
 - `fixture`:KWS 必须同时含正负样本、唯一 key、安全的相对音频路径和逐文件 SHA256;不能从模型输出反推 reference。
 - `fixture`:SE 必须含 1-5 条唯一 key 的安全 noisy/clean 配对,两种角色都逐文件校验 hash 且随 bundle 保留。
+- `fixture`:SD/SA-ASR 必须含 1-5 条唯一 key、安全相对音频路径和结构化 `segments`。每段要求有限 `start>=0`、`end>start`、非空 `speaker`;SA-ASR 还要求非空 `text`;SD 允许全静音的空数组。
 - `model_payload`:`destination` 必须等于 harness 拥有的 bundle 目录,外部路径复用被阻塞。
 - `adapter`:`model.py`/`__init__.py`/`validate.py`/`server.py`/`config.yaml`/`model.spec.yaml`/`dockerfile` 七类文件必须全部存在,`model.py` 不允许残留 `NotImplementedError`/`TODO`。
 - `registry`:`status=passed`、`pull_verified=true`,`target_image_ref` 与 digest 必须 digest 固定。

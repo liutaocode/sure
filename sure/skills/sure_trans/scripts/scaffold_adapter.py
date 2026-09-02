@@ -317,6 +317,20 @@ def tool_contract(task_type: str) -> tuple[str, dict]:
             },
             "required": ["audio_path"],
         }
+    if task_type == "sd":
+        return "diarize", {
+            "type": "object",
+            "properties": {"audio_path": {"type": "string", "minLength": 1}},
+            "required": ["audio_path"],
+            "additionalProperties": False,
+        }
+    if task_type == "sa_asr":
+        return "transcribe_with_speakers", {
+            "type": "object",
+            "properties": {"audio_path": {"type": "string", "minLength": 1}},
+            "required": ["audio_path"],
+            "additionalProperties": False,
+        }
     return "transcribe_audio", {"type": "object", "properties": {"audio_path": {"type": "string"}}, "required": ["audio_path"]}
 
 
@@ -375,6 +389,63 @@ def io_contract_for(task_type: str) -> dict:
             "required_fields": ["audio_path"],
             "nonempty_fields": ["audio_path"],
             "json_serializable": True,
+        }
+    if task_type == "sd":
+        return {
+            "input_type": "audio_path",
+            "output_type": "structured_segments",
+            "input": {"audio_path": "string"},
+            "output": {
+                "segments": "array<{speaker:string,start:number,end:number}>",
+                "num_speakers": "optional integer",
+            },
+            "primary_field": "segments",
+            "required_fields": ["segments"],
+            "nonempty_fields": [],
+            "allow_empty_primary": True,
+            "json_serializable": True,
+            "allow_empty_segments": "silence_only",
+            "approved_output_fields": ["num_speakers", "segments"],
+            "segment_schema": {
+                "type": "object",
+                "required": ["speaker", "start", "end"],
+                "properties": {
+                    "speaker": {"type": "string", "minLength": 1},
+                    "start": {"type": "number", "minimum": 0},
+                    "end": {"type": "number", "exclusiveMinimum": 0},
+                    "duration": {"type": "number", "exclusiveMinimum": 0},
+                },
+                "additionalProperties": False,
+            },
+        }
+    if task_type == "sa_asr":
+        return {
+            "input_type": "audio_path",
+            "output_type": "structured_segments",
+            "input": {"audio_path": "string"},
+            "output": {
+                "segments": "array<{speaker:string,start:number,end:number,text:string}>",
+                "num_speakers": "optional integer",
+            },
+            "primary_field": "segments",
+            "required_fields": ["segments"],
+            "nonempty_fields": ["segments"],
+            "allow_empty_primary": False,
+            "json_serializable": True,
+            "allow_empty_segments": False,
+            "approved_output_fields": ["num_speakers", "segments"],
+            "segment_schema": {
+                "type": "object",
+                "required": ["speaker", "start", "end", "text"],
+                "properties": {
+                    "speaker": {"type": "string", "minLength": 1},
+                    "start": {"type": "number", "minimum": 0},
+                    "end": {"type": "number", "exclusiveMinimum": 0},
+                    "duration": {"type": "number", "exclusiveMinimum": 0},
+                    "text": {"type": "string", "minLength": 1},
+                },
+                "additionalProperties": False,
+            },
         }
     return {
         "input_type": "audio_path",

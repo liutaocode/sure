@@ -21,6 +21,8 @@ for _parent in Path(__file__).resolve().parents:
 from sure.site.container_delivery import resolve_container_image, resolve_container_repository
 from sure.site.loader import load_site_policy
 
+from structured_segments import is_structured_task, structured_task_contract
+
 TASK_TYPES = {
     "asr",
     "s2tt",
@@ -109,6 +111,26 @@ def main() -> int:
     if task_type not in TASK_TYPES:
         print(f"LOAD_MODEL_INPUT gate: unsupported task_type={task_type!r}", file=sys.stderr)
         return 1
+
+    if is_structured_task(task_type):
+        expected_contract = structured_task_contract(task_type)
+        if data.get("task_contract") != expected_contract:
+            print(
+                "LOAD_MODEL_INPUT gate: SD/SA-ASR requires the canonical structured segments task_contract.",
+                file=sys.stderr,
+            )
+            return 1
+        normalized = data.get("normalized_model_input")
+        if not isinstance(normalized, dict) or any(
+            normalized.get(field) != expected_contract[field]
+            for field in ("tool_name", "predict_method", "io_contract")
+        ):
+            print(
+                "LOAD_MODEL_INPUT gate: normalized MODEL_INPUT must expose the canonical "
+                "SD/SA-ASR method and io_contract.",
+                file=sys.stderr,
+            )
+            return 1
 
     deployment_type = data.get("deployment_type")
     if deployment_type not in DEPLOYMENT_TYPES:

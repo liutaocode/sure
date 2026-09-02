@@ -12,6 +12,8 @@
 		"output_summary": { "type": "string" },
 		"sample_output_path": { "type": "string" },
 		"sample_outputs_path": { "type": "string" },
+		"validated_sample_count": { "type": "integer", "minimum": 1, "maximum": 5 },
+		"protocol_arguments": { "type": "object" },
 		"model_dir": { "type": "string" },
 		"wrapper_path": { "type": "string" },
 		"validate_py": { "type": "string" },

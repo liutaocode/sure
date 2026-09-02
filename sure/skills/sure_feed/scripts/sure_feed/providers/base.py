@@ -9,7 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from sure_feed.fixture_registry import select_fixture_for_task
+from sure_feed.fixture_registry import io_contract_for_task, select_fixture_for_task
 
 
 NETWORK_ERROR_TYPES = (TimeoutError, socket.timeout, urllib.error.URLError)
@@ -54,6 +54,8 @@ def canonical_task(task: str) -> str:
         "speaker-aware-asr": "sa_asr",
         "speaker-aware asr": "sa_asr",
         "speaker-attributed speech recognition": "sa_asr",
+        "speaker attributed asr": "sa_asr",
+        "sa asr": "sa_asr",
         "transcribe-diarize": "sa_asr",
         "transcribe diarize": "sa_asr",
         "speech-translation": "s2tt",
@@ -71,6 +73,11 @@ def canonical_task(task: str) -> str:
         "emotion-recognition": "ser",
         "speech-emotion-recognition": "ser",
         "speaker-diarization": "sd",
+        "speaker diarization": "sd",
+        "speaker diarisation": "sd",
+        "speaker-diarisation": "sd",
+        "diarization": "sd",
+        "diarisation": "sd",
         "gender-recognition": "gr",
     }
     return aliases.get(value, value.replace("-", "_") if value == "sa-asr" else value)
@@ -244,10 +251,14 @@ def _narrow_task_from_research(
     )
     diarization_terms = (
         "speaker diarization",
+        "speaker-diarization",
         "diarization",
         "diarisation",
         "diarize",
         "diarise",
+        "diar_",
+        "diar-",
+        "sortformer",
         "transcribe-diarize",
         "transcribe diarize",
     )
@@ -260,6 +271,15 @@ def _narrow_task_from_research(
     has_transcription = _contains_any(combined, transcription_terms)
     has_diarization = _contains_any(combined, diarization_terms)
     has_speaker_attribution = _contains_any(combined, speaker_attributed_terms)
+    joint_transcription_diarization_fields = [
+        field
+        for field, value in haystack.items()
+        if _contains_any(value, transcription_terms)
+        and (
+            _contains_any(value, diarization_terms)
+            or _contains_any(value, speaker_attributed_terms)
+        )
+    ]
     enhancement_terms = TASK_KEYWORDS["se"]
     voice_conversion_terms = TASK_KEYWORDS["vc"]
     has_enhancement = _contains_any(combined, enhancement_terms)
@@ -284,15 +304,22 @@ def _narrow_task_from_research(
         ev.append(evidence(source, "task_narrowing.no_narrower_task", True, "medium", url))
         return None, 0.0, ev, None
 
-    if has_transcription and (has_diarization or has_speaker_attribution):
+    if has_speaker_attribution or joint_transcription_diarization_fields:
         if target in {"auto", "sa_asr", "speech_understanding"}:
-            for field in ("model_id", "tags", "model_card"):
-                value = haystack.get(field, "")
+            for field, value in haystack.items():
                 lowered = value.lower()
                 if _contains_any(lowered, transcription_terms) and (
                     _contains_any(lowered, diarization_terms) or _contains_any(lowered, speaker_attributed_terms)
                 ):
-                    ev.append(evidence(source, field, value[:500], "strong" if field != "model_card" else "medium", url))
+                    ev.append(
+                        evidence(
+                            source,
+                            field,
+                            value[:500],
+                            "strong" if field in {"model_id", "tags", "tasks"} else "medium",
+                            url,
+                        )
+                    )
             ev.append(
                 evidence(
                     source,
@@ -305,6 +332,18 @@ def _narrow_task_from_research(
             return "sa_asr", 0.98, ev, "research_narrowing"
 
     if has_diarization and target in {"auto", "sd", "speech_understanding"}:
+        for field, value in haystack.items():
+            if _contains_any(value, diarization_terms):
+                ev.append(
+                    evidence(
+                        source,
+                        field,
+                        value[:500],
+                        "strong" if field in {"model_id", "tags", "tasks"} else "medium",
+                        url,
+                    )
+                )
+                break
         ev.append(evidence(source, "task_narrowing.final_task", "sd", "strong", url))
         return "sd", 0.93, ev, "research_narrowing"
 
@@ -330,6 +369,23 @@ def infer_task(candidate: dict[str, Any], requested_task: str) -> tuple[bool, st
         value.strip().lower().replace("_", "-") == "audio-to-audio"
         for value in task_values
     )
+    specialized, specialized_score, specialized_ev, specialized_source = (
+        _narrow_task_from_research(
+            candidate,
+            pipeline_task or "",
+            target,
+            source,
+            url,
+        )
+    )
+    if specialized in {"sa_asr", "sd"}:
+        return (
+            True,
+            specialized,
+            specialized_score,
+            specialized_ev,
+            specialized_source or "research_narrowing",
+        )
     if has_broad_audio_tag:
         narrowed, score, narrowing_ev, match_source = _narrow_task_from_research(
             candidate,
@@ -392,6 +448,16 @@ def infer_task(candidate: dict[str, Any], requested_task: str) -> tuple[bool, st
 
 def task_defaults(task: str) -> dict[str, Any]:
     normalized = canonical_task(task)
+    if normalized in {"sd", "sa_asr"}:
+        method = "diarize" if normalized == "sd" else "transcribe_with_speakers"
+        fixture_task = "sd" if normalized == "sd" else "sa_asr"
+        return {
+            "io_contract": io_contract_for_task(normalized),
+            "infer_test": (
+                f"model.{method}('fixtures/tasks/{fixture_task}/"
+                "librispeech_2spk_smoke/librispeech_2spk_001.wav')"
+            ),
+        }
     if normalized == "tts":
         return {
             "io_contract": {
@@ -640,6 +706,8 @@ def _derive_entrypoints(
             ".convert(",
             ".enhance(",
             ".denoise(",
+            ".diarize(",
+            "transcribe_with_speakers(",
             ".infer(",
             "pipeline(",
         ),

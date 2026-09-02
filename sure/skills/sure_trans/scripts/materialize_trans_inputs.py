@@ -38,7 +38,7 @@ MODEL_FRAMEWORK_ALIASES = {
 }
 MODEL_FRAMEWORK = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
-TASK_TYPES = {"asr", "kws", "s2tt", "se", "tts", "vc"}
+TASK_TYPES = {"asr", "kws", "s2tt", "sa_asr", "sd", "se", "tts", "vc"}
 TASK_TYPE_ALIASES = {
     "acoustic noise suppression": "se",
     "acoustic-noise-suppression": "se",
@@ -46,6 +46,28 @@ TASK_TYPE_ALIASES = {
     "speech enhancement": "se",
     "speech-enhancement": "se",
     "speech_enhancement": "se",
+    "diarization": "sd",
+    "diarisation": "sd",
+    "speaker diarization": "sd",
+    "speaker diarisation": "sd",
+    "speaker-diarization": "sd",
+    "speaker_diarization": "sd",
+    "speaker_diarisation": "sd",
+    "sa asr": "sa_asr",
+    "sa-asr": "sa_asr",
+    "speaker attributed asr": "sa_asr",
+    "speaker-attributed-asr": "sa_asr",
+    "speaker-attributed asr": "sa_asr",
+    "speaker_attributed_asr": "sa_asr",
+    "speaker aware asr": "sa_asr",
+    "speaker-aware-asr": "sa_asr",
+    "speaker-aware asr": "sa_asr",
+    "speaker_aware_asr": "sa_asr",
+    "speaker-attributed speech recognition": "sa_asr",
+    "transcribe diarize": "sa_asr",
+    "transcribe-diarize": "sa_asr",
+    "transcription diarization": "sa_asr",
+    "transcription-diarization": "sa_asr",
 }
 TASK_MARKERS = {
     "asr": ("asr", "transcribe", "speech recognition", "speech_recognition"),
@@ -60,6 +82,34 @@ TASK_MARKERS = {
         "wake_word",
         "hotword",
         "kws_predict",
+    ),
+    "sa_asr": (
+        "sa-asr",
+        "sa_asr",
+        "speaker attributed",
+        "speaker-attributed",
+        "speaker_attributed",
+        "speaker aware asr",
+        "speaker-aware asr",
+        "speaker_aware_asr",
+        "transcribe_with_speakers",
+        "transcribe diarize",
+        "transcribe-diarize",
+        "transcribe_diarize",
+        "transcription diarization",
+        "transcription-diarization",
+        "transcription_diarization",
+    ),
+    "sd": (
+        "speaker diarization",
+        "speaker-diarization",
+        "speaker_diarization",
+        "speaker diarisation",
+        "speaker_diarisation",
+        "diarization",
+        "diarisation",
+        "diarize",
+        "diarise",
     ),
     "se": (
         "speech enhancement",
@@ -114,11 +164,27 @@ def resolve_task_type(explicit: str | None, inference_entrypoint: Path, model_pa
             raise ValueError(f"unsupported task type {explicit!r}; expected one of {sorted(TASK_TYPES)}")
         return task_type
     source = inference_entrypoint.read_text(encoding="utf-8", errors="replace")[:2_000_000].lower()
-    corpus = f"{inference_entrypoint} {model_path} {source}"
+    corpus = f"{inference_entrypoint} {model_path} {source}".lower()
     scores = {
         task_type: sum(corpus.count(marker) for marker in markers)
         for task_type, markers in TASK_MARKERS.items()
     }
+    if scores["sa_asr"] > 0 and any(
+        marker in corpus
+        for marker in (
+            "transcribe_with_speakers",
+            "speaker attributed",
+            "speaker-attributed",
+            "speaker_attributed",
+            "transcribe diarize",
+            "transcribe-diarize",
+            "transcribe_diarize",
+            "transcription diarization",
+            "transcription-diarization",
+            "transcription_diarization",
+        )
+    ):
+        return "sa_asr"
     if scores["asr"] > 0 and scores["kws"] > 0:
         terminal_asr = any(
             marker in source
@@ -140,7 +206,8 @@ def resolve_task_type(explicit: str | None, inference_entrypoint: Path, model_pa
     winners = [task_type for task_type, score in scores.items() if score == highest and score > 0]
     if len(winners) != 1:
         raise ValueError(
-            "task_type could not be inferred unambiguously; pass task_type=asr|kws|s2tt|se|tts|vc"
+            "task_type could not be inferred unambiguously; pass "
+            "task_type=asr|kws|s2tt|sa_asr|sd|se|tts|vc"
         )
     return winners[0]
 

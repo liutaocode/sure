@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from sure_feed.fixture_registry import io_contract_for_task
+
 
 class BridgeError(ValueError):
     """Raised when an XForge-to-SURE bridge manifest is invalid."""
@@ -167,9 +169,19 @@ def _modelscope_model_url(source: dict[str, Any]) -> str:
 
 def _canonical_task_type(task_type: str) -> str:
     value = str(task_type or "").strip().lower()
-    normalized = value.replace("-", "_")
+    normalized = value.replace("-", "_").replace(" ", "_")
     if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
+    if normalized in {
+        "sa_asr",
+        "saasr",
+        "speaker_attributed_asr",
+        "speaker_aware_asr",
+        "transcribe_diarize",
+    }:
+        return "sa_asr"
+    if normalized in {"sd", "speaker_diarization", "speaker_diarisation", "diarization", "diarisation"}:
+        return "sd"
     return value
 
 
@@ -180,6 +192,8 @@ def _sure_task_name(task_type: str) -> str:
         "slu": "SLU",
         "gr": "GR",
         "ser": "SER",
+        "sd": "SD",
+        "sa_asr": "SA-ASR",
         "tts": "TTS",
         "se": "SE",
     }
@@ -193,6 +207,8 @@ def _default_tool_name(task_type: str) -> str:
         "slu": "slu_understand",
         "gr": "gender_recognize",
         "ser": "emotion_recognize",
+        "sd": "diarize",
+        "sa_asr": "transcribe_with_speakers",
         "tts": "tts_synthesize",
         "kws": "kws_predict",
         "se": "enhance_speech",
@@ -202,6 +218,8 @@ def _default_tool_name(task_type: str) -> str:
 
 def _io_contract_for_task(task_type: str) -> dict[str, Any]:
     task = task_type.lower()
+    if task in {"sd", "sa_asr"}:
+        return {"input_field": "audio_path", **io_contract_for_task(task)}
     if task == "tts":
         return {
             "input_field": "text",
@@ -241,6 +259,12 @@ def _io_contract_for_task(task_type: str) -> dict[str, Any]:
 
 def _tool_input_schema_for_task(task_type: str) -> dict[str, Any]:
     task = task_type.lower()
+    if task in {"sd", "sa_asr"}:
+        return {
+            "type": "object",
+            "properties": {"audio_path": {"type": "string"}},
+            "required": ["audio_path"],
+        }
     if task == "kws":
         return {
             "type": "object",
@@ -295,6 +319,33 @@ def _default_model_spec_yaml(
     model_id = model_root.name
     task_type = _canonical_task_type(str(manifest["task_type"]))
     io_contract = _io_contract_for_task(task_type)
+    extra_contract_lines = [
+        f"  {field}: {json.dumps(io_contract[field], ensure_ascii=False, separators=(',', ':'))}"
+        for field in (
+            "input",
+            "output",
+            "allow_empty_primary",
+            "allow_empty_segments",
+            "approved_output_fields",
+            "segment_schema",
+        )
+        if field in io_contract
+    ]
+    required_field_lines = [
+        "  required_fields:",
+        *[f"    - {_yaml_string(field)}" for field in io_contract["required_fields"]],
+    ]
+    nonempty_field_lines = (
+        [
+            "  nonempty_fields:",
+            *[
+                f"    - {_yaml_string(field)}"
+                for field in io_contract["nonempty_fields"]
+            ],
+        ]
+        if io_contract["nonempty_fields"]
+        else ["  nonempty_fields: []"]
+    )
     local_path = None
     if weights_manifest:
         local_path = _path_for_spec(weights_manifest.get("resolved_local_model_path"), model_root)
@@ -338,10 +389,9 @@ def _default_model_spec_yaml(
         f"  input_type: {_yaml_string(io_contract['input_type'])}",
         f"  output_type: {_yaml_string(io_contract['output_type'])}",
         f"  primary_field: {_yaml_string(io_contract['primary_field'])}",
-        "  required_fields:",
-        *[f"    - {_yaml_string(field)}" for field in io_contract["required_fields"]],
-        "  nonempty_fields:",
-        *[f"    - {_yaml_string(field)}" for field in io_contract["nonempty_fields"]],
+        *required_field_lines,
+        *nonempty_field_lines,
+        *extra_contract_lines,
         "  json_serializable: true",
         "acceptance:",
         "  must_import: true",
@@ -368,7 +418,7 @@ def _default_config_yaml(
     io_contract = _io_contract_for_task(task_type)
     input_field = io_contract["input_field"]
     input_description = "Text to synthesize" if input_field == "text" else "Path to an audio file"
-    if task_type in {"kws", "se"}:
+    if task_type in {"kws", "se", "sd", "sa_asr"}:
         input_schema_block = (
             "    input_schema: "
             + json.dumps(_tool_input_schema_for_task(task_type), ensure_ascii=False, separators=(",", ":"))
@@ -533,6 +583,19 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         raise NotImplementedError("SURE tool-agent must implement speech enhancement inference.")'''
         result_fields = '''    audio_path: str = ""
     raw: dict[str, Any] | None = None'''
+    elif task_type in {"sd", "sa_asr"}:
+        task_label = "SD" if task_type == "sd" else "SA-ASR"
+        method = "diarization" if task_type == "sd" else "speaker-attributed transcription"
+        predict_body = f'''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            raise ValueError("audio_path is required")
+        if not Path(audio_path).is_file():
+            raise FileNotFoundError(audio_path)
+        if not self.model_loaded:
+            self.load()
+        raise NotImplementedError("SURE tool-agent must implement {task_label} {method} inference.")'''
+        result_fields = '''    segments: list[dict[str, Any]] = field(default_factory=list)
+    raw: dict[str, Any] | None = None'''
     else:
         predict_body = '''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
         if not audio_path:
@@ -556,7 +619,7 @@ repository and its README/code.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -603,7 +666,7 @@ def _default_server_py(task_type: str) -> str:
     )
     content_value = (
         "json.dumps(result, ensure_ascii=False)"
-        if task_type.lower() in {"kws", "se"}
+        if task_type.lower() in {"kws", "se", "sd", "sa_asr"}
         else f'str(result.get("{content_field}", ""))'
     )
     return f'''#!/usr/bin/env python3

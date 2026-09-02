@@ -39,7 +39,7 @@ def _load_samples(jsonl_path: Path) -> list[dict[str, Any]]:
 
 
 def _default_metric(task: str | None, language: str | None) -> str:
-    task_name = (task or "").upper()
+    task_name = (task or "").upper().replace("_", "-")
     language_name = (language or "").lower()
     if task_name in {"SER", "GR", "SLU"}:
         return "accuracy"

@@ -24,6 +24,7 @@ from deployment_contract import (
 from write_package_gate import write_package_gate
 from write_runtime_inventory import write_inventory
 from write_verdict import write_verdict
+from structured_segments import is_structured_task, validate_structured_rows
 
 
 CORE_TERMINAL_ARTIFACTS = (
@@ -208,6 +209,44 @@ def validate_portable_se_sample_output(model_dir: Path, sample_output: Path) -> 
         raise ValueError(f"SE sample_output audio_path is missing from model outputs: {value}")
 
 
+def validate_structured_sample_outputs(model_dir: Path, *, task: str) -> None:
+    sample_output_path = model_dir / "artifacts" / "sample_output.json"
+    sample_outputs_path = model_dir / "artifacts" / "sample_outputs.jsonl"
+    fixture_manifest_path = model_dir / "artifacts" / "fixture_manifest.json"
+    for path in (sample_output_path, sample_outputs_path, fixture_manifest_path):
+        if not path.is_file():
+            raise ValueError(f"ready SD/SA-ASR bundle is missing artifacts/{path.name}")
+    rows: list[dict[str, Any]] = []
+    for line_no, line in enumerate(sample_outputs_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{sample_outputs_path}:{line_no} must be a JSON object")
+        rows.append(row)
+    fixture_manifest = read_json(fixture_manifest_path)
+    violations: list[str] = []
+    if canonical_task(fixture_manifest.get("task_type")) != task:
+        violations.append("fixture manifest task_type disagrees with SD/SA-ASR bundle task")
+    fixture_root = Path(str(fixture_manifest.get("staged_dir") or "")).expanduser()
+    if not fixture_root.is_absolute() or not fixture_root.is_dir():
+        violations.append("fixture manifest staged_dir must be an existing absolute directory")
+        fixture_root = None
+    violations.extend(
+        validate_structured_rows(
+            rows,
+            task=task,
+            samples=fixture_manifest.get("samples"),
+            fixture_root=fixture_root,
+        )
+    )
+    first_output = read_json(sample_output_path)
+    if rows and rows[0].get("output") != first_output:
+        violations.append("sample_output.json must equal the first structured output row")
+    if violations:
+        raise ValueError("invalid SD/SA-ASR bundled sample evidence: " + "; ".join(violations))
+
+
 def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]:
     manifest_path = model_dir / "artifacts" / "artifact_manifest.json"
     manifest = read_json(manifest_path)
@@ -259,6 +298,12 @@ def update_manifest(model_dir: Path, resolved: dict[str, Any]) -> dict[str, Any]
         required["sample_output_json"] = {
             "path": "artifacts/sample_output.json",
             "description": "Bounded inference sample output.",
+        }
+    if is_structured_task(task):
+        validate_structured_sample_outputs(model_dir, task=task)
+        required["sample_outputs_jsonl"] = {
+            "path": "artifacts/sample_outputs.jsonl",
+            "description": "Bounded structured inference outputs for every fixture row.",
         }
     output_files = bundled_output_files(model_dir, require_pcm_wav=task == "se")
     if ready_profile and task == "se" and not output_files:

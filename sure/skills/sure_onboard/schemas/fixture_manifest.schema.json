@@ -13,7 +13,7 @@
 		"source_dir": { "type": "string" },
 		"staged_dir": { "type": "string" },
 		"gt_jsonl": { "type": "string" },
-		"sample_count": { "type": "number" },
+		"sample_count": { "type": "integer", "minimum": 1, "maximum": 5 },
 		"link_policy": { "type": "string", "enum": ["copy"] },
 		"samples": {
 			"type": "array",
@@ -26,12 +26,14 @@
 					"audio_path": { "type": "string" },
 					"duration_sec": { "type": "number" },
 					"sample_rate": { "type": "number" },
+					"audio_is_silence": { "type": "boolean" },
 					"annotation_fields": { "type": "array", "items": { "type": "string" } }
 				},
 				"additionalProperties": true
 			}
 		},
 		"validation_payload_env": { "type": "string" },
+		"validation_protocol_env": { "type": ["string", "null"] },
 		"notes": { "type": "string" }
 	},
 	"additionalProperties": false

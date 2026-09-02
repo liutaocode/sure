@@ -445,7 +445,7 @@ class KwsTransTests(unittest.TestCase):
                 json.dumps({"status": "passed", "log_path": "/shared-storage/private/log.txt"}),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "shared-storage"):
+            with self.assertRaisesRegex(ValueError, "non-portable"):
                 finalize_trans_bundle.project_mcp_result(
                     source,
                     destination,

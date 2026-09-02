@@ -9,16 +9,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from structured_segments import (
+    STRUCTURED_MANIFEST_SAMPLE_FIELDS,
+    canonical_task,
+    is_structured_task,
+    pcm_wav_info,
+    validate_segments,
+)
+
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def canonical_task(task: str) -> str:
-    normalized = task.replace("-", "_").lower()
-    if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
-        return "se"
-    return normalized
 
 
 def is_relative_child(path: Path, parent: Path) -> bool:
@@ -65,8 +66,14 @@ def main() -> int:
 
     model_dir = Path(str(data["model_dir"])).resolve()
     task = canonical_task(str(data["task_type"]))
-    staged_dir = Path(str(data["staged_dir"])).resolve()
-    gt_jsonl = Path(str(data["gt_jsonl"])).resolve()
+    raw_staged_dir = Path(str(data["staged_dir"])).expanduser()
+    raw_gt_jsonl = Path(str(data["gt_jsonl"])).expanduser()
+    if is_structured_task(task) and raw_staged_dir.is_symlink():
+        return fail("SD/SA-ASR staged fixture directory must not be a symlink")
+    if is_structured_task(task) and raw_gt_jsonl.is_symlink():
+        return fail("SD/SA-ASR staged gt.jsonl must not be a symlink")
+    staged_dir = raw_staged_dir.resolve()
+    gt_jsonl = raw_gt_jsonl.resolve()
 
     if not model_dir.exists():
         return fail(f"model_dir does not exist: {model_dir}")
@@ -78,6 +85,10 @@ def main() -> int:
         return fail(f"staged_dir must be under model_dir/fixture/{task}: {staged_dir}")
     if not staged_dir.exists() or not staged_dir.is_dir():
         return fail(f"staged_dir does not exist or is not a directory: {staged_dir}")
+    if is_structured_task(task):
+        symlinks = [entry for entry in staged_dir.rglob("*") if entry.is_symlink()]
+        if symlinks:
+            return fail(f"SD/SA-ASR staged fixture tree must not contain symlinks: {symlinks[0]}")
     if not gt_jsonl.exists():
         return fail(f"gt_jsonl does not exist: {gt_jsonl}")
     if gt_jsonl.parent.resolve() != staged_dir.resolve():
@@ -90,8 +101,9 @@ def main() -> int:
         return fail("sample_count must match len(samples)")
     if not (1 <= len(samples) <= 5):
         return fail("sample_count must be between 1 and 5")
-
     parsed_rows = []
+    allowed_structured_files = {gt_jsonl} if is_structured_task(task) else set()
+    seen_keys: set[str] = set()
     for line_no, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
             continue
@@ -110,8 +122,16 @@ def main() -> int:
         resolved_audio = (gt_jsonl.parent / audio_path).resolve()
         if not is_relative_child(resolved_audio, staged_dir):
             return fail(f"{gt_jsonl}:{line_no} audio path escapes staged_dir: {audio}")
-        if not resolved_audio.exists():
+        if not resolved_audio.is_file():
             return fail(f"{gt_jsonl}:{line_no} referenced audio does not exist: {audio}")
+        if is_structured_task(task):
+            allowed_structured_files.add(resolved_audio)
+        key = str(row.get("key") or row.get("id") or audio_path.stem).strip()
+        if not key:
+            return fail(f"{gt_jsonl}:{line_no} requires a non-empty key")
+        if key in seen_keys:
+            return fail(f"{gt_jsonl}:{line_no} duplicates fixture key {key!r}")
+        seen_keys.add(key)
         reference_audio = row.get("reference_audio")
         if task == "se":
             if not isinstance(reference_audio, str) or not reference_audio:
@@ -143,10 +163,39 @@ def main() -> int:
                 return fail("SE manifest samples must preserve reference_audio")
             if Path(str(manifest_sample.get("reference_audio_path") or "")).resolve() != resolved_reference:
                 return fail("SE manifest samples must preserve resolved reference_audio_path")
+        if task == "sa_asr" and "segments" not in row:
+            return fail(f"{gt_jsonl}:{line_no} task sa_asr requires speaker-attributed segments")
+        if task == "sd" and "segments" not in row:
+            return fail(f"{gt_jsonl}:{line_no} task sd requires speaker segments")
+        if is_structured_task(task) and row.get("task") is not None and canonical_task(row["task"]) != task:
+            return fail(f"{gt_jsonl}:{line_no} declares task {row['task']!r}, expected {task!r}")
+
+        wav_info: dict[str, Any] | None = None
+        if is_structured_task(task):
+            try:
+                wav_info = pcm_wav_info(resolved_audio)
+            except ValueError as exc:
+                return fail(f"{gt_jsonl}:{line_no} {exc}")
+            segment_violations = validate_segments(
+                row.get("segments"),
+                task=task,
+                duration_sec=float(wav_info["duration_sec"]),
+                audio_is_silence=bool(wav_info["audio_is_silence"]),
+            )
+            if segment_violations:
+                return fail(
+                    f"{gt_jsonl}:{line_no} invalid {task} reference segments: "
+                    + "; ".join(segment_violations)
+                )
+
         annotation_fields = [
             field
             for field in ("ground_truth", "target_text", "text", "segments", "label", "intent")
-            if field in row and annotation_is_nonempty(row[field])
+            if field in row
+            and (
+                is_structured_task(task) and field == "segments"
+                or annotation_is_nonempty(row[field])
+            )
         ]
         if task == "se" and annotation_is_nonempty(reference_audio):
             annotation_fields.append("reference_audio")
@@ -155,12 +204,41 @@ def main() -> int:
                 f"{gt_jsonl}:{line_no} must contain at least one annotation field "
                 "(ground_truth, target_text, text, segments, label, intent, or reference_audio)"
             )
-        if task == "sa_asr" and "segments" not in row:
-            return fail(f"{gt_jsonl}:{line_no} task sa_asr requires speaker-attributed segments")
+        if is_structured_task(task):
+            if len(samples) <= len(parsed_rows):
+                return fail("samples array has fewer entries than gt.jsonl")
+            manifest_sample = samples[len(parsed_rows)]
+            if not isinstance(manifest_sample, dict):
+                return fail(f"samples[{len(parsed_rows)}] must be an object")
+            unexpected = sorted(
+                str(field)
+                for field in manifest_sample
+                if field not in STRUCTURED_MANIFEST_SAMPLE_FIELDS
+            )
+            if unexpected:
+                return fail(
+                    "structured manifest sample exposes unapproved field(s): "
+                    + ", ".join(unexpected)
+                )
+            if manifest_sample.get("key") != key:
+                return fail("structured manifest samples must preserve fixture key order")
+            if manifest_sample.get("annotation_fields") != ["segments"]:
+                return fail("structured manifest annotation_fields must equal ['segments']")
+            assert wav_info is not None
+            for field in ("duration_sec", "sample_rate", "audio_is_silence"):
+                if manifest_sample.get(field) != wav_info[field]:
+                    return fail(f"structured manifest samples must preserve actual WAV {field}")
         parsed_rows.append(row)
 
     if len(parsed_rows) != len(samples):
         return fail("samples array must mirror non-empty gt.jsonl rows")
+    if is_structured_task(task):
+        staged_files = {entry.resolve() for entry in staged_dir.rglob("*") if entry.is_file()}
+        extras = sorted(staged_files - allowed_structured_files)
+        if extras:
+            return fail(f"SD/SA-ASR staged fixture contains an unreferenced sidecar: {extras[0]}")
+        if data.get("validation_protocol_env") != "SURE_VALIDATE_PROTOCOL_JSON":
+            return fail("SD/SA-ASR fixture manifest must declare SURE_VALIDATE_PROTOCOL_JSON")
 
     discoverable = list((model_dir / "fixture").glob("**/gt.jsonl"))
     if not discoverable:

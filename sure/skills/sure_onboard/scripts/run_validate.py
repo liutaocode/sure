@@ -35,6 +35,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "runtime" / "harness"))
 from model_child_env import model_child_env
 
+from structured_segments import (
+    canonical_task,
+    is_structured_task,
+    structured_task_contract,
+    validate_structured_rows,
+)
+
 KIND_TO_PASS_KEY = {
     "import": "import_passed",
     "load": "load_passed",
@@ -236,6 +243,100 @@ def load_sample_output(data: dict, run_dir: Path) -> tuple[Path, dict]:
     return path, read_json(path)
 
 
+def sample_outputs_path_for(data: dict, run_dir: Path) -> Path | None:
+    model_dir = resolve_path(data.get("model_dir"), run_dir)
+    raw = data.get("sample_outputs_path")
+    candidates: list[Path] = []
+    if raw:
+        path = Path(str(raw)).expanduser()
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            candidates.extend((run_dir / "artifacts" / path, run_dir / path))
+            if model_dir:
+                candidates.extend((model_dir / path, model_dir / "artifacts" / path.name))
+    candidates.append(run_dir / "artifacts" / "sample_outputs.jsonl")
+    if model_dir:
+        candidates.append(model_dir / "artifacts" / "sample_outputs.jsonl")
+    return first_existing(candidates)
+
+
+def read_jsonl_objects(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}:{line_no} is not valid JSON: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_no} must be a JSON object")
+        rows.append(row)
+    return rows
+
+
+def structured_task_for(data: dict, run_dir: Path) -> str:
+    resolved_path = run_dir / "artifacts" / "model_input_resolved.json"
+    if resolved_path.is_file():
+        task = canonical_task(read_json(resolved_path).get("task_type"))
+        if is_structured_task(task):
+            return task
+    return canonical_task(data.get("task_type"))
+
+
+def fixture_manifest_for(data: dict, run_dir: Path) -> dict:
+    model_dir = resolve_path(data.get("model_dir"), run_dir)
+    candidates = [run_dir / "artifacts" / "fixture_manifest.json"]
+    if model_dir:
+        candidates.append(model_dir / "artifacts" / "fixture_manifest.json")
+    path = first_existing(candidates)
+    if path is None:
+        raise FileNotFoundError("SD/SA-ASR validation requires fixture_manifest.json")
+    return read_json(path)
+
+
+def validate_structured_evidence(data: dict, run_dir: Path) -> list[str]:
+    task = structured_task_for(data, run_dir)
+    if not is_structured_task(task):
+        return []
+    expected_contract = structured_task_contract(task)["io_contract"]
+    actual_contract = io_contract_from(data, run_dir)
+    violations: list[str] = []
+    if actual_contract != expected_contract:
+        violations.append("SD/SA-ASR io_contract must equal the canonical structured segments contract")
+    outputs_path = sample_outputs_path_for(data, run_dir)
+    if outputs_path is None:
+        return [*violations, "SD/SA-ASR validation requires sample_outputs.jsonl"]
+    try:
+        rows = read_jsonl_objects(outputs_path)
+        manifest = fixture_manifest_for(data, run_dir)
+    except (OSError, ValueError) as exc:
+        return [*violations, str(exc)]
+    if canonical_task(manifest.get("task_type")) != task:
+        violations.append("fixture manifest task_type disagrees with SD/SA-ASR validation task")
+    fixture_root = Path(str(manifest.get("staged_dir") or "")).expanduser()
+    if not fixture_root.is_absolute() or not fixture_root.is_dir():
+        violations.append("fixture manifest staged_dir must be an existing absolute directory")
+        fixture_root = None
+    violations.extend(
+        validate_structured_rows(
+            rows,
+            task=task,
+            samples=manifest.get("samples"),
+            fixture_root=fixture_root,
+        )
+    )
+    try:
+        _, first_output = load_sample_output(data, run_dir)
+    except (OSError, ValueError) as exc:
+        violations.append(str(exc))
+    else:
+        if rows and rows[0].get("output") != first_output:
+            violations.append("sample_output.json must equal the first structured output row")
+    return violations
+
+
 def io_contract_from(data: dict, run_dir: Path) -> dict:
     contract = data.get("io_contract")
     if isinstance(contract, dict):
@@ -273,7 +374,12 @@ def validate_output_contract(sample_output: dict, contract: dict) -> list[str]:
     primary_field = contract.get("primary_field")
     if isinstance(primary_field, str) and primary_field and primary_field not in required_fields:
         required_fields.append(primary_field)
-    if isinstance(primary_field, str) and primary_field and primary_field not in nonempty_fields:
+    if (
+        isinstance(primary_field, str)
+        and primary_field
+        and primary_field not in nonempty_fields
+        and contract.get("allow_empty_segments") != "silence_only"
+    ):
         nonempty_fields.append(primary_field)
 
     for field in required_fields:
@@ -553,6 +659,20 @@ def main() -> int:
         if not sample_output:
             print(f"VALIDATE_INFER gate failed: sample_output is empty: {sample_path}", file=sys.stderr)
             return 1
+        structured_violations = validate_structured_evidence(data, run_dir)
+        if structured_violations:
+            print(
+                "VALIDATE_INFER gate failed: " + "; ".join(structured_violations),
+                file=sys.stderr,
+            )
+            return 1
+        if is_structured_task(structured_task_for(data, run_dir)):
+            outputs_path = sample_outputs_path_for(data, run_dir)
+            assert outputs_path is not None
+            rows = read_jsonl_objects(outputs_path)
+            data["sample_outputs_path"] = str(outputs_path)
+            data["validated_sample_count"] = len(rows)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     if args.kind == "contract":
         try:
@@ -569,6 +689,20 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        structured_violations = validate_structured_evidence(data, run_dir)
+        if structured_violations:
+            print(
+                "VALIDATE_CONTRACT gate failed: " + "; ".join(structured_violations),
+                file=sys.stderr,
+            )
+            return 1
+        if is_structured_task(structured_task_for(data, run_dir)):
+            outputs_path = sample_outputs_path_for(data, run_dir)
+            assert outputs_path is not None
+            rows = read_jsonl_objects(outputs_path)
+            data["sample_outputs_path"] = str(outputs_path)
+            data["validated_sample_count"] = len(rows)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if data.get("io_contract_satisfied") is False:
             print(
                 "VALIDATE_CONTRACT gate failed: io_contract_satisfied is explicitly false.",

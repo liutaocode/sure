@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import select
 import subprocess
 import sys
@@ -21,12 +22,27 @@ import threading
 import time
 import wave
 from collections import deque
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 SCHEMA = "sure.trans.mcp_smoke.v1"
 STDERR_TAIL_LINES = 200
 PORTABLE_CONTAINER_ROOTS = ("/fixture/", "/models/", "/opt/", "/validation/", "/workspace/")
 KWS_OPERATING_THRESHOLD = 0.5
+SPEAKER_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
+SD_SEGMENT_FIELDS = frozenset({"speaker", "start", "end", "duration"})
+SA_ASR_SEGMENT_FIELDS = frozenset({*SD_SEGMENT_FIELDS, "text"})
+URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+REFERENCE_OUTPUT_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "reference",
+    "reference_segments",
+    "reference_text",
+    "target",
+    "target_segments",
+    "target_text",
+}
 
 
 def sha256_file(path: Path | None) -> str | None:
@@ -37,6 +53,68 @@ def sha256_file(path: Path | None) -> str | None:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def diagnostic_summary(lines: list[str]) -> dict[str, object]:
+    encoded = "\n".join(lines).encode("utf-8", errors="replace")
+    return {
+        "line_count": len(lines),
+        "utf8_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def looks_like_absolute_path_or_uri(value: str) -> bool:
+    stripped = value.strip()
+    return bool(
+        stripped
+        and (
+            URI_PREFIX.match(stripped)
+            or Path(stripped).is_absolute()
+            or PureWindowsPath(stripped).is_absolute()
+            or stripped.startswith("\\\\")
+        )
+    )
+
+
+def pcm_wav_info(path: Path) -> dict[str, object]:
+    if path.suffix.lower() != ".wav":
+        raise ValueError("structured speaker audio must be a PCM WAV")
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                raise ValueError("structured speaker audio must be a non-empty PCM WAV")
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+            sample_rate = handle.getframerate()
+            frame_count = handle.getnframes()
+            frames = handle.readframes(frame_count)
+    except (EOFError, OSError, wave.Error) as error:
+        raise ValueError(f"structured speaker audio must be a readable PCM WAV: {error}") from error
+    expected_bytes = frame_count * channels * sample_width
+    if len(frames) != expected_bytes:
+        raise ValueError(
+            f"structured speaker PCM data is truncated: expected {expected_bytes} bytes, read {len(frames)}"
+        )
+    silence_byte = b"\x80" if sample_width == 1 else b"\x00"
+    return {
+        "duration_sec": frame_count / sample_rate,
+        "sample_rate": sample_rate,
+        "audio_is_silence": bool(frames) and frames == silence_byte * len(frames),
+    }
+
+
+def pcm_wav_is_silence(path: Path) -> bool:
+    try:
+        return bool(pcm_wav_info(path)["audio_is_silence"])
+    except ValueError:
+        return False
 
 
 def portable_server_command(command: list[str]) -> list[str]:
@@ -91,6 +169,8 @@ def primary_output_field(tool: str) -> str:
         return "audio_path"
     if tool == "kws_predict":
         return "detected"
+    if tool in {"diarize", "transcribe_with_speakers"}:
+        return "segments"
     return "text"
 
 
@@ -106,6 +186,8 @@ def output_is_nonempty(primary_field: str, value: object) -> bool:
             return False
         candidate = Path(value)
         return candidate.is_file() and candidate.stat().st_size > 0
+    if primary_field == "segments":
+        return isinstance(value, list)
     if isinstance(value, str):
         return bool(value.strip())
     if isinstance(value, (list, dict)):
@@ -329,6 +411,218 @@ def validate_se_output(
     return [], resolved
 
 
+def speaker_task_for_tool(tool: str) -> str:
+    if tool == "diarize":
+        return "sd"
+    if tool == "transcribe_with_speakers":
+        return "sa_asr"
+    raise ValueError(f"unsupported structured speaker tool: {tool}")
+
+
+def forbidden_speaker_output_fields(value: object, path: str = "result") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            child = f"{path}.{key}"
+            if (
+                normalized in REFERENCE_OUTPUT_FIELDS
+                or normalized.startswith("reference_")
+                or normalized == "path"
+                or normalized.endswith("_path")
+            ):
+                found.append(child)
+            found.extend(forbidden_speaker_output_fields(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(forbidden_speaker_output_fields(item, f"{path}[{index}]"))
+    return found
+
+
+def validate_speaker_segments(
+    value: object,
+    *,
+    task: str,
+    label: str,
+    empty_sd_allowed: bool = False,
+    duration_sec: float | None = None,
+) -> list[str]:
+    violations: list[str] = []
+    if not isinstance(value, list):
+        return [f"{label} segments must be an array"]
+    if task == "sa_asr" and not value:
+        violations.append(f"{label} SA-ASR segments must not be empty")
+    if task == "sd" and not value and not empty_sd_allowed:
+        violations.append(f"{label} empty SD segments are allowed only for pure-silence audio")
+    for index, segment in enumerate(value):
+        if not isinstance(segment, dict):
+            violations.append(f"{label} segments[{index}] must be an object")
+            continue
+        approved_fields = SA_ASR_SEGMENT_FIELDS if task == "sa_asr" else SD_SEGMENT_FIELDS
+        unknown = sorted(str(field) for field in segment if field not in approved_fields)
+        if unknown:
+            violations.append(
+                f"{label} segments[{index}] contains unapproved field(s): " + ", ".join(unknown)
+            )
+        speaker = segment.get("speaker")
+        if not isinstance(speaker, str) or not speaker.strip():
+            violations.append(f"{label} segments[{index}].speaker must be a non-empty string")
+        elif looks_like_absolute_path_or_uri(speaker):
+            violations.append(f"{label} segments[{index}].speaker must be a safe token")
+        start = segment.get("start")
+        end = segment.get("end")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(float(start))
+            or float(start) < 0
+        ):
+            violations.append(f"{label} segments[{index}].start must be finite and >= 0")
+        end_valid = not (
+            isinstance(end, bool)
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(end))
+            or not isinstance(start, (int, float))
+            or isinstance(start, bool)
+            or not math.isfinite(float(start))
+            or float(end) <= float(start)
+        )
+        if not end_valid:
+            violations.append(f"{label} segments[{index}].end must be finite and > start")
+        if task == "sa_asr":
+            text = segment.get("text")
+            if not isinstance(text, str) or not text.strip():
+                violations.append(f"{label} segments[{index}].text must be a non-empty string")
+        if end_valid and duration_sec is not None and float(end) > duration_sec + 1e-6:
+            violations.append(f"{label} segments[{index}].end exceeds WAV duration {duration_sec:.6f}")
+        duration = segment.get("duration")
+        if duration is not None and (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or float(duration) <= 0
+            or not isinstance(start, (int, float))
+            or isinstance(start, bool)
+            or not math.isfinite(float(start))
+            or not isinstance(end, (int, float))
+            or isinstance(end, bool)
+            or not math.isfinite(float(end))
+            or not math.isclose(
+                float(duration), float(end) - float(start), rel_tol=0, abs_tol=1e-3
+            )
+        ):
+            violations.append(
+                f"{label} segments[{index}].duration must be finite, positive, and equal end-start"
+            )
+    return violations
+
+
+def validate_speaker_output(
+    value: object,
+    *,
+    tool: str,
+    empty_sd_allowed: bool = False,
+    duration_sec: float | None = None,
+) -> list[str]:
+    if not isinstance(value, dict):
+        return ["structured speaker output must be an object"]
+    if "segments" not in value:
+        return ["structured speaker output requires segments"]
+    task = speaker_task_for_tool(tool)
+    unknown_fields = sorted(str(field) for field in value if field not in SPEAKER_OUTPUT_FIELDS)
+    violations = [
+        f"structured speaker output must not expose reference or path field {path}"
+        for path in forbidden_speaker_output_fields(value)
+    ]
+    if unknown_fields:
+        violations.append("structured speaker output contains unapproved field(s): " + ", ".join(unknown_fields))
+    for field, item in value.items():
+        if field != "segments" and isinstance(item, str) and looks_like_absolute_path_or_uri(item):
+            violations.append(f"structured speaker output contains absolute path or URI at result.{field}")
+    violations.extend(validate_speaker_segments(
+        value.get("segments"),
+        task=task,
+        label=task.upper(),
+        empty_sd_allowed=empty_sd_allowed,
+        duration_sec=duration_sec,
+    ))
+    segments = value.get("segments")
+    num_speakers = value.get("num_speakers")
+    if num_speakers is not None:
+        observed = {
+            segment.get("speaker").strip()
+            for segment in segments
+            if isinstance(segment, dict)
+            and isinstance(segment.get("speaker"), str)
+            and segment.get("speaker").strip()
+        } if isinstance(segments, list) else set()
+        if (
+            isinstance(num_speakers, bool)
+            or not isinstance(num_speakers, int)
+            or num_speakers < 0
+            or num_speakers != len(observed)
+        ):
+            violations.append("num_speakers must equal the number of distinct segment speakers")
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        violations.append(f"structured speaker output must be strict JSON: {error}")
+    return violations
+
+
+def load_speaker_fixture(path: Path, *, tool: str) -> list[tuple[str, Path, dict, None]]:
+    task = speaker_task_for_tool(tool)
+    label = task.upper().replace("_", "-")
+    rows: list[tuple[str, Path, dict, None]] = []
+    seen: set[str] = set()
+    if path.is_symlink():
+        raise ValueError("structured speaker fixture gt.jsonl must not be a symlink")
+    fixture_root = path.parent.resolve()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{label} fixture line {line_number} must be an object")
+        key = str(row.get("key") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"{label} fixture key is missing or duplicated: {key!r}")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"{label} fixture key must be a safe token: {key!r}")
+        seen.add(key)
+        audio = row.get("audio") or row.get("wav")
+        if not isinstance(audio, str) or not audio.strip():
+            raise ValueError(f"{label} fixture {key} requires audio or wav")
+        relative = Path(audio)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in audio:
+            raise ValueError(f"{label} fixture {key} audio path must be relative and contained")
+        current = path.parent
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"{label} fixture {key} audio must not traverse a symlink")
+        audio_path = (path.parent / relative).resolve()
+        if (
+            not audio_path.is_file()
+            or audio_path.stat().st_size <= 0
+            or not audio_path.is_relative_to(fixture_root)
+        ):
+            raise ValueError(f"{label} fixture {key} audio is missing or unsafe")
+        violations = validate_speaker_segments(
+            row.get("segments"),
+            task=task,
+            label=f"{label} fixture {key}",
+            empty_sd_allowed=(task == "sd" and bool(pcm_wav_info(audio_path)["audio_is_silence"])),
+            duration_sec=float(pcm_wav_info(audio_path)["duration_sec"]),
+        )
+        if violations:
+            raise ValueError("; ".join(violations))
+        rows.append((key, audio_path, row, None))
+    if not 1 <= len(rows) <= 5:
+        raise ValueError(f"{label} MCP smoke requires 1 to 5 samples")
+    return rows
+
+
 def _read_line(fd: int, buffer: bytearray, deadline: float) -> str | None:
     """Read one line from fd before deadline; None on timeout or EOF."""
     while True:
@@ -434,9 +728,12 @@ def main() -> int:
                 calls = [(*call, None) for call in load_kws_fixture(fixture_gt_jsonl)]
             elif args.tool == "enhance_speech":
                 calls = load_se_fixture(fixture_gt_jsonl)
+            elif args.tool in {"diarize", "transcribe_with_speakers"}:
+                calls = load_speaker_fixture(fixture_gt_jsonl, tool=args.tool)
             else:
                 raise ValueError(
-                    "--fixture-gt-jsonl is only valid with --tool kws_predict or enhance_speech"
+                    "--fixture-gt-jsonl is only valid with --tool kws_predict, enhance_speech, "
+                    "diarize, or transcribe_with_speakers"
                 )
         else:
             assert audio is not None
@@ -520,6 +817,19 @@ def main() -> int:
                 if args.tool == "kws_predict" and fixture_row is not None
                 else []
             )
+            speaker_wav_info: dict[str, object] | None = None
+            if args.tool in {"diarize", "transcribe_with_speakers"}:
+                speaker_wav_info = pcm_wav_info(call_audio)
+                violations.extend(
+                    validate_speaker_output(
+                        parsed,
+                        tool=args.tool,
+                        empty_sd_allowed=(
+                            args.tool == "diarize" and bool(speaker_wav_info["audio_is_silence"])
+                        ),
+                        duration_sec=float(speaker_wav_info["duration_sec"]),
+                    )
+                )
             generated_audio: Path | None = None
             if args.tool == "enhance_speech":
                 se_violations, generated_audio = validate_se_output(
@@ -552,6 +862,8 @@ def main() -> int:
                     if generated_audio is not None
                     else None
                 )
+            if args.tool in {"diarize", "transcribe_with_speakers"}:
+                result_preview = parsed if isinstance(parsed, dict) else None
             sample_evidence.append(
                 {
                     "key": key,
@@ -565,6 +877,21 @@ def main() -> int:
                         else call_audio.name
                     ),
                     "audio_sha256": sha256_file(call_audio),
+                    "audio_is_silence": (
+                        bool(speaker_wav_info["audio_is_silence"])
+                        if speaker_wav_info is not None
+                        else pcm_wav_is_silence(call_audio)
+                    ),
+                    "audio_duration_sec": (
+                        speaker_wav_info["duration_sec"]
+                        if speaker_wav_info is not None
+                        else None
+                    ),
+                    "audio_sample_rate": (
+                        speaker_wav_info["sample_rate"]
+                        if speaker_wav_info is not None
+                        else None
+                    ),
                     "reference_audio": (
                         str(fixture_row.get("reference_audio"))
                         if fixture_row is not None and reference_audio is not None
@@ -641,9 +968,9 @@ def main() -> int:
         "tools_call": steps["tools_call"],
         "shutdown": steps["shutdown"],
         "server_command": portable_server_command(args.server_command),
-        "server_stderr_tail": list(server_stderr)[-STDERR_TAIL_LINES:],
+        "server_stderr_summary": diagnostic_summary(list(server_stderr)),
         "stdout_junk_count": len(junk_tail),
-        "stdout_junk_tail": list(junk_tail)[-STDERR_TAIL_LINES:],
+        "stdout_junk_summary": diagnostic_summary(list(junk_tail)),
         "duration_ms": round((time.monotonic() - started) * 1000, 3),
         "error": error,
     }

@@ -5,15 +5,22 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import shutil
 import wave
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
 AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 ANNOTATION_FIELDS = ("ground_truth", "target_text", "text", "segments", "label", "intent")
 KWS_OPERATING_THRESHOLD = 0.5
+SPEAKER_TASKS = {"sd", "sa_asr"}
+STRUCTURED_FIXTURE_TASKS = {"kws", "sa_asr", "sd", "se"}
+SPEAKER_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
+SD_SEGMENT_FIELDS = frozenset({"speaker", "start", "end", "duration"})
+SA_ASR_SEGMENT_FIELDS = frozenset({*SD_SEGMENT_FIELDS, "text"})
+URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
 def read_object(path: Path) -> dict:
@@ -35,16 +42,16 @@ def choose_fixture(resolved: dict, task: str) -> Path:
     explicit = resolved.get("fixture_path")
     if explicit:
         path = Path(str(explicit))
-        if task in {"kws", "se"} and (
+        if task in STRUCTURED_FIXTURE_TASKS and (
             path.is_dir() or (path.is_file() and path.name == "gt.jsonl")
         ):
             return path
-        if task not in {"kws", "se"} and path.is_file():
+        if task not in STRUCTURED_FIXTURE_TASKS and path.is_file():
             return path
-        expected = "a directory or gt.jsonl" if task in {"kws", "se"} else "a file"
+        expected = "a directory or gt.jsonl" if task in STRUCTURED_FIXTURE_TASKS else "a file"
         raise ValueError(f"fixture must be {expected}: {path}")
     build_context = Path(str(resolved["build_context"]))
-    if task in {"kws", "se"}:
+    if task in STRUCTURED_FIXTURE_TASKS:
         structured_candidates = [
             build_context / "examples" / task / "gt.jsonl",
             build_context / "fixture" / task / "gt.jsonl",
@@ -151,6 +158,59 @@ def wav_duration(path: Path) -> float | None:
         return None
 
 
+def looks_like_absolute_path_or_uri(value: str) -> bool:
+    stripped = value.strip()
+    return bool(
+        stripped
+        and (
+            URI_PREFIX.match(stripped)
+            or Path(stripped).is_absolute()
+            or PureWindowsPath(stripped).is_absolute()
+            or stripped.startswith("\\\\")
+        )
+    )
+
+
+def pcm_wav_info(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() != ".wav":
+        raise ValueError("speaker fixture audio must be a PCM WAV")
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                raise ValueError("speaker fixture audio must be a non-empty PCM WAV")
+            channels = handle.getnchannels()
+            sample_width = handle.getsampwidth()
+            sample_rate = handle.getframerate()
+            frame_count = handle.getnframes()
+            frames = handle.readframes(frame_count)
+    except (OSError, EOFError, wave.Error) as error:
+        raise ValueError(f"speaker fixture audio must be a readable PCM WAV: {error}") from error
+    expected_bytes = frame_count * channels * sample_width
+    if len(frames) != expected_bytes:
+        raise ValueError(
+            f"speaker fixture PCM data is truncated: expected {expected_bytes} bytes, read {len(frames)}"
+        )
+    silence_byte = b"\x80" if sample_width == 1 else b"\x00"
+    return {
+        "duration_sec": frame_count / sample_rate,
+        "sample_rate": sample_rate,
+        "audio_is_silence": bool(frames) and frames == silence_byte * len(frames),
+    }
+
+
+def pcm_wav_is_silence(path: Path) -> bool:
+    try:
+        return bool(pcm_wav_info(path)["audio_is_silence"])
+    except ValueError:
+        return False
+
+
 def kws_duration(row: dict[str, Any], audio_path: Path, *, key: str) -> float:
     value = row.get("duration", row.get("duration_sec"))
     if value is None:
@@ -175,6 +235,224 @@ def fixture_tree_identity(staged_dir: Path, relative_files: list[Path]) -> str:
     return hashlib.sha256(
         json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def validate_speaker_segments(
+    value: object,
+    *,
+    task: str,
+    label: str,
+    empty_sd_allowed: bool = False,
+    duration_sec: float | None = None,
+) -> list[dict[str, Any]]:
+    if task not in SPEAKER_TASKS:
+        raise ValueError(f"unsupported speaker task: {task}")
+    if not isinstance(value, list):
+        raise ValueError(f"{label} segments must be an array")
+    if task == "sa_asr" and not value:
+        raise ValueError(f"{label} SA-ASR segments must not be empty")
+    if task == "sd" and not value and not empty_sd_allowed:
+        raise ValueError(f"{label} empty SD segments are allowed only for pure-silence audio")
+    segments: list[dict[str, Any]] = []
+    for index, segment in enumerate(value):
+        if not isinstance(segment, dict):
+            raise ValueError(f"{label} segments[{index}] must be an object")
+        approved_fields = SA_ASR_SEGMENT_FIELDS if task == "sa_asr" else SD_SEGMENT_FIELDS
+        unknown = sorted(str(field) for field in segment if field not in approved_fields)
+        if unknown:
+            raise ValueError(
+                f"{label} segments[{index}] contains unapproved field(s): " + ", ".join(unknown)
+            )
+        speaker = segment.get("speaker")
+        if not isinstance(speaker, str) or not speaker.strip():
+            raise ValueError(f"{label} segments[{index}].speaker must be a non-empty string")
+        if looks_like_absolute_path_or_uri(speaker):
+            raise ValueError(f"{label} segments[{index}].speaker must be a safe token")
+        start = segment.get("start")
+        end = segment.get("end")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(float(start))
+            or float(start) < 0
+        ):
+            raise ValueError(f"{label} segments[{index}].start must be finite and >= 0")
+        if (
+            isinstance(end, bool)
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(end))
+            or float(end) <= float(start)
+        ):
+            raise ValueError(f"{label} segments[{index}].end must be finite and > start")
+        if task == "sa_asr":
+            text = segment.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"{label} segments[{index}].text must be a non-empty string")
+        if duration_sec is not None and float(end) > duration_sec + 1e-6:
+            raise ValueError(
+                f"{label} segments[{index}].end exceeds WAV duration {duration_sec:.6f}"
+            )
+        duration = segment.get("duration")
+        if duration is not None and (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or float(duration) <= 0
+            or not math.isclose(
+                float(duration), float(end) - float(start), rel_tol=0, abs_tol=1e-3
+            )
+        ):
+            raise ValueError(
+                f"{label} segments[{index}].duration must be finite, positive, and equal end-start"
+            )
+        segments.append(dict(segment))
+    return segments
+
+
+def speaker_audio_source(
+    source_dir: Path,
+    value: object,
+    *,
+    task: str,
+    key: str,
+) -> tuple[Path, Path]:
+    label = task.upper().replace("_", "-")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} fixture {key} requires a non-empty audio field")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts or "\\" in value:
+        raise ValueError(f"{label} fixture {key} audio path must stay inside the fixture directory")
+    current = source_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} fixture {key} audio must not traverse a symlink")
+    resolved = (source_dir / relative).resolve()
+    if (
+        not resolved.is_relative_to(source_dir)
+        or not resolved.is_file()
+        or resolved.stat().st_size <= 0
+        or resolved.suffix.lower() not in AUDIO_SUFFIXES
+    ):
+        raise ValueError(f"{label} fixture {key} audio is missing or unsafe: {value}")
+    return relative, resolved
+
+
+def prepare_speaker_fixture(
+    resolved: dict,
+    source: Path,
+    run_dir: Path,
+    *,
+    task: str,
+) -> dict[str, Any]:
+    if task not in SPEAKER_TASKS:
+        raise ValueError(f"unsupported speaker task: {task}")
+    label = task.upper().replace("_", "-")
+    raw_source_dir = source.parent if source.is_file() else source
+    if raw_source_dir.is_symlink():
+        raise ValueError(f"{label} fixture root must not be a symlink: {raw_source_dir}")
+    if source.is_symlink():
+        raise ValueError(f"{label} fixture gt.jsonl must not be a symlink: {source}")
+    source_dir = raw_source_dir.resolve()
+    source_gt = source if source.is_file() else source_dir / "gt.jsonl"
+    if source_gt.name != "gt.jsonl" or source_gt.is_symlink() or not source_gt.is_file():
+        raise ValueError(f"{label} fixture must contain gt.jsonl: {source_dir}")
+    rows = read_jsonl(source_gt)
+    if not 1 <= len(rows) <= 5:
+        raise ValueError(f"{label} smoke fixture must contain 1 to 5 bounded samples")
+
+    staged_dir = run_dir / "fixture" / task
+    clear_directory(staged_dir, run_dir / "fixture")
+    seen_keys: set[str] = set()
+    staged_rows: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    relative_files: set[Path] = set()
+
+    for index, row in enumerate(rows, 1):
+        key = str(row.get("key") or "").strip()
+        if not key:
+            raise ValueError(f"{label} fixture row {index} requires a non-empty key")
+        if looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"{label} fixture key must be a safe token: {key!r}")
+        if key in seen_keys:
+            raise ValueError(f"{label} fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        relative_audio, audio_source = speaker_audio_source(
+            source_dir,
+            row.get("audio", row.get("wav")),
+            task=task,
+            key=key,
+        )
+        wav_info = pcm_wav_info(audio_source)
+        segments = validate_speaker_segments(
+            row.get("segments"),
+            task=task,
+            label=f"{label} fixture {key}",
+            empty_sd_allowed=task == "sd" and bool(wav_info["audio_is_silence"]),
+            duration_sec=float(wav_info["duration_sec"]),
+        )
+        destination = staged_dir / relative_audio
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            raise ValueError(f"{label} fixture destination must not be a symlink: {destination}")
+        shutil.copy2(audio_source, destination)
+        relative_files.add(relative_audio)
+        staged_row = {
+            **row,
+            "key": key,
+            "task_type": task,
+            "audio": relative_audio.as_posix(),
+            "segments": segments,
+        }
+        try:
+            json.dumps(staged_row, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} fixture {key} must contain strict JSON: {error}") from error
+        staged_rows.append(staged_row)
+        samples.append(
+            {
+                "key": key,
+                "audio": relative_audio.as_posix(),
+                "audio_path": str(destination),
+                "annotation_fields": ["segments"],
+                "segment_count": len(segments),
+                **wav_info,
+                "sha256": sha256(destination),
+                "size_bytes": destination.stat().st_size,
+            }
+        )
+
+    gt_jsonl = staged_dir / "gt.jsonl"
+    with gt_jsonl.open("w", encoding="utf-8") as handle:
+        for row in staged_rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    relative_files.add(Path("gt.jsonl"))
+    return {
+        "schema": "sure.trans.fixture_manifest.v1",
+        "status": "ready",
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(run_dir),
+        "task_type": task,
+        "source_dir": str(source_dir),
+        "staged_dir": str(staged_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": samples,
+        "source_path": str(source_dir),
+        "staged_path": str(staged_dir),
+        "sha256": fixture_tree_identity(staged_dir, list(relative_files)),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(samples),
+        "link_policy": "copy",
+        "annotation_source": {
+            "type": "fixture_gt_jsonl",
+            "source_path": str(source_gt.resolve()),
+            "staged_path": str(gt_jsonl),
+            "fallback": False,
+        },
+    }
 
 
 def prepare_kws_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str, Any]:
@@ -478,7 +756,10 @@ def main() -> int:
     artifacts = run_dir / "artifacts"
     resolved = read_object(artifacts / "trans_input_resolved.json")
     task = str(resolved["task_type"]).replace("-", "_").lower()
-    source = choose_fixture(resolved, task).resolve()
+    source = choose_fixture(resolved, task)
+    if source.is_symlink():
+        raise ValueError(f"fixture path must not be a symlink: {source}")
+    source = source.resolve()
     if task == "kws":
         payload = prepare_kws_fixture(resolved, source, run_dir)
         output = artifacts / "fixture_manifest.json"
@@ -487,6 +768,12 @@ def main() -> int:
         return 0
     if task == "se":
         payload = prepare_se_fixture(resolved, source, run_dir)
+        output = artifacts / "fixture_manifest.json"
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(output)
+        return 0
+    if task in SPEAKER_TASKS:
+        payload = prepare_speaker_fixture(resolved, source, run_dir, task=task)
         output = artifacts / "fixture_manifest.json"
         output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(output)

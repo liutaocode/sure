@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from structured_segments import is_structured_task, validate_structured_rows
+
 CORE_FILES = ["model.spec.yaml", "model.py", "server.py", "__init__.py", "validate.py", "config.yaml"]
 REQUIRED_RUN_ARTIFACTS = [
     "model_input_resolved.json",
@@ -171,6 +173,44 @@ def validate_se_sample_evidence(model_artifacts: Path) -> None:
                 raise ValueError(f"SE sample evidence audio_path is missing from model outputs: {value}")
 
 
+def validate_structured_sample_evidence(model_artifacts: Path, *, task: str) -> None:
+    sample_output_path = model_artifacts / "sample_output.json"
+    sample_outputs_path = model_artifacts / "sample_outputs.jsonl"
+    fixture_manifest_path = model_artifacts / "fixture_manifest.json"
+    for path in (sample_output_path, sample_outputs_path, fixture_manifest_path):
+        if not path.is_file():
+            raise ValueError(f"SD/SA-ASR staging requires {path.name}")
+    rows: list[dict[str, Any]] = []
+    for line_no, line in enumerate(sample_outputs_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{sample_outputs_path}:{line_no} must be a JSON object")
+        rows.append(row)
+    manifest = read_json(fixture_manifest_path)
+    violations: list[str] = []
+    if canonical_task(manifest.get("task_type")) != task:
+        violations.append("fixture manifest task_type disagrees with SD/SA-ASR staging task")
+    fixture_root = Path(str(manifest.get("staged_dir") or "")).expanduser()
+    if not fixture_root.is_absolute() or not fixture_root.is_dir():
+        violations.append("fixture manifest staged_dir must be an existing absolute directory")
+        fixture_root = None
+    violations.extend(
+        validate_structured_rows(
+            rows,
+            task=task,
+            samples=manifest.get("samples"),
+            fixture_root=fixture_root,
+        )
+    )
+    first_output = read_json(sample_output_path)
+    if rows and rows[0].get("output") != first_output:
+        violations.append("sample_output.json must equal the first structured output row")
+    if violations:
+        raise ValueError("invalid SD/SA-ASR sample evidence: " + "; ".join(violations))
+
+
 def artifact_entry(path: str, description: str) -> dict[str, Any]:
     return {"path": path, "description": description}
 
@@ -271,7 +311,10 @@ def main_with_args(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    task = canonical_task(resolved.get("task_type"))
     required_run_artifacts = list(REQUIRED_RUN_ARTIFACTS)
+    if is_structured_task(task):
+        required_run_artifacts.extend(("sample_output.json", "sample_outputs.jsonl"))
     if resolved.get("deployment_type") == "local" and resolved.get("package_profile") == "none":
         required_run_artifacts.append(MODEL_RUNTIME_ARTIFACT)
     missing_required = [name for name in required_run_artifacts if not (run_artifacts / name).exists()]
@@ -291,6 +334,8 @@ def main_with_args(argv: list[str] | None = None) -> int:
             copy_artifact(source, model_artifacts / name)
             copied_required.append(name)
     for name in OPTIONAL_RUN_ARTIFACTS:
+        if name in required_run_artifacts:
+            continue
         if resolved.get("package_profile") == "none" and name.startswith("docker_"):
             continue
         source = run_artifacts / name
@@ -302,12 +347,20 @@ def main_with_args(argv: list[str] | None = None) -> int:
         copied_outputs = stage_output_tree(
             run_artifacts,
             model_artifacts,
-            task=canonical_task(resolved.get("task_type")),
+            task=task,
         )
-        if canonical_task(resolved.get("task_type")) == "se":
+        if task == "se":
             if not copied_outputs:
                 raise ValueError("SE staging requires at least one generated output")
             validate_se_sample_evidence(model_artifacts)
+        elif is_structured_task(task) and (
+            not args.allow_missing_run_artifacts
+            or all(
+                (model_artifacts / name).is_file()
+                for name in ("sample_output.json", "sample_outputs.jsonl", "fixture_manifest.json")
+            )
+        ):
+            validate_structured_sample_evidence(model_artifacts, task=task)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"stage_model_artifacts failed: {exc}", file=sys.stderr)
         return 1
