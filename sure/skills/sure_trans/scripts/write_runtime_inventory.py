@@ -78,7 +78,11 @@ def main() -> int:
         "s2tt": "translate_audio",
         "tts": "synthesize_speech",
         "vad": "detect_speech",
+        "ser": "emotion_recognize",
+        "gr": "gender_recognize",
+        "slu": "slu_understand",
         "vc": "convert_voice",
+        "tse": "extract_target_speaker",
     }
     tool_name = args.tool_name or default_tools.get(task_type, "transcribe_audio")
     harness = runtime_binding.get("runtimes", {}).get("harness", {}) if isinstance(runtime_binding, dict) else {}

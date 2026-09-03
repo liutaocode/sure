@@ -11,12 +11,19 @@ import wave
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task,
+    validate_fixture_row,
+)
+from tse_contract import canonical_task as canonical_tse_task, safe_relative_audio, safe_sample_id
 
 AUDIO_SUFFIXES = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
 ANNOTATION_FIELDS = ("ground_truth", "target_text", "text", "segments", "label", "intent")
 KWS_OPERATING_THRESHOLD = 0.5
 SPEAKER_TASKS = {"sd", "sa_asr"}
-STRUCTURED_FIXTURE_TASKS = {"kws", "sa_asr", "sd", "se", "vad"}
+STRUCTURED_FIXTURE_TASKS = {"kws", "sa_asr", "sd", "se", "tse", "vad"}
+STRUCTURED_FIXTURE_TASKS |= set(CLASSIFICATION_TASKS)
 SPEAKER_OUTPUT_FIELDS = frozenset({"segments", "num_speakers"})
 SD_SEGMENT_FIELDS = frozenset({"speaker", "start", "end", "duration"})
 SA_ASR_SEGMENT_FIELDS = frozenset({*SD_SEGMENT_FIELDS, "text"})
@@ -685,7 +692,7 @@ def prepare_kws_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str
     polarities: set[bool] = set()
     staged_rows: list[dict[str, Any]] = []
     samples: list[dict[str, Any]] = []
-    relative_files: list[Path] = []
+    relative_files: set[Path] = set()
 
     for index, row in enumerate(rows, 1):
         raw_audio = row.get("audio") or row.get("wav")
@@ -748,7 +755,7 @@ def prepare_kws_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str
         if destination.is_symlink():
             raise ValueError(f"KWS fixture destination must not be a symlink: {destination}")
         shutil.copy2(audio_source, destination)
-        relative_files.append(relative_audio)
+        relative_files.add(relative_audio)
         staged_row = {
             **row,
             "key": key,
@@ -785,7 +792,7 @@ def prepare_kws_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str
     with gt_jsonl.open("w", encoding="utf-8") as handle:
         for row in staged_rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-    relative_files.append(Path("gt.jsonl"))
+    relative_files.add(Path("gt.jsonl"))
     total_bytes = sum((staged_dir / relative).stat().st_size for relative in relative_files)
     return {
         "schema": "sure.trans.fixture_manifest.v1",
@@ -804,6 +811,150 @@ def prepare_kws_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str
         "gt_sha256": sha256(gt_jsonl),
         "expected_sha256": sha256(gt_jsonl),
         "size_bytes": total_bytes,
+        "sample_count": len(samples),
+        "link_policy": "copy",
+        "annotation_source": {
+            "type": "fixture_gt_jsonl",
+            "source_path": str(source_gt.resolve()),
+            "staged_path": str(gt_jsonl),
+            "fallback": False,
+        },
+    }
+
+
+def classification_audio_source(
+    source_dir: Path, value: object, *, task: str, key: str
+) -> tuple[Path, Path]:
+    label = task.upper()
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} fixture {key} requires a non-empty audio field")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts or "\\" in value:
+        raise ValueError(f"{label} fixture {key} audio path must stay inside the fixture directory")
+    current = source_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} fixture {key} audio must not traverse a symlink")
+    resolved = (source_dir / relative).resolve()
+    if (
+        not resolved.is_relative_to(source_dir)
+        or not resolved.is_file()
+        or resolved.stat().st_size <= 0
+        or resolved.suffix.lower() not in AUDIO_SUFFIXES
+    ):
+        raise ValueError(f"{label} fixture {key} audio is missing or unsafe: {value}")
+    return relative, resolved
+
+
+def prepare_classification_fixture(
+    resolved: dict, source: Path, run_dir: Path, *, task: str
+) -> dict[str, Any]:
+    """Stage keyed SER/GR/SLU rows without copying reference-only metadata."""
+
+    normalized_task = canonical_task(task)
+    if normalized_task not in CLASSIFICATION_TASKS:
+        raise ValueError(f"unsupported classification task: {task}")
+    source_dir = (source.parent if source.is_file() else source).resolve()
+    source_gt = source if source.is_file() else source_dir / "gt.jsonl"
+    if source_gt.name != "gt.jsonl" or source_gt.is_symlink() or not source_gt.is_file():
+        raise ValueError(f"{normalized_task.upper()} fixture must contain gt.jsonl: {source_dir}")
+    rows = read_jsonl(source_gt)
+    if not 1 <= len(rows) <= 5:
+        raise ValueError(f"{normalized_task.upper()} smoke fixture must contain 1 to 5 bounded samples")
+
+    staged_dir = run_dir / "fixture" / normalized_task
+    clear_directory(staged_dir, run_dir / "fixture")
+    seen_keys: set[str] = set()
+    staged_rows: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    relative_files: set[Path] = set()
+    for index, row in enumerate(rows, 1):
+        key = str(row.get("key") or row.get("id") or "").strip()
+        if (
+            not key
+            or "/" in key
+            or "\\" in key
+            or any(ord(character) < 32 or character.isspace() for character in key)
+        ):
+            raise ValueError(f"{normalized_task.upper()} fixture row {index} requires a non-empty key")
+        if key in seen_keys:
+            raise ValueError(f"{normalized_task.upper()} fixture contains duplicate key: {key}")
+        seen_keys.add(key)
+        declared_task = row.get("task_type", row.get("task"))
+        if declared_task is not None and canonical_task(declared_task) != normalized_task:
+            raise ValueError(
+                f"{normalized_task.upper()} fixture {key} declares task {declared_task!r}, "
+                f"expected {normalized_task!r}"
+            )
+        expected = validate_fixture_row(normalized_task, row, key=key)
+        relative_audio, audio_source = classification_audio_source(
+            source_dir, row.get("audio") or row.get("wav"), task=normalized_task, key=key
+        )
+        destination = staged_dir / relative_audio
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink():
+            raise ValueError(f"{normalized_task.upper()} fixture destination must not be a symlink: {destination}")
+        shutil.copy2(audio_source, destination)
+        relative_files.add(relative_audio)
+
+        staged_row: dict[str, Any] = {
+            "key": key,
+            "task_type": normalized_task,
+            "audio": relative_audio.as_posix(),
+            "ground_truth": expected,
+        }
+        if isinstance(row.get("language"), str) and row["language"].strip():
+            staged_row["language"] = row["language"]
+        if isinstance(row.get("dataset"), str) and row["dataset"].strip():
+            staged_row["dataset"] = row["dataset"]
+        if normalized_task == "slu":
+            prompt = row.get("prompt") or row.get("instruction")
+            staged_row["prompt"] = str(prompt).strip()
+            choices = row.get("choices", row.get("options"))
+            if choices is not None:
+                staged_row["choices"] = choices
+        try:
+            json.dumps(staged_row, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{normalized_task.upper()} fixture {key} must contain strict JSON: {error}") from error
+        staged_rows.append(staged_row)
+        sample: dict[str, Any] = {
+            "key": key,
+            "audio": relative_audio.as_posix(),
+            "audio_path": str(destination),
+            "annotation_fields": ["ground_truth"],
+            "sha256": sha256(destination),
+            "size_bytes": destination.stat().st_size,
+        }
+        if normalized_task == "slu":
+            sample["prompt"] = staged_row["prompt"]
+            if "choices" in staged_row:
+                sample["choices"] = staged_row["choices"]
+        samples.append(sample)
+
+    gt_jsonl = staged_dir / "gt.jsonl"
+    with gt_jsonl.open("w", encoding="utf-8") as handle:
+        for row in staged_rows:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+    relative_files.add(Path("gt.jsonl"))
+    return {
+        "schema": "sure.trans.fixture_manifest.v1",
+        "status": "ready",
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(run_dir),
+        "task_type": normalized_task,
+        "source_dir": str(source_dir),
+        "staged_dir": str(staged_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": samples,
+        "source_path": str(source_dir),
+        "staged_path": str(staged_dir),
+        "sha256": fixture_tree_identity(staged_dir, relative_files),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
         "sample_count": len(samples),
         "link_policy": "copy",
         "annotation_source": {
@@ -946,6 +1097,213 @@ def prepare_se_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str,
     }
 
 
+def tse_audio_source(
+    source_dir: Path,
+    value: object,
+    *,
+    key: str,
+    role: str,
+) -> tuple[Path, Path]:
+    """Resolve one TSE role while keeping fixture paths relative and contained."""
+
+    relative = safe_relative_audio(value, role=role)
+    current = source_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"TSE fixture {key} {role} must not traverse a symlink")
+    resolved = (source_dir / relative).resolve()
+    if (
+        not resolved.is_relative_to(source_dir)
+        or not resolved.is_file()
+        or resolved.stat().st_size <= 0
+        or resolved.suffix.lower() not in AUDIO_SUFFIXES
+    ):
+        raise ValueError(f"TSE fixture {key} {role} is missing or unsafe: {value}")
+    return relative, resolved
+
+
+def _tse_copy_role(
+    source_dir: Path,
+    staged_dir: Path,
+    value: object,
+    *,
+    key: str,
+    role: str,
+    relative_files: set[Path],
+) -> tuple[Path, Path]:
+    relative, source = tse_audio_source(source_dir, value, key=key, role=role)
+    destination = staged_dir / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        raise ValueError(f"TSE fixture destination must not be a symlink: {destination}")
+    shutil.copy2(source, destination)
+    relative_files.add(relative)
+    return relative, destination
+
+
+def prepare_tse_fixture(resolved: dict, source: Path, run_dir: Path) -> dict[str, Any]:
+    """Stage bounded mixture/enrollment/reference roles for TSE inference."""
+
+    raw_source_dir = source.parent if source.is_file() else source
+    if raw_source_dir.is_symlink() or source.is_symlink():
+        raise ValueError("TSE fixture root and gt.jsonl must not be symlinks")
+    source_dir = raw_source_dir.resolve()
+    source_gt = source if source.is_file() else source_dir / "gt.jsonl"
+    if source_gt.name != "gt.jsonl" or not source_gt.is_file() or source_gt.is_symlink():
+        raise ValueError(f"TSE fixture must contain gt.jsonl: {source_dir}")
+    rows = read_jsonl(source_gt)
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("TSE smoke fixture must contain 1 to 5 bounded samples")
+
+    staged_dir = run_dir / "fixture" / "tse"
+    clear_directory(staged_dir, run_dir / "fixture")
+    seen_keys: set[str] = set()
+    staged_rows: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    relative_files: set[Path] = set()
+
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"TSE fixture row {index} must be an object")
+        key = safe_sample_id(row.get("sample_id") or row.get("key"), role="TSE sample_id")
+        if key in seen_keys:
+            raise ValueError(f"TSE fixture contains duplicate sample_id: {key}")
+        seen_keys.add(key)
+
+        mixture_value = (
+            row.get("mixture_audio")
+            or row.get("mixture_audio_path")
+            or row.get("mixed_audio")
+            or row.get("audio")
+            or row.get("mixture")
+        )
+        enrollment_value = (
+            row.get("enrollment_audio")
+            or row.get("enrollment_audio_path")
+            or row.get("enrollment")
+        )
+        reference_value = row.get("reference_audio") or row.get("reference_audio_path")
+        mixture_relative, mixture_destination = _tse_copy_role(
+            source_dir,
+            staged_dir,
+            mixture_value,
+            key=key,
+            role="mixture_audio",
+            relative_files=relative_files,
+        )
+        enrollment_relative, enrollment_destination = _tse_copy_role(
+            source_dir,
+            staged_dir,
+            enrollment_value,
+            key=key,
+            role="enrollment_audio",
+            relative_files=relative_files,
+        )
+        reference_relative, reference_destination = _tse_copy_role(
+            source_dir,
+            staged_dir,
+            reference_value,
+            key=key,
+            role="reference_audio",
+            relative_files=relative_files,
+        )
+        role_paths = (mixture_destination, enrollment_destination, reference_destination)
+        if len({path.resolve() for path in role_paths}) != 3:
+            raise ValueError(f"TSE fixture {key} roles must be independent files")
+        if any(path.samefile(other) for offset, path in enumerate(role_paths) for other in role_paths[offset + 1 :]):
+            raise ValueError(f"TSE fixture {key} roles must not alias the same file")
+
+        language = row.get("language")
+        if language not in (None, "") and (not isinstance(language, str) or not language.strip()):
+            raise ValueError(f"TSE fixture {key} language must be a non-empty string when provided")
+        reference_text = row.get("reference_text")
+        if reference_text is not None and not isinstance(reference_text, str):
+            raise ValueError(f"TSE fixture {key} reference_text must be a string when provided")
+
+        staged_row: dict[str, Any] = {
+            "key": key,
+            "sample_id": key,
+            "task_type": "tse",
+            "mixture_audio": mixture_relative.as_posix(),
+            "mixed_audio": mixture_relative.as_posix(),
+            "enrollment_audio": enrollment_relative.as_posix(),
+            "reference_audio": reference_relative.as_posix(),
+        }
+        # ``audio`` is a compatibility alias for generic fixture discovery;
+        # inference always uses the explicit mixture/enrollment fields.
+        staged_row["audio"] = mixture_relative.as_posix()
+        if isinstance(language, str) and language.strip():
+            staged_row["language"] = language.strip()
+        if isinstance(reference_text, str) and reference_text.strip():
+            staged_row["reference_text"] = reference_text
+        if "mixed_audio" in row and row.get("mixed_audio") not in (None, ""):
+            # Keep the standalone evaluator role spelling canonical in gt.jsonl.
+            if str(row["mixed_audio"]) != str(mixture_value):
+                raise ValueError(f"TSE fixture {key} mixture_audio and mixed_audio disagree")
+        json.dumps(staged_row, ensure_ascii=False, allow_nan=False)
+        staged_rows.append(staged_row)
+
+        annotation_fields = ["reference_audio"]
+        if staged_row.get("reference_text"):
+            annotation_fields.append("reference_text")
+        samples.append(
+            {
+                "key": key,
+                "sample_id": key,
+                "audio": mixture_relative.as_posix(),
+                "mixture_audio": mixture_relative.as_posix(),
+                "mixed_audio": mixture_relative.as_posix(),
+                "mixture_audio_path": str(mixture_destination),
+                "enrollment_audio": enrollment_relative.as_posix(),
+                "enrollment_audio_path": str(enrollment_destination),
+                "reference_audio": reference_relative.as_posix(),
+                "reference_audio_path": str(reference_destination),
+                "reference_text": staged_row.get("reference_text", ""),
+                "language": staged_row.get("language", "en"),
+                "annotation_fields": annotation_fields,
+                "mixture_sha256": sha256(mixture_destination),
+                "enrollment_sha256": sha256(enrollment_destination),
+                "reference_sha256": sha256(reference_destination),
+                "mixture_size_bytes": mixture_destination.stat().st_size,
+                "enrollment_size_bytes": enrollment_destination.stat().st_size,
+                "reference_size_bytes": reference_destination.stat().st_size,
+            }
+        )
+
+    gt_jsonl = staged_dir / "gt.jsonl"
+    with gt_jsonl.open("w", encoding="utf-8") as handle:
+        for row in staged_rows:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+    relative_files.add(Path("gt.jsonl"))
+    return {
+        "schema": "sure.trans.fixture_manifest.v1",
+        "status": "ready",
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(run_dir),
+        "task_type": "tse",
+        "source_dir": str(source_dir),
+        "staged_dir": str(staged_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": samples,
+        "source_path": str(source_dir),
+        "staged_path": str(staged_dir),
+        "sha256": fixture_tree_identity(staged_dir, list(relative_files)),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(samples),
+        "link_policy": "copy",
+        "annotation_source": {
+            "type": "fixture_gt_jsonl",
+            "source_path": str(source_gt.resolve()),
+            "staged_path": str(gt_jsonl),
+            "fallback": False,
+        },
+    }
+
+
 def clear_directory(path: Path, controlled_root: Path) -> None:
     if controlled_root.is_symlink() or path.is_symlink():
         raise ValueError(f"fixture staging directory must not be a symlink: {path}")
@@ -970,7 +1328,7 @@ def main() -> int:
     run_dir = Path(args.run_dir).resolve()
     artifacts = run_dir / "artifacts"
     resolved = read_object(artifacts / "trans_input_resolved.json")
-    task = str(resolved["task_type"]).replace("-", "_").lower()
+    task = canonical_tse_task(str(resolved["task_type"]).replace("-", "_").lower())
     source = choose_fixture(resolved, task)
     if source.is_symlink():
         raise ValueError(f"fixture path must not be a symlink: {source}")
@@ -983,6 +1341,18 @@ def main() -> int:
         return 0
     if task == "se":
         payload = prepare_se_fixture(resolved, source, run_dir)
+        output = artifacts / "fixture_manifest.json"
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(output)
+        return 0
+    if task == "tse":
+        payload = prepare_tse_fixture(resolved, source, run_dir)
+        output = artifacts / "fixture_manifest.json"
+        output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(output)
+        return 0
+    if task in CLASSIFICATION_TASKS:
+        payload = prepare_classification_fixture(resolved, source, run_dir, task=task)
         output = artifacts / "fixture_manifest.json"
         output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(output)

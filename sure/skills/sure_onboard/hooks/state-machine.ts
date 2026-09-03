@@ -56,6 +56,7 @@ const TASK_TYPES = [
 	"speech_understanding",
 	"sa-asr",
 	"sa_asr",
+	"tse",
 ];
 const DEPLOYMENT_TYPES = ["local", "api"];
 const BACKENDS = ["uv", "pip", "conda", "pixi", "docker", "api"];

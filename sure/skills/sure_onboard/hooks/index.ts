@@ -84,18 +84,42 @@ const TASK_TYPES = [
 	"speech_understanding",
 	"sa-asr",
 	"sa_asr",
+	"tse",
 ];
 const DEPLOYMENT_TYPES = ["local", "api"];
 const PACKAGE_PROFILES = ["none", "docker-local", "docker-registry"];
 
 function canonicalTaskType(value: string): string {
 	const raw = value.trim().toLowerCase();
-	const normalized = raw.replace(/-/g, "_");
+	const normalized = raw.replace(/[\s-]+/g, "_");
 	if (normalized === "speech_enhancement" || normalized === "acoustic_noise_suppression") {
 		return "se";
 	}
 	if (normalized === "speech_activity_detection" || normalized === "voice_activity_detection") {
 		return "vad";
+	}
+	if (["speech_emotion_recognition", "speaker_emotion_recognition", "emotion_recognition"].includes(normalized)) {
+		return "ser";
+	}
+	if (["gender_recognition", "speaker_gender"].includes(normalized)) {
+		return "gr";
+	}
+	if (normalized === "spoken_language_understanding") {
+		return "slu";
+	}
+	if (
+		[
+			"tse",
+			"target_speaker_extraction",
+			"target_speaker_extractor",
+			"target_speaker_extraction_model",
+			"target_speaker",
+			"speaker_extraction",
+			"target_voice_extraction",
+			"target_voice_separation",
+		].includes(normalized)
+	) {
+		return "tse";
 	}
 	return raw;
 }

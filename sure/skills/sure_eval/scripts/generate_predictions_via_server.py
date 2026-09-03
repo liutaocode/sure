@@ -33,12 +33,65 @@ from sure_eval.core.config import Config
 from sure_eval.core.logging import configure_logging, get_logger
 from sure_eval.datasets import DatasetManager
 
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task as canonical_classification_task,
+    normalize_prediction as normalize_classification_prediction,
+    prompt_payload as classification_prompt_payload,
+)
+
 configure_logging(level="INFO")
 logger = get_logger(__name__)
 
 SURE_SUITES_ROOT = Path("data/datasets/sure_benchmark/SURE_Test_Suites")
 PREDICTION_SNAPSHOT_INTERVAL = 25
 KWS_OPERATING_THRESHOLD = 0.5
+TSE_TASK_ALIASES = {
+    "TSE",
+    "TARGET_SPEAKER_EXTRACTION",
+    "TARGET_SPEAKER_EXTRACTOR",
+    "TARGET_SPEAKER_EXTRACTION_MODEL",
+    "TARGET_SPEAKER",
+    "SPEAKER_EXTRACTION",
+    "TARGET_VOICE_EXTRACTION",
+    "TARGET_VOICE_SEPARATION",
+}
+TSE_OUTPUT_FIELDS = {"prediction_audio", "sample_id"}
+TSE_FORBIDDEN_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "input",
+    "input_audio",
+    "mixture_audio",
+    "mixture_audio_path",
+    "mixed_audio",
+    "reference",
+    "reference_audio",
+    "reference_audio_path",
+    "reference_text",
+    "target",
+    "target_audio",
+    "target_audio_path",
+    "target_text",
+    "enrollment_audio",
+    "enrollment_audio_path",
+}
+CLASSIFICATION_PROTECTED_ARGUMENTS = {"audio_path", "prompt", "choices"}
+CLASSIFICATION_REFERENCE_ARGUMENTS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "input",
+    "input_audio",
+    "reference",
+    "reference_annotation",
+    "reference_audio",
+    "reference_text",
+    "target",
+    "target_audio",
+    "target_text",
+}
 
 
 def _utc_now() -> str:
@@ -129,7 +182,15 @@ def _resolve_working_dir(model_dir: Path, runtime_inventory: dict[str, Any]) -> 
 
 
 def _resolve_audio_path(repo_root: Path, sample: dict[str, Any]) -> Path:
-    sample_path = Path(sample.get("path", ""))
+    sample_value = (
+        sample.get("path")
+        or sample.get("mixture_audio_path")
+        or sample.get("mixture_audio")
+        or sample.get("mixed_audio")
+        or sample.get("audio")
+        or ""
+    )
+    sample_path = Path(str(sample_value))
     if sample_path.is_absolute():
         return sample_path
 
@@ -146,14 +207,23 @@ def _resolve_audio_path(repo_root: Path, sample: dict[str, Any]) -> Path:
 
 def _materialize_sample_audio(repo_root: Path, sample: dict[str, Any], scratch_dir: Path) -> Path:
     """Return a normal audio file path for a sample, slicing long audio if needed."""
-    if sample.get("source_audio") and sample.get("begin_time") is not None and sample.get("end_time") is not None:
-        source = Path(str(sample["source_audio"]))
+    # TSE's source is the mixture role.  ``source_audio`` is a legacy alias
+    # used by VC datasets and must never become an implicit reference/enrollment
+    # fallback for target-speaker extraction.
+    if (
+        _normalize_task(sample.get("task")) != "TSE"
+        and not any(sample.get(field) for field in ("mixture_audio", "mixture_audio_path", "enrollment_audio", "enrollment_audio_path"))
+        and sample.get("source_audio")
+        and sample.get("begin_time") is not None
+        and sample.get("end_time") is not None
+    ):
+        source = Path(str(sample.get("source_audio") or sample.get("mixture_audio") or sample.get("path") or ""))
         if not source.is_absolute():
             source = repo_root / source
         if not source.exists():
             raise FileNotFoundError(f"Unable to resolve source audio path for sample: {sample}")
 
-        key = str(sample.get("key", "sample")).replace("/", "_")
+        key = (_sample_key(sample) or "sample").replace("/", "_")
         output_path = scratch_dir / f"{key}.wav"
         if not output_path.exists():
             start = float(sample["begin_time"])
@@ -189,6 +259,10 @@ def _safe_filename(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value)
 
 
+def _sample_key(sample: dict[str, Any]) -> str:
+    return str(sample.get("key") or sample.get("sample_id") or "")
+
+
 def _normalize_tts_language(language: str | None) -> str:
     value = str(language or "").strip()
     normalized = value.lower().replace("_", "-")
@@ -214,6 +288,11 @@ def _normalize_task(value: Any) -> str:
     )
     if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
         return "VAD"
+    if normalized in TSE_TASK_ALIASES:
+        return "TSE"
+    classification = canonical_classification_task(normalized).upper()
+    if classification in CLASSIFICATION_TASKS:
+        return classification
     return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
@@ -242,6 +321,8 @@ def _metric_task_hint(metrics: list[str]) -> str:
             hinted.append("VC")
         elif metric_name.startswith("tts_"):
             hinted.append("TTS")
+        elif metric_name.startswith("tse_"):
+            hinted.append("TSE")
     hinted = [task for index, task in enumerate(hinted) if task not in hinted[:index]]
     return hinted[0] if len(hinted) == 1 else ""
 
@@ -253,12 +334,12 @@ def _model_task(model_cfg: dict[str, Any]) -> str:
 
 def _effective_generation_task(sample_task: str, model_cfg: dict[str, Any], metrics: list[str]) -> str:
     task = _normalize_task(sample_task) or "ASR"
-    if task in {"TTS", "VC"}:
+    if task in {"TTS", "VC", "TSE"}:
         metric_task = _metric_task_hint(metrics)
-        if metric_task in {"TTS", "VC"}:
+        if metric_task in {"TTS", "VC", "TSE"}:
             return metric_task
         declared_task = _model_task(model_cfg)
-        if declared_task in {"TTS", "VC"}:
+        if declared_task in {"TTS", "VC", "TSE"}:
             return declared_task
     return task
 
@@ -293,6 +374,47 @@ def _sample_reference_audio_path(repo_root: Path, sample: dict[str, Any], fallba
     return _resolve_audio_field_path(repo_root, value) or fallback
 
 
+def _sample_enrollment_audio_path(repo_root: Path, sample: dict[str, Any]) -> Path | None:
+    """Resolve the TSE enrollment role without using scoring references."""
+
+    value = (
+        sample.get("enrollment_audio_path")
+        or sample.get("enrollment_audio")
+        or sample.get("enrollment")
+        or sample.get("speaker_audio")
+        or sample.get("enroll_audio")
+    )
+    return _resolve_audio_field_path(repo_root, value)
+
+
+def _validate_tse_input_path(path: Path, *, role: str) -> Path:
+    candidate = path.expanduser()
+    if ".." in candidate.parts:
+        raise ValueError(f"TSE {role} path must not contain traversal components")
+    absolute = candidate.absolute()
+    current = Path(absolute.anchor) if absolute.anchor else Path(".")
+    parts = absolute.parts[1:] if absolute.anchor else absolute.parts
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"TSE {role} path must not traverse a symlink: {absolute}")
+    if not absolute.is_file() or absolute.stat().st_size <= 0:
+        raise ValueError(f"TSE {role} path is missing or empty: {absolute}")
+    return absolute.resolve()
+
+
+def _validate_tse_sample_key(value: Any) -> str:
+    key = str(value or "").strip()
+    if (
+        not key
+        or "/" in key
+        or "\\" in key
+        or any(ord(character) < 32 or character.isspace() for character in key)
+    ):
+        raise ValueError("TSE sample key must be a safe non-empty token")
+    return key
+
+
 def _se_run_output_path(output_audio_dir: Path, key: str) -> Path:
     root = output_audio_dir.expanduser().absolute()
     if root.is_symlink():
@@ -303,6 +425,19 @@ def _se_run_output_path(output_audio_dir: Path, key: str) -> Path:
     output = (root / f"{_safe_filename(key)}.wav").absolute()
     if output.parent != root or output.is_symlink():
         raise ValueError(f"SE output_path must be a direct non-symlink child of {root}")
+    return output
+
+
+def _tse_run_output_path(output_audio_dir: Path, key: str) -> Path:
+    root = output_audio_dir.expanduser().absolute()
+    if root.is_symlink():
+        raise ValueError(f"TSE output directory must not be a symlink: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    if root.resolve() != root:
+        raise ValueError(f"TSE output directory must not traverse a symlink: {root}")
+    output = (root / f"{_safe_filename(key)}.wav").absolute()
+    if output.parent != root or output.is_symlink():
+        raise ValueError(f"TSE output_path must be a direct non-symlink child of {root}")
     return output
 
 
@@ -323,6 +458,95 @@ def _validate_pcm_wav(path: Path, *, label: str) -> float:
     except (EOFError, OSError, wave.Error) as exc:
         raise ValueError(f"{label} must be a readable non-empty PCM WAV: {path}") from exc
     return duration
+
+
+def _classification_forbidden_argument_fields(
+    value: Any,
+    path: str = "tool_args",
+) -> list[str]:
+    """Find reference/path keys before protocol arguments reach the model."""
+
+    found: list[str] = []
+    if isinstance(value, dict):
+        for field, item in value.items():
+            normalized = str(field).strip().lower().replace("-", "_")
+            child = f"{path}.{field}"
+            if (
+                normalized in CLASSIFICATION_REFERENCE_ARGUMENTS
+                or normalized == "path"
+                or normalized.startswith("reference_")
+                or normalized.endswith("_path")
+            ):
+                found.append(child)
+            found.extend(_classification_forbidden_argument_fields(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(_classification_forbidden_argument_fields(item, f"{path}[{index}]"))
+    return found
+
+
+def _validate_classification_tool_args(tool_args: dict[str, Any]) -> None:
+    protected = sorted(
+        str(key)
+        for key in tool_args
+        if str(key).strip().lower().replace("-", "_") in CLASSIFICATION_PROTECTED_ARGUMENTS
+    )
+    if protected:
+        raise ValueError(
+            "classification harness-owned argument(s) cannot be overridden: "
+            + ", ".join(protected)
+        )
+    forbidden = _classification_forbidden_argument_fields(tool_args)
+    if forbidden:
+        raise ValueError(
+            "classification tool arguments must not contain reference/path field(s): "
+            + ", ".join(forbidden)
+        )
+    for key, value in tool_args.items():
+        if isinstance(value, (dict, list, tuple, set)):
+            raise ValueError(f"classification tool argument {key!r} must be a scalar")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"classification tool argument {key!r} must be finite")
+
+
+def _validate_tse_prediction_audio(
+    value: Any,
+    *,
+    expected_path: str | Path,
+    forbidden_inputs: tuple[Path, ...],
+) -> Path:
+    """Resolve a TSE output and bind it to the harness-assigned file."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("TSE prediction payload must contain prediction_audio")
+    expected = Path(expected_path).expanduser().absolute()
+    candidate = Path(value.strip()).expanduser()
+    if ".." in candidate.parts or "://" in value or (
+        len(value) > 1 and value[0].isalpha() and value[1] == ":"
+    ):
+        raise ValueError("TSE prediction_audio must be a contained basename/path without traversal")
+    if not candidate.is_absolute():
+        candidate = expected.parent / candidate
+    candidate = candidate.absolute()
+    if candidate != expected:
+        raise ValueError(
+            f"TSE prediction_audio must equal the run-local output_path: {candidate}"
+        )
+    root = expected.parent
+    if root.is_symlink() or root.resolve() != root:
+        raise ValueError("TSE run-local output directory must not traverse a symlink")
+    if candidate.is_symlink() or not candidate.is_file() or candidate.stat().st_size <= 0:
+        raise ValueError("TSE prediction_audio must be a real non-empty file")
+    for input_path in forbidden_inputs:
+        try:
+            if candidate.resolve().samefile(input_path):
+                raise ValueError(
+                    "TSE prediction_audio must not alias mixture, enrollment, or reference audio"
+                )
+        except OSError:
+            continue
+    _validate_pcm_wav(candidate, label="TSE prediction_audio")
+    return candidate.resolve()
 
 
 def _validate_kws_threshold(value: Any, *, source: str) -> float:
@@ -494,8 +718,47 @@ def _build_tool_arguments(
     tool_args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     task_name = _normalize_task(task)
+    if task_name == "TSE":
+        key = _validate_tse_sample_key(sample.get("key") or sample.get("sample_id") or "sample")
+        enrollment_candidate = _sample_enrollment_audio_path(repo_root, sample)
+        if enrollment_candidate is None:
+            raise ValueError(
+                f"TSE sample {key} requires an enrollment_audio/enrollment_audio_path role"
+            )
+        enrollment = _validate_tse_input_path(enrollment_candidate, role="enrollment_audio")
+        mixture = _validate_tse_input_path(audio_path, role="mixture_audio")
+        _validate_pcm_wav(enrollment, label=f"TSE sample {key} enrollment audio")
+        if enrollment == mixture:
+            raise ValueError(f"TSE sample {key} mixture and enrollment audio must differ")
+        output_audio_path = _tse_run_output_path(output_audio_dir, key)
+        arguments: dict[str, Any] = {
+            "mixture_audio_path": str(mixture),
+            "enrollment_audio_path": str(enrollment),
+            "output_path": str(output_audio_path),
+        }
+        if tool_args:
+            forbidden = sorted(
+                key
+                for key in tool_args
+                if str(key).strip().lower().replace("-", "_") in TSE_FORBIDDEN_FIELDS
+            )
+            if forbidden:
+                raise ValueError(
+                    "TSE inference arguments must not contain reference/input fields: "
+                    + ", ".join(forbidden)
+                )
+            arguments.update(tool_args)
+        # The three contract fields are harness-owned and cannot be overridden.
+        for field, expected in (
+            ("mixture_audio_path", str(mixture)),
+            ("enrollment_audio_path", str(enrollment)),
+            ("output_path", str(output_audio_path)),
+        ):
+            if arguments.get(field) != expected:
+                raise ValueError(f"TSE tool argument {field} cannot be overridden")
+        return arguments
     if task_name == "SE":
-        key = str(sample.get("key", "sample"))
+        key = _sample_key(sample) or "sample"
         output_audio_path = str(_se_run_output_path(output_audio_dir, key))
         arguments: dict[str, Any] = {argument_name: str(audio_path)}
         if tool_args:
@@ -504,7 +767,7 @@ def _build_tool_arguments(
         return arguments
 
     if task_name in {"TTS", "VC"}:
-        key = str(sample.get("key", "sample"))
+        key = _sample_key(sample) or "sample"
         prompt_audio_path = _sample_reference_audio_path(repo_root, sample, audio_path)
 
         target_text = (
@@ -581,6 +844,32 @@ def _build_tool_arguments(
             _validate_kws_threshold(tool_args["threshold"], source="tool argument")
         if tool_args:
             arguments.update(tool_args)
+        return arguments
+
+    if task_name in CLASSIFICATION_TASKS:
+        arguments: dict[str, Any] = {"audio_path": str(audio_path)}
+        if language:
+            arguments["language"] = language
+        if task_name == "SLU":
+            arguments.update(classification_prompt_payload(sample))
+        if tool_args:
+            _validate_classification_tool_args(tool_args)
+            arguments.update(tool_args)
+        forbidden = {
+            "answer",
+            "expected",
+            "ground_truth",
+            "reference",
+            "reference_audio",
+            "reference_text",
+            "target",
+            "target_text",
+        } & set(arguments)
+        if forbidden:
+            raise ValueError(
+                "classification inference arguments must not contain reference fields: "
+                + ", ".join(sorted(forbidden))
+            )
         return arguments
 
     if task_name == "VAD":
@@ -922,6 +1211,8 @@ def _normalize_prediction_payload(
     kws_require_score: bool = False,
     expected_audio_output: str | Path | None = None,
     vad_duration: float | None = None,
+    forbidden_inputs: tuple[Path, ...] = (),
+    sample_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     task_name = _normalize_task(task)
     if isinstance(payload, dict):
@@ -931,6 +1222,41 @@ def _normalize_prediction_payload(
         prediction = dict(nested_prediction or {})
         if not prediction:
             prediction = dict(payload)
+        if task_name == "TSE":
+            if nested_prediction is not None:
+                envelope_fields = sorted(str(field) for field in payload if field != "prediction")
+                if envelope_fields:
+                    raise ValueError(
+                        "TSE prediction envelope contains unapproved field(s): "
+                        + ", ".join(envelope_fields)
+                    )
+            unknown = sorted(str(field) for field in prediction if field not in TSE_OUTPUT_FIELDS)
+            if unknown:
+                raise ValueError(
+                    "TSE prediction contains unapproved field(s): " + ", ".join(unknown)
+                )
+            prediction_audio = prediction.get("prediction_audio")
+            if prediction_audio is None and "audio_path" in prediction:
+                raise ValueError("TSE prediction must use prediction_audio, not audio_path")
+            if expected_audio_output is None:
+                raise ValueError("TSE prediction requires a harness-assigned output_path")
+            resolved = _validate_tse_prediction_audio(
+                prediction_audio,
+                expected_path=expected_audio_output,
+                forbidden_inputs=forbidden_inputs,
+            )
+            normalized: dict[str, Any] = {"prediction_audio": str(resolved)}
+            returned_id = prediction.get("sample_id")
+            if returned_id is not None:
+                returned_id = _validate_tse_sample_key(returned_id)
+                if sample_id is not None and returned_id != sample_id:
+                    raise ValueError(
+                        f"TSE prediction sample_id {returned_id!r} does not match {sample_id!r}"
+                    )
+                normalized["sample_id"] = returned_id
+            elif sample_id is not None:
+                normalized["sample_id"] = _validate_tse_sample_key(sample_id)
+            return str(resolved), normalized
         if task_name in {"ASR", "S2TT"}:
             value = prediction.get("text") or prediction.get("transcript") or payload.get("text") or ""
             if isinstance(value, (list, tuple)) and len(value) == 1:
@@ -989,15 +1315,19 @@ def _normalize_prediction_payload(
                 "audio_path": resolved_audio,
                 "enhanced_audio": resolved_audio,
             }
-        if task_name in {"SER", "GR"}:
-            value = prediction.get("label") or payload.get("label") or payload.get("text") or ""
-            return str(value), {"label": str(value)}
-        if task_name == "SLU":
-            value = prediction.get("text") or prediction.get("label") or payload.get("text") or payload.get("label") or ""
-            normalized = {"text": str(value)}
-            if prediction.get("label") is not None:
-                normalized["label"] = prediction["label"]
-            return str(value), normalized
+        if task_name in CLASSIFICATION_TASKS:
+            # Only the model response is normalized here.  Reference fields
+            # from the dataset never participate in this conversion.
+            if isinstance(payload.get("prediction"), dict):
+                envelope_fields = sorted(str(field) for field in payload if field != "prediction")
+                if envelope_fields:
+                    raise ValueError(
+                        f"{task_name} prediction envelope contains unapproved field(s): "
+                        + ", ".join(envelope_fields)
+                    )
+            raw_prediction: Any = prediction if prediction else payload
+            scalar, normalized = normalize_classification_prediction(task_name, raw_prediction)
+            return scalar, normalized
         if task_name in {"SD", "SA-ASR"}:
             if isinstance(payload.get("prediction"), dict):
                 envelope_fields = sorted(str(field) for field in payload if field != "prediction")
@@ -1140,8 +1470,10 @@ def _normalize_prediction_payload(
         if task_name == "VC":
             normalized["converted_audio"] = value
         return value, normalized
-    if task_name in {"SER", "GR"}:
-        return value, {"label": value}
+    if task_name == "TSE":
+        raise ValueError("TSE prediction payload must be a JSON object with prediction_audio")
+    if task_name in CLASSIFICATION_TASKS:
+        return normalize_classification_prediction(task_name, value)
     if task_name in {"SD", "SA-ASR"}:
         raise ValueError(f"{task_name} prediction payload must be a JSON object with segments")
     if task_name == "VAD":
@@ -1188,7 +1520,7 @@ def _load_existing_structured_predictions(path: Path) -> dict[str, dict[str, Any
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            key = str(row.get("key", ""))
+            key = str(row.get("key") or row.get("sample_id") or "")
             if key:
                 records[key] = row
     return records
@@ -1225,17 +1557,18 @@ def _write_prediction_snapshots(
 
     with open(prediction_tmp, "w", encoding="utf-8") as handle:
         for sample in samples:
-            key = str(sample.get("key", ""))
+            key = _sample_key(sample)
             handle.write(f"{key}\t{prediction_map.get(key, '')}\n")
     prediction_tmp.replace(prediction_path)
 
     with open(structured_tmp, "w", encoding="utf-8") as handle:
         for sample in samples:
-            key = str(sample.get("key", ""))
+            key = _sample_key(sample)
             row = structured_map.get(
                 key,
                 {
                     "key": key,
+                    **({"sample_id": _validate_tse_sample_key(sample.get("sample_id") or key)} if sample_task == "TSE" else {}),
                     "dataset": canonical_dataset,
                     "task": sample_task,
                     "language": str(sample.get("language") or sample_language),
@@ -1255,7 +1588,7 @@ def _write_existing_result_log_entries(
 ) -> None:
     written: set[str] = set()
     for sample in samples:
-        key = str(sample.get("key", ""))
+        key = _sample_key(sample)
         if key in predictions:
             result_log_handle.write(f"{key}\t{predictions[key]}\n")
             written.add(key)
@@ -1678,7 +2011,12 @@ def main() -> int:
             with tempfile.TemporaryDirectory(prefix=f"sure-eval-{canonical_dataset}-audio-") as scratch:
                 scratch_dir = Path(scratch)
                 for sample in samples:
-                    key = str(sample.get("key", ""))
+                    key = _sample_key(sample)
+                    sample_identity = (
+                        _validate_tse_sample_key(sample.get("sample_id") or key)
+                        if sample_task == "TSE"
+                        else key
+                    )
                     if args.resume and key in prediction_map:
                         continue
 
@@ -1712,11 +2050,27 @@ def main() -> int:
                     next_id += 1
                     raw_payload = _extract_response_payload(response)
                     raw_response_types.add(type(raw_payload).__name__)
+                    tse_forbidden_inputs: tuple[Path, ...] = ()
+                    if sample_task == "TSE":
+                        tse_forbidden = _resolve_audio_field_path(
+                            repo_root, sample.get("reference_audio")
+                        )
+                        tse_forbidden_inputs = tuple(
+                            Path(str(arguments[field]))
+                            for field in ("mixture_audio_path", "enrollment_audio_path")
+                            if arguments.get(field)
+                        ) + ((tse_forbidden,) if tse_forbidden is not None else ())
                     prediction, normalized_prediction = _normalize_prediction_payload(
                         raw_payload,
                         task=sample_task,
                         kws_require_score=_kws_metrics_require_scores(generation_metrics),
-                        expected_audio_output=arguments.get("output_path") if sample_task == "SE" else None,
+                        expected_audio_output=(
+                            arguments.get("output_path")
+                            if sample_task in {"SE", "TSE"}
+                            else None
+                        ),
+                        forbidden_inputs=tse_forbidden_inputs,
+                        sample_id=sample_identity if sample_task == "TSE" else None,
                         vad_duration=(
                             _validate_pcm_wav(audio_path, label="VAD input audio")
                             if sample_task == "VAD"
@@ -1726,18 +2080,19 @@ def main() -> int:
                     if isinstance(raw_payload, dict):
                         observed_payload = (
                             normalized_prediction
-                            if sample_task in {"SD", "SA-ASR", "VAD"}
+                            if sample_task in {"SD", "SA-ASR", "VAD", "TSE", *CLASSIFICATION_TASKS}
                             else raw_payload
                         )
                         raw_response_keys.update(str(key) for key in observed_payload)
                     prediction_map[key] = prediction
                     raw_response_evidence = (
                         normalized_prediction
-                        if sample_task in {"SD", "SA-ASR", "VAD"}
+                        if sample_task in {"SD", "SA-ASR", "VAD", "TSE", *CLASSIFICATION_TASKS}
                         else raw_payload
                     )
                     structured_map[key] = {
                         "key": key,
+                        **({"sample_id": sample_identity} if sample_task == "TSE" else {}),
                         "dataset": canonical_dataset,
                         "task": sample_task,
                         "language": str(sample.get("language") or sample_language),

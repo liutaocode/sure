@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import sure_feed.providers.huggingface as hf_module  # noqa: E402
 import sure_feed.providers.base as base_module  # noqa: E402
+import sure_feed.bridge as bridge  # noqa: E402
+import sure_feed.fixture_registry as fixture_registry  # noqa: E402
 import check_model_input as check_model_input_module  # noqa: E402
 from sure_feed.fixture_registry import normalize_task, select_fixture_for_task  # noqa: E402
 from sure_feed.providers.base import (  # noqa: E402
@@ -602,6 +604,120 @@ sf.write("output.wav", enhanced, 16000)
             with self.subTest(alias=alias):
                 self.assertEqual(canonical_task(alias), "sa_asr")
                 self.assertEqual(normalize_task(alias), "sa_asr")
+
+    def test_composite_speech_understanding_is_not_collapsed_to_slu(self) -> None:
+        self.assertEqual(canonical_task("speech_understanding"), "speech_understanding")
+        self.assertEqual(normalize_task("speech_understanding"), "speech_understanding")
+        self.assertEqual(canonical_task("spoken language understanding"), "slu")
+        self.assertEqual(normalize_task("spoken language understanding"), "slu")
+
+    def test_tse_generated_config_uses_pair_input_schema(self) -> None:
+        for alias in (
+            "tse",
+            "target_speaker",
+            "target_speaker_extraction_model",
+            "target_voice_separation",
+        ):
+            with self.subTest(alias=alias):
+                self.assertEqual(base_module.canonical_task(alias), "tse")
+                self.assertEqual(normalize_task(alias), "tse")
+                self.assertEqual(bridge._canonical_task_type(alias), "tse")
+        manifest = {
+            "source": {"id": "example/tse", "provider": "modelscope"},
+            "task_type": "tse",
+        }
+        config = bridge._default_config_yaml(manifest, Path("/tmp/example__tse"), None)
+        self.assertIn("mixture_audio_path", config)
+        self.assertIn("enrollment_audio_path", config)
+        self.assertIn("output_path", config)
+        self.assertNotIn("required: [\"audio_path\"]", config)
+
+    def test_tse_fixture_roles_project_to_safe_canonical_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture_dir = root / "fixtures" / "tasks" / "tse" / "smoke"
+            fixture_dir.mkdir(parents=True)
+            mixture = fixture_dir / "mixture.wav"
+            enrollment = fixture_dir / "enrollment.wav"
+            reference = fixture_dir / "reference.wav"
+            outside = root / "private.wav"
+            for path in (mixture, enrollment, reference, outside):
+                path.write_bytes(b"wav")
+            sample = fixture_registry._compact_sample(
+                {
+                    "sample_id": "utt-1",
+                    "mixture_audio_path": str(mixture),
+                    "enrollment_audio_path": str(enrollment),
+                    "target_audio_path": str(reference),
+                    "reference_audio_path": str(outside),
+                    "task_type": "target_speaker_extraction_model",
+                },
+                fixture_dir,
+                root,
+            )
+            self.assertEqual(sample["key"], "utt-1")
+            self.assertEqual(sample["audio"], "fixtures/tasks/tse/smoke/mixture.wav")
+            self.assertEqual(sample["mixture_audio"], sample["audio"])
+            self.assertEqual(sample["enrollment_audio"], "fixtures/tasks/tse/smoke/enrollment.wav")
+            self.assertEqual(sample["reference_audio"], "fixtures/tasks/tse/smoke/reference.wav")
+            self.assertNotIn("mixture_audio_path", sample)
+            self.assertNotIn("enrollment_audio_path", sample)
+            self.assertNotIn("reference_audio_path", sample)
+            self.assertNotIn(str(root), json.dumps(sample))
+
+    def test_provider_derives_tse_registry_contract(self) -> None:
+        contract = {
+            "input_type": "audio_pair",
+            "output_type": "audio",
+            "primary_field": "prediction_audio",
+            "required_fields": ["prediction_audio"],
+            "nonempty_fields": ["prediction_audio"],
+            "json_serializable": True,
+        }
+        with mock.patch.object(
+            base_module,
+            "select_fixture_for_task",
+            return_value=({"fixture_source": "task_registry"}, contract, [], []),
+        ):
+            fixture, derived = base_module._derive_fixture_and_contract(
+                "target_speaker",
+                {"model_id": "owner/tse"},
+                "",
+                {},
+                "manual",
+                None,
+                [],
+                [],
+            )
+        self.assertEqual(fixture["fixture_source"], "task_registry")
+        self.assertEqual(derived, contract)
+
+    def test_generated_classification_and_tse_results_are_closed(self) -> None:
+        for task, fields, expected in (
+            ("ser", {"label": "neu"}, {"label": "neu"}),
+            ("gr", {"label": "woman"}, {"label": "woman"}),
+            ("slu", {"answer": "A"}, {"answer": "A"}),
+            ("tse", {"prediction_audio": "out.wav"}, {"prediction_audio": "out.wav"}),
+            ("se", {"audio_path": "enhanced.wav"}, {"audio_path": "enhanced.wav"}),
+            (
+                "kws",
+                {"detected": False, "keyword": None, "score": None},
+                {"detected": False, "keyword": None, "score": None},
+            ),
+            ("sd", {"segments": []}, {"segments": []}),
+            ("sa_asr", {"segments": []}, {"segments": []}),
+        ):
+            with self.subTest(task=task):
+                source = bridge._default_model_py(
+                    {"source": {"id": "example/model"}, "task_type": task}
+                )
+                namespace: dict[str, object] = {}
+                exec(source, namespace)
+                result_type = namespace["PredictionResult"]
+                result = result_type(**fields)
+                self.assertEqual(result.to_dict(), expected)
+                server_source = bridge._default_server_py(task)
+                self.assertNotIn('"raw": result', server_source)
 
     def test_direct_asr_pipeline_yields_to_explicit_diarization_models(self) -> None:
         candidates = (

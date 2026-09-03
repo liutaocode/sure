@@ -34,6 +34,7 @@ from sure_eval.datasets.source_resolver import (
 )
 
 from evaluation_capabilities import default_metrics_for_task_language, supported_metrics_for_task_language
+from classification_contract import CLASSIFICATION_TASKS, canonical_task as canonical_classification_task
 from harness_runtime import HarnessRuntimeBindingError, load_harness_runtime
 from resolve_evaluation_engine import resolve_engine_root
 from resolve_model_dir import APPROVED_MODELS_ROOT, resolve_approved_model
@@ -61,10 +62,10 @@ TEXT_DEFAULT_METRICS = {
     "VAD": "f1",
     "KWS": "accuracy",
     "SE": "si-sdr",
+    "TSE": "si_sdr",
     "SER": "accuracy",
     "GR": "accuracy",
     "SLU": "accuracy",
-    "SPEECH_UNDERSTANDING": "accuracy",
 }
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._=-]{0,199}$")
 
@@ -101,6 +102,20 @@ def _normalize_task(value: Any) -> str:
     )
     if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
         return "VAD"
+    if normalized in {
+        "TSE",
+        "TARGET_SPEAKER_EXTRACTION",
+        "TARGET_SPEAKER_EXTRACTOR",
+        "TARGET_SPEAKER_EXTRACTION_MODEL",
+        "TARGET_SPEAKER",
+        "SPEAKER_EXTRACTION",
+        "TARGET_VOICE_EXTRACTION",
+        "TARGET_VOICE_SEPARATION",
+    }:
+        return "TSE"
+    classification = canonical_classification_task(normalized).upper()
+    if classification in CLASSIFICATION_TASKS:
+        return classification
     return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
@@ -112,6 +127,8 @@ def _metric_task_hint(metrics: list[str]) -> str:
             hinted.append("VC")
         elif metric_name.startswith("tts_"):
             hinted.append("TTS")
+        elif metric_name.startswith("tse_"):
+            hinted.append("TSE")
     hinted = _dedupe(hinted)
     return hinted[0] if len(hinted) == 1 else ""
 
@@ -134,17 +151,22 @@ def _effective_dataset_task(dataset_task: str, model_task: str, metrics: list[st
     task = _normalize_task(dataset_task) or "UNKNOWN"
     model_task = _normalize_task(model_task)
     metric_task = _metric_task_hint(metrics)
-    if task in {"TTS", "VC"}:
-        if metric_task in {"TTS", "VC"}:
+    if task in {"TTS", "VC", "TSE"}:
+        if metric_task in {"TTS", "VC", "TSE"}:
             return metric_task
-        if model_task in {"TTS", "VC"}:
+        if model_task in {"TTS", "VC", "TSE"}:
             return model_task
     return task
 
 
-SYNTH_TASKS = {"TTS", "VC"}
+SYNTH_TASKS = {"TTS", "VC", "TSE"}
 TASK_CHECK_EXEMPT = {"OMNI", "API"}
-TASK_WORDS = {"ASR": "speech recognition", "TTS": "speech synthesis", "VC": "voice conversion"}
+TASK_WORDS = {
+    "ASR": "speech recognition",
+    "TTS": "speech synthesis",
+    "VC": "voice conversion",
+    "TSE": "target speaker extraction",
+}
 
 
 class EvalInputError(ValueError):
@@ -213,8 +235,8 @@ def _check_task_compatibility(model: dict[str, Any], datasets: list[dict[str, An
     for item in datasets:
         task = _normalize_task(item.get("task"))
         exact_task_mismatch = (
-            model_task in {"KWS", "SE", "SD", "SA-ASR", "VAD"}
-            or task in {"KWS", "SE", "SD", "SA-ASR", "VAD"}
+            model_task in {"KWS", "SE", "TSE", "SD", "SA-ASR", "VAD", *CLASSIFICATION_TASKS}
+            or task in {"KWS", "SE", "TSE", "SD", "SA-ASR", "VAD"}
         ) and task != model_task
         synth_mismatch = (task in SYNTH_TASKS) != model_synth
         if task and task != "UNKNOWN" and (exact_task_mismatch or synth_mismatch):
@@ -650,6 +672,8 @@ def _default_metrics(task: str, language: str, engine_root: Path | None) -> list
     task_upper = _normalize_task(task)
     if task_upper == "SE":
         return ["si-sdr"]
+    if task_upper == "TSE":
+        return ["si_sdr"]
     if task_upper == "VAD":
         return ["f1", "p_fa", "p_miss", "dcf_nist"]
     if engine_root is not None:
@@ -944,7 +968,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
             "evaluation_tasks": tasks,
             "languages": languages,
             "single_task": len([task for task in tasks if task != "UNKNOWN"]) <= 1,
-            "audio_evaluation_required": any(task in {"TTS", "VC"} for task in tasks),
+            "audio_evaluation_required": any(task in {"TTS", "VC", "TSE"} for task in tasks),
             "metrics": metric_list,
         },
         "runtime": {

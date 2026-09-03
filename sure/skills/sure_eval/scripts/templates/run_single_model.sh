@@ -128,6 +128,10 @@ else:
         "TTS": "synthesize_speech",
         "VC": "convert_voice",
         "SE": "enhance_speech",
+        "TSE": "extract_target_speaker",
+        "SER": "emotion_recognize",
+        "GR": "gender_recognize",
+        "SLU": "slu_understand",
     }
     if task in defaults:
         print(defaults[task])
@@ -159,7 +163,7 @@ export SURE_EVAL_METRICS="$METRICS"
 EVALUATION_BACKEND="${EVALUATION_BACKEND:-external}"
 STRICT_MAIN_FLOW="${STRICT_MAIN_FLOW:-1}"
 EVALUATION_TIMEOUT="${EVALUATION_TIMEOUT:-7200}"
-AUDIO_EVAL_TASKS="${AUDIO_EVAL_TASKS:-TTS VC}"
+AUDIO_EVAL_TASKS="${AUDIO_EVAL_TASKS:-TTS VC TSE}"
 REPAIR_INVALID_ONLY="${REPAIR_INVALID_ONLY:-0}"
 REPAIR_VALIDATION_PAYLOAD="${REPAIR_VALIDATION_PAYLOAD:-$RUN_DIR/validation_payload.json}"
 EXECUTION_PATH="${SURE_EVAL_EXECUTION_PATH:-${EXECUTION_PATH:-unknown}}"

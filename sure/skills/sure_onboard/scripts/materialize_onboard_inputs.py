@@ -30,6 +30,7 @@ from sure.site.container_registry import resolve_image_version
 from sure.site.loader import load_site_policy
 
 from structured_segments import canonical_task, is_structured_task, structured_task_contract
+from tse_contract import canonical_task as canonical_tse_task, task_contract as tse_task_contract
 
 try:
     import yaml
@@ -55,6 +56,7 @@ TASK_TYPES = {
     "speech_understanding",
     "sa-asr",
     "sa_asr",
+    "tse",
 }
 DEPLOYMENT_TYPES = {"local", "api"}
 PACKAGE_PROFILES = {"none", "docker-local", "docker-registry"}
@@ -69,6 +71,7 @@ ALL_TASK_PLAYBOOKS = [
     "references/task_playbooks/KWS.md",
     "references/task_playbooks/SE.md",
     "references/task_playbooks/VAD.md",
+    "references/task_playbooks/TSE.md",
 ]
 ALL_ENV_PLAYBOOKS = [
     "references/playbooks/env_uv.md",
@@ -257,6 +260,8 @@ def task_playbooks_for(task_type: str) -> list[str]:
         ]
     if task in {"s2tt", "sd", "ser", "slu", "gr", "speech_understanding"}:
         return ["references/task_playbooks/SPEECH_UNDERSTANDING.md"]
+    if task == "tse":
+        return ["references/task_playbooks/TSE.md"]
     if task == "tts":
         return ["references/task_playbooks/TTS.md"]
     if task == "vc":
@@ -343,7 +348,22 @@ def make_model_input_resolved(
 
     normalized_model_input = {**model_input, "task_type": task_type}
     task_contract = None
-    if is_structured_task(task_type):
+    if canonical_tse_task(task_type) == "tse":
+        task_contract = tse_task_contract()
+        declared_contract = model_input.get("io_contract")
+        if declared_contract is not None and declared_contract != task_contract["io_contract"]:
+            raise ValueError(
+                "MODEL_INPUT io_contract conflicts with the canonical TSE task contract; "
+                "regenerate the Feed handoff instead of overriding it"
+            )
+        for field in ("tool_name", "predict_method"):
+            declared = model_input.get(field)
+            if declared is not None and declared != task_contract[field]:
+                raise ValueError(
+                    f"MODEL_INPUT {field}={declared!r} conflicts with canonical {field}={task_contract[field]!r}"
+                )
+        normalized_model_input.update(task_contract)
+    elif is_structured_task(task_type):
         task_contract = structured_task_contract(task_type)
         declared_contract = model_input.get("io_contract")
         if declared_contract is not None and declared_contract != task_contract["io_contract"]:

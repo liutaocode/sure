@@ -91,6 +91,25 @@ def _model_task(config: dict[str, Any]) -> str:
     ).strip().upper().replace("-", "_").replace(" ", "_")
     if task in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
         return "VAD"
+    if task in {
+        "TSE",
+        "TARGET_SPEAKER_EXTRACTION",
+        "TARGET_SPEAKER_EXTRACTOR",
+        "TARGET_SPEAKER_EXTRACTION_MODEL",
+        "TARGET_SPEAKER",
+        "SPEAKER_EXTRACTION",
+        "TARGET_VOICE_EXTRACTION",
+        "TARGET_VOICE_SEPARATION",
+    }:
+        return "TSE"
+    task = {
+        "SPEECH_EMOTION_RECOGNITION": "SER",
+        "EMOTION_RECOGNITION": "SER",
+        "SPEAKER_EMOTION_RECOGNITION": "SER",
+        "GENDER_RECOGNITION": "GR",
+        "SPEAKER_GENDER": "GR",
+        "SPOKEN_LANGUAGE_UNDERSTANDING": "SLU",
+    }.get(task, task)
     return "SA-ASR" if task == "SA_ASR" else task
 
 
@@ -110,6 +129,10 @@ def _tool_names(config: dict[str, Any]) -> list[str]:
         "SD": "diarize",
         "SA-ASR": "transcribe_with_speakers",
         "VAD": "detect_speech",
+        "SER": "emotion_recognize",
+        "GR": "gender_recognize",
+        "SLU": "slu_understand",
+        "TSE": "extract_target_speaker",
     }
     return [defaults.get(_model_task(config), "predict")]
 
@@ -120,6 +143,9 @@ def _respond(payload: dict[str, Any]) -> None:
 
 
 def _tool_schema(task: str) -> dict[str, Any]:
+    classification_task = _classification_task_name(task)
+    if classification_task:
+        task = classification_task
     if task == "VC":
         required = ["source_audio_path", "reference_audio_path"]
         properties = {
@@ -140,6 +166,26 @@ def _tool_schema(task: str) -> dict[str, Any]:
             "audio_path": {"type": "string"},
             "output_path": {"type": "string"},
         }
+    elif task == "TSE":
+        required = ["mixture_audio_path", "enrollment_audio_path", "output_path"]
+        properties = {
+            "mixture_audio_path": {"type": "string", "minLength": 1},
+            "enrollment_audio_path": {"type": "string", "minLength": 1},
+            "output_path": {"type": "string", "minLength": 1},
+        }
+    elif task in {"SER", "GR"}:
+        required = ["audio_path"]
+        properties = {
+            "audio_path": {"type": "string", "minLength": 1},
+            "language": {"type": "string"},
+        }
+    elif task == "SLU":
+        required = ["audio_path", "prompt"]
+        properties = {
+            "audio_path": {"type": "string", "minLength": 1},
+            "prompt": {"type": "string", "minLength": 1},
+            "choices": {"type": ["object", "array"]},
+        }
     else:
         required = ["audio_path"]
         properties = {"audio_path": {"type": "string"}}
@@ -148,17 +194,160 @@ def _tool_schema(task: str) -> dict[str, Any]:
         "properties": properties,
         "required": required,
     }
-    if task == "VAD":
+    if task in {"VAD", "TSE", "SER", "GR", "SLU"}:
         schema["additionalProperties"] = False
     return schema
 
 
-def _call_model(model: Any, name: str, arguments: dict[str, Any]) -> Any:
+CLASSIFICATION_TOOL_TASKS = {
+    "emotion_recognize": "SER",
+    "recognize_emotion": "SER",
+    "gender_recognize": "GR",
+    "recognize_gender": "GR",
+    "slu_understand": "SLU",
+    "understand_audio": "SLU",
+    "audio_question_answer": "SLU",
+}
+CLASSIFICATION_REFERENCE_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "input",
+    "input_audio",
+    "reference",
+    "reference_annotation",
+    "reference_audio",
+    "reference_text",
+    "target",
+    "target_audio",
+    "target_text",
+}
+
+
+def _classification_task_name(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    return {
+        "SER": "SER",
+        "SPEECH_EMOTION_RECOGNITION": "SER",
+        "EMOTION_RECOGNITION": "SER",
+        "SPEAKER_EMOTION_RECOGNITION": "SER",
+        "GR": "GR",
+        "GENDER_RECOGNITION": "GR",
+        "SPEAKER_GENDER": "GR",
+        "SLU": "SLU",
+        "SPOKEN_LANGUAGE_UNDERSTANDING": "SLU",
+    }.get(normalized, "")
+
+
+def _classification_reference_field_paths(value: Any, path: str = "arguments") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for field, item in value.items():
+            normalized = str(field).strip().lower().replace("-", "_")
+            child = f"{path}.{field}"
+            allowed_audio_path = path == "arguments" and normalized == "audio_path"
+            if not allowed_audio_path and (
+                normalized in CLASSIFICATION_REFERENCE_FIELDS
+                or normalized == "path"
+                or normalized.startswith("reference_")
+                or normalized.endswith("_path")
+            ):
+                found.append(child)
+            found.extend(_classification_reference_field_paths(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(_classification_reference_field_paths(item, f"{path}[{index}]"))
+    return found
+
+
+def _validate_classification_arguments(task: str, arguments: dict[str, Any]) -> None:
+    normalized = _classification_task_name(task)
+    if normalized not in {"SER", "GR", "SLU"}:
+        raise ValueError(f"unsupported classification task: {task!r}")
+    allowed = {"audio_path", "language"}
+    required = {"audio_path"}
+    if normalized == "SLU":
+        allowed.update({"prompt", "choices"})
+        required.add("prompt")
+    unknown = sorted(str(field) for field in arguments if field not in allowed)
+    if unknown:
+        raise ValueError("classification tool arguments contain unapproved field(s): " + ", ".join(unknown))
+    missing = sorted(field for field in required if field not in arguments)
+    if missing:
+        raise ValueError("classification tool arguments are missing required field(s): " + ", ".join(missing))
+    forbidden = _classification_reference_field_paths(arguments)
+    if forbidden:
+        raise ValueError(
+            "classification tool arguments contain reference/path field(s): "
+            + ", ".join(forbidden)
+        )
+    audio_path = arguments.get("audio_path")
+    if not isinstance(audio_path, str) or not audio_path.strip():
+        raise ValueError("classification audio_path must be a non-empty string")
+    language = arguments.get("language")
+    if "language" in arguments and not isinstance(language, str):
+        raise ValueError("classification language must be a string when provided")
+    if normalized == "SLU":
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("SLU prompt must be a non-empty string")
+        if "choices" in arguments:
+            choices = arguments["choices"]
+            if not isinstance(choices, (dict, list)) or not choices:
+                raise ValueError("SLU choices must be a non-empty object or array")
+    try:
+        json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("classification tool arguments must contain finite JSON values") from error
+
+
+def _call_model(
+    model: Any,
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    task: str | None = None,
+) -> Any:
+    classification_task = (
+        _classification_task_name(task)
+        if task is not None
+        else CLASSIFICATION_TOOL_TASKS.get(name, "")
+    )
+    if classification_task in {"SER", "GR", "SLU"}:
+        _validate_classification_arguments(classification_task, arguments)
     structured_methods = {
         "diarize": "diarize",
         "transcribe_with_speakers": "transcribe_with_speakers",
         "detect_speech": "detect_speech",
     }
+    if _model_task({"task": task}) == "TSE" or name in {
+        "extract_target_speaker",
+        "target_speaker_extract",
+        "target_speaker_extraction",
+    }:
+        expected_fields = {"mixture_audio_path", "enrollment_audio_path", "output_path"}
+        if set(arguments) != expected_fields:
+            raise ValueError(
+                "TSE tool requires exactly mixture_audio_path, enrollment_audio_path, and output_path"
+            )
+        for field in expected_fields:
+            value = arguments.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"TSE tool argument {field} must be a non-empty string")
+        for field in ("mixture_audio_path", "enrollment_audio_path"):
+            if not Path(arguments[field]).is_file():
+                raise FileNotFoundError(arguments[field])
+        if Path(arguments["output_path"]).is_dir():
+            raise ValueError("TSE output_path must name a file")
+        method = getattr(model, "extract_target_speaker", None)
+        if method is None:
+            # A generic wrapper may implement TSE through predict(dict).
+            return model.predict(arguments)
+        return method(
+            arguments.get("mixture_audio_path"),
+            arguments.get("enrollment_audio_path"),
+            arguments.get("output_path"),
+        )
     method_name = structured_methods.get(name)
     if method_name is None:
         return model.predict(arguments)
@@ -230,7 +419,7 @@ def main() -> int:
                 if name == "healthcheck" and hasattr(model, "healthcheck"):
                     result = model.healthcheck()
                 else:
-                    result = _call_model(model, name, arguments)
+                    result = _call_model(model, name, arguments, task=task)
                 _respond(
                     {
                         "jsonrpc": "2.0",

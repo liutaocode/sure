@@ -51,6 +51,73 @@ IO_CONTRACT: dict[str, Any] = (
 )
 KWS_OPERATING_THRESHOLD = 0.5
 STRUCTURED_TASKS = {"vad", "sd", "sa_asr"}
+CLASSIFICATION_TASKS = {"ser", "gr", "slu"}
+TSE_TASK = "tse"
+TSE_OUTPUT_FIELDS = {"prediction_audio", "sample_id"}
+TSE_REFERENCE_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "input",
+    "mixture_audio",
+    "mixture_audio_path",
+    "mixed_audio",
+    "reference",
+    "reference_audio",
+    "reference_audio_path",
+    "reference_text",
+    "target",
+    "target_audio",
+    "target_audio_path",
+    "target_text",
+    "enrollment_audio",
+    "enrollment_audio_path",
+}
+SER_LABEL_ALIASES = {
+    "neu": "neu", "neutral": "neu", "calm": "neu",
+    "hap": "hap", "happy": "hap", "happiness": "hap", "joy": "hap",
+    "ang": "ang", "angry": "ang", "anger": "ang",
+    "sad": "sad", "sadness": "sad",
+}
+GR_LABEL_ALIASES = {
+    "man": "man", "male": "man", "m": "man",
+    "woman": "woman", "female": "woman", "f": "woman",
+}
+SER_NUMERIC_ALIASES = {"0": "neu", "1": "hap", "2": "ang", "3": "sad"}
+GR_NUMERIC_ALIASES = {"0": "man", "1": "woman"}
+CLASSIFICATION_CHOICE_REFERENCE_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "reference",
+    "reference_audio",
+    "reference_text",
+    "target",
+    "target_text",
+}
+CLASSIFICATION_OUTPUT_ROW_FIELDS = {
+    "id",
+    "key",
+    "task",
+    "audio",
+    "dataset",
+    "ground_truth",
+    "prompt",
+    "result",
+}
+CLASSIFICATION_ROW_REFERENCE_FIELDS = {
+    "expected",
+    "ground_truth",
+    "input",
+    "input_audio",
+    "reference",
+    "reference_annotation",
+    "reference_audio",
+    "reference_text",
+    "target",
+    "target_audio",
+    "target_text",
+}
 STRUCTURED_SPEAKER_OUTPUT_FIELDS = {"segments", "num_speakers"}
 STRUCTURED_VAD_OUTPUT_FIELDS = {"speech_segments", "frame_scores"}
 STRUCTURED_SD_SEGMENT_FIELDS = {"speaker", "start", "end", "duration"}
@@ -106,6 +173,23 @@ def normalized_task_value(value: Any) -> str:
         return "se"
     if normalized in {"speech_activity_detection", "voice_activity_detection"}:
         return "vad"
+    if normalized in {
+        "tse",
+        "target_speaker_extraction",
+        "target_speaker_extractor",
+        "target_speaker_extraction_model",
+        "target_speaker",
+        "speaker_extraction",
+        "target_voice_extraction",
+        "target_voice_separation",
+    }:
+        return TSE_TASK
+    if normalized in {"speech_emotion_recognition", "speaker_emotion_recognition", "emotion_recognition"}:
+        return "ser"
+    if normalized in {"gender_recognition", "speaker_gender"}:
+        return "gr"
+    if normalized == "spoken_language_understanding":
+        return "slu"
     return normalized
 
 
@@ -219,6 +303,345 @@ def require_vad_single_link_file(path: Path, label: str) -> None:
         raise ValueError(f"VAD {label} must not be hard-linked: {path}")
 
 
+def normalize_classification_label(task: str, value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"{task.upper()} label is unknown: {value!r}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{task.upper()} label is unknown: {value!r}")
+    text = ("" if value is None else str(value)).strip().lower()
+    text = re.sub(r"^[\s\[({<]+|[\s\])}>.,!?;:：，。！？；]+$", "", text)
+    aliases = (
+        {**SER_LABEL_ALIASES, **SER_NUMERIC_ALIASES}
+        if task == "ser"
+        else {**GR_LABEL_ALIASES, **GR_NUMERIC_ALIASES}
+    )
+    if text not in aliases:
+        raise ValueError(f"{task.upper()} label is unknown: {value!r}")
+    return aliases[text]
+
+
+def normalize_classification_answer(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError("SLU answer must be a string or finite scalar")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("SLU answer must be a string or finite scalar")
+    text = str(value).strip()
+    text = text.rstrip(".!?。！？")
+    if not text or any(ord(character) < 32 for character in text):
+        raise ValueError("SLU answer must be non-empty and must not contain control characters")
+    match = re.fullmatch(r"(?is)(?:the\s+)?answer\s*(?:is|:|-)?\s*([A-Za-z0-9_+-]+)", text)
+    if match:
+        return match.group(1)
+    match = re.fullmatch(r"答案\s*(?:是|为|:|：)?\s*([A-Za-z0-9_+-]+)", text)
+    return match.group(1) if match else text
+
+
+def validate_classification_choices(value: Any, path: str = "choices") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            if normalized in CLASSIFICATION_CHOICE_REFERENCE_FIELDS or normalized.endswith("_path"):
+                raise ValueError(f"SLU choices contain reference/path field at {path}.{key}")
+            validate_classification_choices(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            validate_classification_choices(item, f"{path}[{index}]")
+
+
+def normalize_classification_output(task: str, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        if task in {"ser", "gr"} and not isinstance(value, bool):
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            if isinstance(value, int):
+                value = {"label": value}
+        elif task == "slu" and isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            value = {"answer": value}
+    if not isinstance(value, dict):
+        raise ValueError("classification output must be an object or string")
+    allowed = ({"label", "score", "text"} if task in {"ser", "gr"} else {"answer", "label", "text"})
+    unknown = sorted(str(field) for field in value if field not in allowed)
+    if unknown:
+        raise ValueError("classification output contains unapproved field(s): " + ", ".join(unknown))
+    forbidden = sorted(
+        str(field)
+        for field in value
+        if str(field).lower() in {"expected", "ground_truth", "reference", "reference_audio", "reference_text", "target", "target_text"}
+        or str(field).lower().endswith("_path")
+    )
+    if forbidden:
+        raise ValueError("classification output contains reference/path field(s): " + ", ".join(forbidden))
+    if task in {"ser", "gr"}:
+        raw_label = value["label"] if value.get("label") is not None else value.get("text")
+        label = normalize_classification_label(task, raw_label)
+        output: dict[str, Any] = {"label": label}
+        score = value.get("score")
+        if score is not None:
+            if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)) or not 0 <= float(score) <= 1:
+                raise ValueError("classification score must be finite and within [0, 1]")
+            output["score"] = float(score)
+        return output
+    raw_answer = (
+        value["answer"]
+        if value.get("answer") is not None
+        else value["label"]
+        if value.get("label") is not None
+        else value.get("text")
+    )
+    answer = normalize_classification_answer(raw_answer)
+    output = {"answer": answer}
+    if value.get("label") is not None:
+        output["label"] = normalize_classification_answer(value["label"])
+    return output
+
+
+def classification_fixture_payloads() -> list[dict[str, Any]]:
+    task = normalized_task_type()
+    payloads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for gt_path in sorted((MODEL_DIR / "fixture" / task).glob("**/gt.jsonl")):
+        for line_number, line in enumerate(gt_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                raise ValueError(f"{task.upper()} fixture line {line_number} must be an object")
+            key = str(item.get("key") or item.get("id") or "").strip()
+            if (
+                not key
+                or key in seen
+                or "/" in key
+                or "\\" in key
+                or any(ord(character) < 32 or character.isspace() for character in key)
+            ):
+                raise ValueError(f"{task.upper()} fixture key is missing or duplicated: {key!r}")
+            seen.add(key)
+            audio = item.get("audio") or item.get("wav")
+            if not isinstance(audio, str) or not audio.strip():
+                raise ValueError(f"{task.upper()} fixture {key} requires audio")
+            audio_path = (gt_path.parent / audio).resolve()
+            if not audio_path.is_file() or not audio_path.is_relative_to(gt_path.parent.resolve()):
+                raise ValueError(f"{task.upper()} fixture {key} audio is missing or unsafe")
+            input_data: dict[str, Any] = {"audio_path": str(audio_path)}
+            if isinstance(item.get("language"), str) and item["language"].strip():
+                input_data["language"] = item["language"]
+            if task == "slu":
+                prompt = item.get("prompt") or item.get("instruction")
+                if not isinstance(prompt, str) or not prompt.strip():
+                    raise ValueError(f"SLU fixture {key} requires a non-empty prompt")
+                input_data["prompt"] = prompt
+                choices = item.get("choices", item.get("options"))
+                if choices is not None:
+                    if not isinstance(choices, (dict, list)) or not choices:
+                        raise ValueError(f"SLU fixture {key} choices must be non-empty")
+                    validate_classification_choices(choices)
+                    input_data["choices"] = choices
+            if task in {"ser", "gr"}:
+                normalize_classification_label(
+                    task,
+                    item.get("ground_truth", item.get("target", item.get("label"))),
+                )
+            else:
+                normalize_classification_answer(
+                    item.get("ground_truth", item.get("target", item.get("answer")))
+                )
+            payloads.append({
+                "input": input_data,
+                "fixture": {
+                    "key": key,
+                    "audio": audio,
+                    "dataset": item.get("dataset"),
+                    "language": item.get("language"),
+                    "ground_truth": item.get("ground_truth", item.get("target", item.get("answer"))),
+                    **({"prompt": item.get("prompt") or item.get("instruction")} if task == "slu" else {}),
+                },
+            })
+    if not 1 <= len(payloads) <= 5:
+        raise ValueError(f"{task.upper()} validation requires 1 to 5 fixture rows")
+    return payloads
+
+
+def run_classification_fixture(wrapper: Any, task: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Run every classification fixture row and return a keyed output document."""
+
+    rows: list[dict[str, Any]] = []
+    for fixture in classification_fixture_payloads():
+        key = str(fixture["fixture"]["key"])
+        result = run_predict(wrapper, dict(fixture["input"]), scalar_fallback=False)
+        canonical = normalize_classification_output(task, result)
+        rows.append(
+            {
+                "key": key,
+                "task": task,
+                "audio": fixture["fixture"].get("audio"),
+                "dataset": fixture["fixture"].get("dataset"),
+                "ground_truth": fixture["fixture"].get("ground_truth"),
+                **({"prompt": fixture["fixture"].get("prompt")} if task == "slu" else {}),
+                "result": canonical,
+            }
+        )
+    return {"rows": rows}, rows
+
+
+def classification_forbidden_row_fields(value: Any, path: str = "row") -> list[str]:
+    """Find nested reference/path field names in a classification evidence row."""
+
+    found: list[str] = []
+    if isinstance(value, dict):
+        for field, item in value.items():
+            normalized = str(field).strip().lower().replace("-", "_")
+            child = f"{path}.{field}"
+            root_ground_truth = path == "row" and normalized == "ground_truth"
+            if not root_ground_truth and (
+                normalized in CLASSIFICATION_ROW_REFERENCE_FIELDS
+                or normalized == "path"
+                or normalized.startswith("reference_")
+                or normalized.endswith("_path")
+            ):
+                found.append(child)
+            found.extend(classification_forbidden_row_fields(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(classification_forbidden_row_fields(item, f"{path}[{index}]"))
+    return found
+
+
+def _validate_classification_output_rows(
+    rows: Any,
+    task: str,
+    *,
+    fixtures: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    if not isinstance(rows, list):
+        return [f"{task.upper()} sample_output.json must contain a rows array"]
+    fixture_rows = fixtures if fixtures is not None else classification_fixture_payloads()
+    expected_keys = [str(item["fixture"]["key"]) for item in fixture_rows]
+    allowed_fields = set(CLASSIFICATION_OUTPUT_ROW_FIELDS)
+    if task != "slu":
+        allowed_fields.discard("prompt")
+    violations: list[str] = []
+    observed: list[str] = []
+    for index, row in enumerate(rows, 1):
+        prefix = f"{task.upper()} output row {index}"
+        if not isinstance(row, dict):
+            violations.append(f"{prefix} must be an object")
+            continue
+        unknown = sorted(str(field) for field in row if field not in allowed_fields)
+        if unknown:
+            violations.append(f"{prefix} contains unapproved field(s): " + ", ".join(unknown))
+        forbidden = classification_forbidden_row_fields(row)
+        if forbidden:
+            violations.append(
+                f"{prefix} exposes reference/path field(s): " + ", ".join(forbidden)
+            )
+        missing = sorted(field for field in allowed_fields if field not in row)
+        if missing:
+            violations.append(f"{prefix} is missing field(s): " + ", ".join(missing))
+
+        raw_key = row.get("key")
+        key = raw_key.strip() if isinstance(raw_key, str) else ""
+        if (
+            not isinstance(raw_key, str)
+            or not key
+            or raw_key != key
+            or "/" in key
+            or "\\" in key
+            or any(ord(character) < 32 or character.isspace() for character in key)
+        ):
+            violations.append(f"{prefix} key must be a safe canonical token")
+            key = ""
+        elif key in observed:
+            violations.append(f"{prefix} key is duplicated: {key!r}")
+        observed.append(key)
+
+        fixture = fixture_rows[index - 1].get("fixture") if index <= len(fixture_rows) else None
+        expected_key = str(fixture.get("key") or "") if isinstance(fixture, dict) else ""
+        if key and expected_key and key != expected_key:
+            violations.append(
+                f"{prefix} key does not preserve fixture order: expected={expected_key!r}, observed={key!r}"
+            )
+        row_id = row.get("id")
+        if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id != index:
+            violations.append(f"{prefix} id must equal its one-based fixture position")
+        if row.get("task") != task:
+            violations.append(f"{prefix} task must use canonical value {task!r}")
+
+        audio = row.get("audio")
+        if not isinstance(audio, str) or not audio.strip():
+            violations.append(f"{prefix} audio must be a non-empty relative path")
+        else:
+            relative_audio = Path(audio)
+            if (
+                relative_audio.is_absolute()
+                or ".." in relative_audio.parts
+                or "\\" in audio
+                or structured_looks_like_absolute_path_or_uri(audio)
+            ):
+                violations.append(f"{prefix} audio must be a portable relative path")
+            if isinstance(fixture, dict) and audio != fixture.get("audio"):
+                violations.append(f"{prefix} audio does not match the fixture")
+
+        if isinstance(fixture, dict) and row.get("dataset") != fixture.get("dataset"):
+            violations.append(f"{prefix} dataset metadata changed")
+        dataset = row.get("dataset")
+        if dataset is not None and (
+            not isinstance(dataset, str)
+            or structured_looks_like_absolute_path_or_uri(dataset)
+        ):
+            violations.append(f"{prefix} dataset must be a portable string or null")
+
+        reference = row.get("ground_truth")
+        if isinstance(fixture, dict):
+            expected_reference = fixture.get("ground_truth")
+            try:
+                observed_reference = (
+                    normalize_classification_label(task, reference)
+                    if task in {"ser", "gr"}
+                    else normalize_classification_answer(reference)
+                )
+                canonical_reference = (
+                    normalize_classification_label(task, expected_reference)
+                    if task in {"ser", "gr"}
+                    else normalize_classification_answer(expected_reference)
+                )
+                if observed_reference != canonical_reference:
+                    violations.append(f"{prefix} ground_truth does not match the fixture")
+            except (TypeError, ValueError) as error:
+                violations.append(f"{prefix} has invalid ground_truth: {error}")
+
+        if task == "slu":
+            prompt = row.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
+                violations.append(f"{prefix} prompt must be a non-empty string")
+            elif isinstance(fixture, dict) and prompt != fixture.get("prompt"):
+                violations.append(f"{prefix} prompt metadata changed")
+
+        result = row.get("result")
+        if not isinstance(result, dict):
+            violations.append(f"{prefix} result must be an object")
+            continue
+        try:
+            canonical = normalize_classification_output(task, result)
+        except (TypeError, ValueError) as error:
+            violations.append(f"{prefix} result: {error}")
+            continue
+        if result != canonical:
+            violations.append(f"{prefix} result is not canonical")
+
+    if observed != expected_keys:
+        violations.append(
+            f"{task.upper()} output keys must preserve fixture order: "
+            f"expected={expected_keys}, observed={observed}"
+        )
+    return violations
+
+
+def validate_classification_output_document(sample: dict[str, Any], task: str) -> list[str]:
+    """Validate every keyed classification result and reject reference leakage."""
+
+    return _validate_classification_output_rows(sample.get("rows"), task)
+
+
 def fixture_payloads() -> list[dict[str, Any]]:
     task = normalized_task_type()
     raw_payload = os.environ.get("SURE_VALIDATE_INPUT_JSON")
@@ -263,6 +686,78 @@ def fixture_payloads() -> list[dict[str, Any]]:
                     },
                 }
             ]
+        if task == TSE_TASK:
+            mixture = parsed.get("mixture_audio_path")
+            enrollment = parsed.get("enrollment_audio_path")
+            if not isinstance(mixture, str) or not mixture.strip():
+                raise ValueError("TSE SURE_VALIDATE_INPUT_JSON requires mixture_audio_path")
+            if not isinstance(enrollment, str) or not enrollment.strip():
+                raise ValueError("TSE SURE_VALIDATE_INPUT_JSON requires enrollment_audio_path")
+            mixture_path = Path(mixture).expanduser()
+            enrollment_path = Path(enrollment).expanduser()
+            if mixture_path.is_symlink() or not mixture_path.is_file():
+                raise ValueError("TSE mixture_audio_path must identify a regular file")
+            if enrollment_path.is_symlink() or not enrollment_path.is_file():
+                raise ValueError("TSE enrollment_audio_path must identify a regular file")
+            structured_wav_info(mixture_path)
+            structured_wav_info(enrollment_path)
+            try:
+                if mixture_path.resolve().samefile(enrollment_path.resolve()):
+                    raise ValueError("TSE mixture and enrollment audio must be independent files")
+            except OSError:
+                pass
+            key = str(parsed.get("sample_id") or parsed.get("key") or Path(mixture).stem).strip()
+            tse_safe_sample_id(key)
+            fixture: dict[str, Any] = {
+                "key": key,
+                "sample_id": key,
+                "mixture_audio": parsed.get("mixture_audio") or mixture,
+                "enrollment_audio": parsed.get("enrollment_audio") or enrollment,
+                "reference_audio": parsed.get("reference_audio"),
+                "mixture_audio_path": mixture,
+                "enrollment_audio_path": enrollment,
+                "reference_audio_path": parsed.get("reference_audio_path") or parsed.get("reference_audio"),
+                "audio": parsed.get("audio") or parsed.get("mixture_audio") or mixture,
+                "language": parsed.get("language"),
+                "dataset": parsed.get("dataset"),
+                "reference_text": parsed.get("reference_text"),
+            }
+            return [
+                {
+                    "input": {
+                        "mixture_audio_path": mixture,
+                        "enrollment_audio_path": enrollment,
+                    },
+                    "fixture": fixture,
+                }
+            ]
+        if task in CLASSIFICATION_TASKS:
+            audio_path = parsed.get("audio_path")
+            if not isinstance(audio_path, str) or not audio_path.strip():
+                raise ValueError("classification SURE_VALIDATE_INPUT_JSON requires audio_path")
+            input_data: dict[str, Any] = {"audio_path": audio_path}
+            if isinstance(parsed.get("language"), str) and parsed["language"].strip():
+                input_data["language"] = parsed["language"]
+            fixture: dict[str, Any] = {
+                "key": str(parsed.get("key") or Path(audio_path).stem),
+                "audio": parsed.get("audio") or Path(audio_path).name,
+                "dataset": parsed.get("dataset"),
+                "language": parsed.get("language"),
+                "ground_truth": parsed.get("ground_truth", parsed.get("target", parsed.get("answer"))),
+            }
+            if task == "slu":
+                prompt = parsed.get("prompt") or parsed.get("instruction")
+                if not isinstance(prompt, str) or not prompt.strip():
+                    raise ValueError("SLU SURE_VALIDATE_INPUT_JSON requires a non-empty prompt")
+                input_data["prompt"] = prompt
+                fixture["prompt"] = prompt
+                choices = parsed.get("choices", parsed.get("options"))
+                if choices is not None:
+                    if not isinstance(choices, (dict, list)) or not choices:
+                        raise ValueError("SLU choices must be a non-empty object or array")
+                    validate_classification_choices(choices)
+                    input_data["choices"] = choices
+            return [{"input": input_data, "fixture": fixture}]
         keywords = parsed.get("keywords")
         if (
             task == "kws"
@@ -309,6 +804,9 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 },
             }
         ]
+
+    if task == TSE_TASK:
+        return tse_fixture_payloads()
 
     fixture_root = MODEL_DIR / "fixture"
     for gt_path in sorted(fixture_root.glob("**/gt.jsonl")):
@@ -373,6 +871,41 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 seen_keys.add(key)
                 payload["audio_path"] = str(audio_path)
                 payload.update(structured_protocol_arguments())
+            elif task in CLASSIFICATION_TASKS:
+                audio = item.get("audio") or item.get("wav")
+                if not isinstance(audio, str) or not audio.strip():
+                    raise ValueError(f"{task.upper()} fixture requires a non-empty audio field")
+                audio_path = (gt_path.parent / audio).resolve()
+                if not audio_path.is_file() or not audio_path.is_relative_to(gt_path.parent.resolve()):
+                    raise ValueError(f"{task.upper()} fixture audio is missing or unsafe")
+                key = str(item.get("key") or item.get("id") or audio_path.stem).strip()
+                if (
+                    not key
+                    or key in seen_keys
+                    or "/" in key
+                    or "\\" in key
+                    or any(ord(character) < 32 or character.isspace() for character in key)
+                ):
+                    raise ValueError(f"{task.upper()} fixture key is missing or duplicated: {key!r}")
+                seen_keys.add(key)
+                if item.get("task_type") is not None and normalized_task_value(item["task_type"]) != task:
+                    raise ValueError(f"{task.upper()} fixture declares task {item['task_type']!r}, expected {task!r}")
+                if task in {"ser", "gr"}:
+                    reference_value = item.get("ground_truth", item.get("target", item.get("label")))
+                    normalize_classification_label(task, reference_value)
+                prompt = item.get("prompt") or item.get("instruction")
+                if task == "slu" and (not isinstance(prompt, str) or not prompt.strip()):
+                    raise ValueError(f"SLU fixture {key} requires a non-empty prompt")
+                payload["audio_path"] = str(audio_path)
+                if isinstance(item.get("language"), str) and item["language"].strip():
+                    payload["language"] = item["language"]
+                if task == "slu":
+                    payload["prompt"] = prompt
+                    choices = item.get("choices", item.get("options"))
+                    if choices is not None:
+                        if not isinstance(choices, (dict, list)) or not choices:
+                            raise ValueError(f"SLU fixture {key} choices must be non-empty")
+                        payload["choices"] = choices
             elif task == "se":
                 reference_audio = item.get("reference_audio")
                 if not isinstance(audio, str) or not audio:
@@ -392,14 +925,14 @@ def fixture_payloads() -> list[dict[str, Any]]:
                 payload["reference_audio_path"] = payload["audio_path"]
                 payload["ref_audio"] = payload["audio_path"]
             text = item.get("target_text") or item.get("text") or item.get("prompt_text") or item.get("ground_truth")
-            if task not in {"se", *STRUCTURED_TASKS} and isinstance(text, str):
+            if task not in {"se", *STRUCTURED_TASKS, *CLASSIFICATION_TASKS} and isinstance(text, str):
                 payload["text"] = text
                 payload["prompt_text"] = item.get("prompt_text", text)
-            if task not in {"se", *STRUCTURED_TASKS} and isinstance(item.get("language"), str):
+            if task not in {"se", *STRUCTURED_TASKS, *CLASSIFICATION_TASKS} and isinstance(item.get("language"), str):
                 payload["language"] = item["language"]
-            if task not in {"se", *STRUCTURED_TASKS} and "keywords" in item:
+            if task not in {"se", *STRUCTURED_TASKS, *CLASSIFICATION_TASKS} and "keywords" in item:
                 payload["keywords"] = item["keywords"]
-            if task not in {"se", *STRUCTURED_TASKS} and "threshold" in item:
+            if task not in {"se", *STRUCTURED_TASKS, *CLASSIFICATION_TASKS} and "threshold" in item:
                 if task == "kws" and not valid_kws_threshold(
                     item["threshold"]
                 ):
@@ -414,6 +947,20 @@ def fixture_payloads() -> list[dict[str, Any]]:
                         "dataset": item.get("dataset"),
                         **info,
                     }
+                elif task in CLASSIFICATION_TASKS:
+                    fixture_metadata = {
+                        "key": key,
+                        "audio": item.get("audio") or item.get("wav"),
+                        "language": item.get("language"),
+                        "dataset": item.get("dataset"),
+                        "ground_truth": item.get("ground_truth", item.get("target", item.get("answer"))),
+                    }
+                    if task == "slu":
+                        fixture_metadata["prompt"] = item.get("prompt") or item.get("instruction")
+                        if "choices" in item:
+                            fixture_metadata["choices"] = item["choices"]
+                        elif "options" in item:
+                            fixture_metadata["choices"] = item["options"]
                 else:
                     fixture_metadata = {
                         "key": item.get("key"),
@@ -427,7 +974,7 @@ def fixture_payloads() -> list[dict[str, Any]]:
                     }
                 if task == "se":
                     fixture_metadata["reference_audio_path"] = str(clean_path)
-                if task not in STRUCTURED_TASKS:
+                if task not in { *STRUCTURED_TASKS, *CLASSIFICATION_TASKS }:
                     fixture_metadata.update(
                         {
                             field: item[field]
@@ -495,7 +1042,12 @@ def to_plain(value: Any) -> Any:
     return {"type": type(value).__name__, "repr": repr(value)[:500]}
 
 
-def run_predict(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def run_predict(
+    wrapper: Any,
+    payload: dict[str, Any],
+    *,
+    scalar_fallback: bool = True,
+) -> dict[str, Any]:
     task = normalized_task_type()
     if task in STRUCTURED_TASKS:
         method_name = (
@@ -522,7 +1074,7 @@ def run_predict(wrapper: Any, payload: dict[str, Any]) -> dict[str, Any]:
     try:
         result = predict(payload)
     except TypeError:
-        if TASK_TYPE.lower().replace("-", "_") == "kws":
+        if not scalar_fallback or normalized_task_type() in {"kws", TSE_TASK}:
             raise
         if "audio_path" in payload:
             result = predict(payload["audio_path"])
@@ -1230,6 +1782,375 @@ def validate_se_rows(rows: list[dict[str, Any]], contract: dict[str, Any]) -> li
     return violations
 
 
+def tse_safe_sample_id(value: Any) -> str:
+    token = str(value or "").strip()
+    if (
+        not token
+        or "/" in token
+        or "\\" in token
+        or any(ord(character) < 32 or character.isspace() for character in token)
+        or structured_looks_like_absolute_path_or_uri(token)
+    ):
+        raise ValueError("TSE sample_id must be a safe non-empty token")
+    return token
+
+
+def validate_tse_output_object(value: Any, sample_id: str | None = None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("TSE prediction must be a JSON object")
+    unknown = sorted(str(field) for field in value if field not in TSE_OUTPUT_FIELDS)
+    if unknown:
+        raise ValueError("TSE prediction contains unapproved field(s): " + ", ".join(unknown))
+    for field in value:
+        normalized = str(field).strip().lower().replace("-", "_")
+        if normalized != "prediction_audio" and (
+            normalized.endswith("_path") or normalized in TSE_REFERENCE_FIELDS
+        ):
+            raise ValueError(f"TSE prediction contains forbidden reference/input field: {field}")
+    prediction_audio = value.get("prediction_audio")
+    if not isinstance(prediction_audio, str) or not prediction_audio.strip():
+        raise ValueError("TSE prediction requires a non-empty prediction_audio")
+    output: dict[str, Any] = {"prediction_audio": prediction_audio.strip()}
+    returned_id = value.get("sample_id")
+    if returned_id is not None:
+        returned_id = tse_safe_sample_id(returned_id)
+        if sample_id is not None and returned_id != sample_id:
+            raise ValueError(f"TSE prediction sample_id {returned_id!r} does not match {sample_id!r}")
+        output["sample_id"] = returned_id
+    elif sample_id is not None:
+        output["sample_id"] = tse_safe_sample_id(sample_id)
+    try:
+        json.dumps(output, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"TSE prediction must contain finite JSON data: {error}") from error
+    return output
+
+
+def tse_fixture_role_path(
+    gt_path: Path,
+    row: dict[str, Any],
+    role: str,
+    key: str,
+) -> tuple[str, Path]:
+    aliases = {
+        "mixture_audio": ("mixed_audio", "audio"),
+        "enrollment_audio": ("enrollment",),
+        "reference_audio": ("target_audio",),
+    }
+    raw: Any = row.get(role)
+    if raw is None:
+        for alias in aliases[role]:
+            raw = row.get(alias)
+            if raw is not None:
+                break
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"TSE fixture {key} requires {role}")
+    relative = Path(raw)
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or "\\" in raw
+        or structured_looks_like_absolute_path_or_uri(raw)
+    ):
+        raise ValueError(f"TSE fixture {key} {role} path must be relative and contained")
+    current = gt_path.parent
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"TSE fixture {key} {role} traverses a symlink")
+    path = (gt_path.parent / relative).resolve()
+    if not path.is_file() or path.stat().st_size <= 0 or not path.is_relative_to(gt_path.parent.resolve()):
+        raise ValueError(f"TSE fixture {key} {role} is missing or unsafe")
+    return raw, path
+
+
+def tse_fixture_payloads() -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    fixture_root = MODEL_DIR / "fixture" / TSE_TASK
+    if fixture_root.is_symlink():
+        raise ValueError("TSE fixture root must not be a symlink")
+    if fixture_root.exists() and any(path.is_symlink() for path in fixture_root.rglob("*")):
+        raise ValueError("TSE fixture tree must not contain symlinks")
+    for gt_path in sorted(fixture_root.glob("**/gt.jsonl")):
+        if gt_path.is_symlink():
+            raise ValueError("TSE gt.jsonl must not be a symlink")
+        for line_number, line in enumerate(gt_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"TSE fixture {gt_path}:{line_number} is not valid JSON: {error}") from error
+            if not isinstance(row, dict):
+                raise ValueError(f"TSE fixture {gt_path}:{line_number} must be an object")
+            allowed_fields = {
+                "key",
+                "sample_id",
+                "task_type",
+                "audio",
+                "mixture_audio",
+                "mixed_audio",
+                "enrollment_audio",
+                "enrollment",
+                "reference_audio",
+                "target_audio",
+                "language",
+                "dataset",
+                "reference_text",
+            }
+            unknown_fields = sorted(str(field) for field in row if field not in allowed_fields)
+            if unknown_fields:
+                raise ValueError(
+                    f"TSE fixture {gt_path}:{line_number} contains unapproved field(s): "
+                    + ", ".join(unknown_fields)
+                )
+            key = tse_safe_sample_id(row.get("sample_id") or row.get("key"))
+            if key in seen_keys:
+                raise ValueError(f"TSE fixture key is duplicated: {key!r}")
+            seen_keys.add(key)
+            if row.get("task_type") is not None and normalized_task_value(row["task_type"]) != TSE_TASK:
+                raise ValueError(f"TSE fixture {key} declares task {row['task_type']!r}")
+            role_values: dict[str, str] = {}
+            roles: dict[str, Path] = {}
+            for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+                raw, path = tse_fixture_role_path(gt_path, row, role, key)
+                role_values[role] = raw
+                roles[role] = path
+            if row.get("audio") is not None and row.get("audio") != role_values["mixture_audio"]:
+                raise ValueError(f"TSE fixture {key} audio must equal mixture_audio")
+            role_paths = tuple(roles.values())
+            if len(set(role_paths)) != 3 or any(
+                left.samefile(right)
+                for offset, left in enumerate(role_paths)
+                for right in role_paths[offset + 1 :]
+            ):
+                raise ValueError(f"TSE fixture {key} roles must be independent")
+            reference_text = row.get("reference_text")
+            if reference_text is not None and (
+                not isinstance(reference_text, str)
+                or any(ord(character) < 32 for character in reference_text)
+            ):
+                raise ValueError(f"TSE fixture {key} reference_text must be a safe string")
+            payloads.append(
+                {
+                    "input": {
+                        "mixture_audio_path": str(roles["mixture_audio"]),
+                        "enrollment_audio_path": str(roles["enrollment_audio"]),
+                    },
+                    "fixture": {
+                        "key": key,
+                        "sample_id": key,
+                        "mixture_audio": role_values["mixture_audio"],
+                        "enrollment_audio": role_values["enrollment_audio"],
+                        "reference_audio": role_values["reference_audio"],
+                        "mixture_audio_path": str(roles["mixture_audio"]),
+                        "enrollment_audio_path": str(roles["enrollment_audio"]),
+                        "reference_audio_path": str(roles["reference_audio"]),
+                        "audio": role_values["mixture_audio"],
+                        "language": row.get("language"),
+                        "dataset": row.get("dataset"),
+                        "reference_text": reference_text,
+                    },
+                }
+            )
+    if not 1 <= len(payloads) <= 5:
+        raise ValueError("TSE validation requires 1 to 5 fixture rows")
+    return payloads
+
+
+def tse_outputs_root() -> Path:
+    root = ARTIFACTS_DIR / "outputs"
+    if root.is_symlink():
+        raise ValueError("TSE outputs directory must not be a symlink")
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir() or not os.access(root, os.W_OK):
+        raise ValueError("TSE outputs directory must be writable")
+    return root.resolve()
+
+
+def tse_output_path(key: str, index: int) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return tse_outputs_root() / f"{index:02d}-{digest}.wav"
+
+
+def resolve_tse_output_path(value: str) -> Path:
+    if structured_looks_like_absolute_path_or_uri(value) and not Path(value).is_absolute():
+        raise ValueError(f"TSE prediction_audio must be a local path: {value}")
+    raw = Path(value)
+    if raw.is_absolute():
+        candidate = raw
+    elif raw.parts[:1] == ("artifacts",):
+        candidate = ARTIFACTS_DIR.joinpath(*raw.parts[1:])
+    else:
+        candidate = tse_outputs_root() / raw
+    root = tse_outputs_root()
+    try:
+        lexical = candidate.absolute().relative_to(root)
+    except ValueError as error:
+        raise ValueError("TSE prediction_audio must stay under artifacts/outputs") from error
+    current = root
+    for part in lexical.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("TSE prediction_audio must not traverse a symlink")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError("TSE prediction_audio must stay under artifacts/outputs")
+    return resolved
+
+
+def portable_tse_output_path(path: Path) -> str:
+    relative = path.resolve().relative_to(ARTIFACTS_DIR.resolve())
+    return (Path("artifacts") / relative).as_posix()
+
+
+def validate_tse_output(
+    sample: dict[str, Any],
+    *,
+    expected_path: Path,
+    forbidden_inputs: tuple[Path, ...] = (),
+) -> list[str]:
+    try:
+        canonical = validate_tse_output_object(sample)
+        path = resolve_tse_output_path(canonical["prediction_audio"])
+    except (TypeError, ValueError) as error:
+        return [str(error)]
+    if path != expected_path.resolve() or not path.is_file() or path.stat().st_size <= 0:
+        return ["TSE prediction_audio must equal the harness-assigned non-empty output"]
+    for input_path in forbidden_inputs:
+        try:
+            if path.samefile(input_path):
+                return ["TSE prediction_audio must not alias an input or reference audio"]
+        except (FileNotFoundError, OSError):
+            continue
+    try:
+        with wave.open(str(path), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                return ["TSE prediction_audio must be a non-empty PCM WAV"]
+    except (EOFError, OSError, wave.Error) as error:
+        return [f"TSE prediction_audio must be a readable PCM WAV: {error}"]
+    return []
+
+
+def run_tse_fixture(wrapper: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    for index, fixture in enumerate(tse_fixture_payloads(), 1):
+        key = str(fixture["fixture"]["key"])
+        requested = tse_output_path(key, index)
+        if requested.exists() or requested.is_symlink():
+            requested.unlink()
+        payload = dict(fixture["input"])
+        payload["output_path"] = str(requested)
+        result = run_predict(wrapper, payload, scalar_fallback=False)
+        canonical = validate_tse_output_object(result, sample_id=key)
+        input_paths = tuple(
+            Path(str(fixture["fixture"][field]))
+            for field in ("mixture_audio_path", "enrollment_audio_path", "reference_audio_path")
+        )
+        violations = validate_tse_output(
+            canonical,
+            expected_path=requested,
+            forbidden_inputs=input_paths,
+        )
+        if violations:
+            raise AssertionError("; ".join(violations))
+        canonical["prediction_audio"] = portable_tse_output_path(requested)
+        rows.append({"key": key, "sample_id": key, "result": canonical})
+    return {"rows": rows}, rows
+
+
+def validate_tse_output_document(sample: dict[str, Any], contract: dict[str, Any]) -> list[str]:
+    rows = sample.get("rows")
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 5:
+        return ["TSE sample_output.json must contain 1 to 5 rows"]
+    try:
+        fixtures = tse_fixture_payloads()
+    except (OSError, ValueError) as error:
+        return [str(error)]
+    expected = [str(item["fixture"]["key"]) for item in fixtures]
+    observed: list[str] = []
+    references = {
+        str(item["fixture"]["key"]): item["fixture"] for item in fixtures
+    }
+    violations: list[str] = []
+    referenced_outputs: set[Path] = set()
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            violations.append(f"TSE output row {index} must be an object")
+            continue
+        unknown_row_fields = sorted(str(field) for field in row if field not in {"key", "sample_id", "result"})
+        if unknown_row_fields:
+            violations.append(
+                f"TSE output row {index} contains unapproved field(s): "
+                + ", ".join(unknown_row_fields)
+            )
+        key = str(row.get("key") or row.get("sample_id") or "").strip()
+        try:
+            tse_safe_sample_id(key)
+        except ValueError as error:
+            violations.append(f"TSE output row {index}: {error}")
+            continue
+        if key in observed:
+            violations.append(f"TSE output row {index} key is duplicated: {key!r}")
+            continue
+        observed.append(key)
+        row_sample_id = row.get("sample_id")
+        if row_sample_id is not None and str(row_sample_id).strip() != key:
+            violations.append(f"TSE output {key} sample_id does not match key")
+        result = row.get("result")
+        try:
+            canonical = validate_tse_output_object(result, sample_id=key)
+        except (TypeError, ValueError) as error:
+            violations.append(f"TSE output {key}: {error}")
+            continue
+        if result != canonical:
+            violations.append(f"TSE output {key} is not canonical")
+        if key not in references:
+            violations.append(f"unexpected TSE output key: {key}")
+            continue
+        violations.extend(f"TSE output {key}: {item}" for item in validate_contract(canonical, contract))
+        fixture = references[key]
+        forbidden = tuple(
+            Path(str(fixture[field]))
+            for field in ("mixture_audio_path", "enrollment_audio_path", "reference_audio_path")
+        )
+        fixture_index = expected.index(key) + 1
+        expected_output = tse_output_path(key, fixture_index).resolve()
+        violations.extend(
+            f"TSE output {key}: {item}"
+            for item in validate_tse_output(
+                canonical,
+                expected_path=expected_output,
+                forbidden_inputs=forbidden,
+            )
+        )
+        referenced_outputs.add(expected_output)
+    if observed != expected:
+        violations.append(
+            f"TSE output keys must preserve fixture order: expected={expected}, observed={observed}"
+        )
+    actual_outputs: set[Path] = set()
+    for path in tse_outputs_root().rglob("*"):
+        if path.is_symlink():
+            violations.append(f"TSE outputs must not contain symlinks: {path.name}")
+        elif path.is_file():
+            actual_outputs.add(path.resolve())
+    extra_outputs = sorted(path.name for path in actual_outputs - referenced_outputs)
+    missing_outputs = sorted(path.name for path in referenced_outputs - actual_outputs)
+    if extra_outputs:
+        violations.append("TSE outputs contain unreferenced file(s): " + ", ".join(extra_outputs))
+    if missing_outputs:
+        violations.append("TSE outputs are missing referenced file(s): " + ", ".join(missing_outputs))
+    return violations
+
+
 def validate_contract(sample: dict[str, Any], contract: dict[str, Any]) -> list[str]:
     violations: list[str] = []
     required = string_list(contract.get("required_fields"))
@@ -1250,8 +2171,9 @@ def validate_contract(sample: dict[str, Any], contract: dict[str, Any]) -> list[
     for field in nonempty:
         if field in sample and not is_nonempty(sample[field]):
             violations.append(f"field must be nonempty: {field}")
+    audio_evidence_fields = ("audio_path", "prediction_audio", "wavs", "wavs_summary", "sample_rate")
     if contract.get("output_type") == "audio" and not any(
-        key in sample for key in ("audio_path", "wavs", "wavs_summary", "sample_rate")
+        key in sample for key in audio_evidence_fields
     ):
         violations.append("audio output requires audio_path, wavs, wavs_summary, or sample_rate evidence")
     if contract.get("json_serializable") is True:
@@ -1292,10 +2214,14 @@ def stage_infer() -> bool:
     started = time.time()
     try:
         wrapper = load_wrapper()
-        payloads = fixture_payloads()
+        task = normalized_task_type()
+        payloads = (
+            classification_fixture_payloads()
+            if task in CLASSIFICATION_TASKS
+            else fixture_payloads()
+        )
         outputs: list[dict[str, Any]] = []
         rows: list[dict[str, Any]] = []
-        task = normalized_task_type()
         for index, fixture in enumerate(payloads, start=1):
             payload = dict(fixture["input"])
             requested_output: Path | None = None
@@ -1305,7 +2231,17 @@ def stage_infer() -> bool:
                 if requested_output.exists() or requested_output.is_symlink():
                     requested_output.unlink()
                 payload["output_path"] = str(requested_output)
-            sample = run_predict(wrapper, payload)
+            elif task == TSE_TASK:
+                key = str(fixture["fixture"].get("key") or index)
+                requested_output = tse_output_path(key, index)
+                if requested_output.exists() or requested_output.is_symlink():
+                    requested_output.unlink()
+                payload["output_path"] = str(requested_output)
+            sample = (
+                run_predict(wrapper, payload, scalar_fallback=False)
+                if task == TSE_TASK
+                else run_predict(wrapper, payload)
+            )
             if not sample:
                 raise AssertionError(f"prediction output is empty for fixture {index}")
             if task in STRUCTURED_TASKS:
@@ -1331,6 +2267,31 @@ def stage_infer() -> bool:
                     raise AssertionError("; ".join(violations))
                 assert requested_output is not None
                 sample["audio_path"] = portable_se_output_path(requested_output)
+            elif task == TSE_TASK:
+                assert requested_output is not None
+                canonical = validate_tse_output_object(
+                    sample,
+                    sample_id=str(fixture["fixture"].get("key") or index),
+                )
+                forbidden_inputs = tuple(
+                    Path(str(fixture["fixture"][field]))
+                    for field in (
+                        "mixture_audio_path",
+                        "enrollment_audio_path",
+                        "reference_audio_path",
+                    )
+                )
+                violations = validate_tse_output(
+                    canonical,
+                    expected_path=requested_output,
+                    forbidden_inputs=forbidden_inputs,
+                )
+                if violations:
+                    raise AssertionError("; ".join(violations))
+                canonical["prediction_audio"] = portable_tse_output_path(requested_output)
+                sample = canonical
+            elif task in CLASSIFICATION_TASKS:
+                sample = normalize_classification_output(task, sample)
             outputs.append(sample)
             if task in STRUCTURED_TASKS:
                 row = {
@@ -1343,6 +2304,23 @@ def stage_infer() -> bool:
                     "sample_rate": fixture["fixture"]["sample_rate"],
                     "audio_is_silence": fixture["fixture"]["audio_is_silence"],
                     "output": sample,
+                }
+            elif task == TSE_TASK:
+                row = {
+                    "key": fixture["fixture"].get("key") or str(index),
+                    "sample_id": fixture["fixture"].get("sample_id") or str(index),
+                    "result": sample,
+                }
+            elif task in CLASSIFICATION_TASKS:
+                row = {
+                    "id": index,
+                    "key": fixture["fixture"].get("key") or str(index),
+                    "task": task,
+                    "audio": fixture["fixture"].get("audio"),
+                    "dataset": fixture["fixture"].get("dataset"),
+                    "ground_truth": fixture["fixture"].get("ground_truth"),
+                    **({"prompt": fixture["fixture"].get("prompt")} if task == "slu" else {}),
+                    "result": sample,
                 }
             else:
                 row = {
@@ -1365,7 +2343,10 @@ def stage_infer() -> bool:
                     }
                 )
             rows.append(row)
-        write_json(SAMPLE_OUTPUT, outputs[0])
+        write_json(
+            SAMPLE_OUTPUT,
+            {"rows": rows} if task in {TSE_TASK, *CLASSIFICATION_TASKS} else outputs[0],
+        )
         write_jsonl(SAMPLE_OUTPUTS, rows)
     except Exception as exc:  # noqa: BLE001
         append_log("VALIDATE_INFER", "failed", str(exc))
@@ -1400,7 +2381,35 @@ def stage_contract() -> bool:
         if not isinstance(sample, dict):
             raise ValueError("sample_output.json must be an object")
         contract = load_io_contract()
-        if task in STRUCTURED_TASKS:
+        if task == TSE_TASK:
+            if not SAMPLE_OUTPUTS.is_file():
+                violations = ["TSE contract validation requires sample_outputs.jsonl"]
+                rows = []
+            else:
+                rows = [
+                    json.loads(line)
+                    for line in SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                violations = validate_tse_output_document(sample, contract)
+                if rows != sample.get("rows"):
+                    violations.append("TSE sample_outputs.jsonl must exactly mirror sample_output rows")
+        elif task in CLASSIFICATION_TASKS:
+            violations = validate_classification_output_document(sample, task)
+            if SAMPLE_OUTPUTS.is_file():
+                rows = [
+                    json.loads(line)
+                    for line in SAMPLE_OUTPUTS.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                violations.extend(_validate_classification_output_rows(rows, task))
+                if rows != sample.get("rows"):
+                    violations.append(
+                        "classification sample_outputs.jsonl must exactly mirror sample_output rows"
+                    )
+            else:
+                violations.append("classification contract validation requires sample_outputs.jsonl")
+        elif task in STRUCTURED_TASKS:
             if not SAMPLE_OUTPUTS.is_file():
                 violations = ["structured contract validation requires sample_outputs.jsonl"]
             else:
@@ -1467,7 +2476,7 @@ def stage_contract() -> bool:
         sample_outputs_path="artifacts/sample_outputs.jsonl",
         validated_sample_count=(
             len(rows)
-            if task in {"kws", "se", *STRUCTURED_TASKS} and SAMPLE_OUTPUTS.is_file()
+            if task in {"kws", "se", TSE_TASK, *STRUCTURED_TASKS, *CLASSIFICATION_TASKS} and SAMPLE_OUTPUTS.is_file()
             else 1
         ),
         **({"protocol_arguments": protocol_arguments} if task in STRUCTURED_TASKS else {}),

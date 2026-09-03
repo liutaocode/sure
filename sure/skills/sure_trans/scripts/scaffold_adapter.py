@@ -7,7 +7,29 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path, PurePosixPath
+
+# Some Feed regression tests load this module from a file spec rather than as
+# a script, so Python does not automatically add the sibling script directory
+# to ``sys.path``. Resolve the local contract explicitly for both entry modes.
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task,
+    input_schema_for,
+    io_contract_for as classification_io_contract_for,
+    tool_name_for,
+)
+from tse_contract import (
+    canonical_task as canonical_tse_task,
+    input_schema_for as tse_input_schema_for,
+    io_contract_for as tse_io_contract_for,
+    tool_name_for as tse_tool_name_for,
+)
 
 
 def read_object(path: Path) -> dict:
@@ -216,7 +238,15 @@ def main() -> int:
         shutil.copyfile(templates / "model.py", model_py)
     shutil.copyfile(templates / "__init__.py", adapter_dir / "__init__.py")
     shutil.copyfile(Path(__file__).resolve().parent / "mcp_smoke.py", adapter_dir / "mcp_smoke.py")
-    task_type = str(resolved.get("task_type") or "asr").lower()
+    shutil.copyfile(
+        Path(__file__).resolve().parent / "classification_contract.py",
+        adapter_dir / "classification_contract.py",
+    )
+    shutil.copyfile(
+        Path(__file__).resolve().parent / "tse_contract.py",
+        adapter_dir / "tse_contract.py",
+    )
+    task_type = canonical_task(resolved.get("task_type") or "asr")
     tool_name, input_schema = tool_contract(task_type)
     io_contract = io_contract_for(task_type)
     replacements = {
@@ -255,6 +285,8 @@ def main() -> int:
         "model_spec": str(adapter_dir / "model.spec.yaml"),
         "dockerfile": str(adapter_dir / "Dockerfile.sure"),
         "mcp_smoke_py": str(adapter_dir / "mcp_smoke.py"),
+        "classification_contract_py": str(adapter_dir / "classification_contract.py"),
+        "tse_contract_py": str(adapter_dir / "tse_contract.py"),
         "source_inference_entrypoint": resolved["inference_entrypoint"],
         "source_image_reference": source_reference,
         "source_image_probe_reference": probe_reference,
@@ -275,6 +307,11 @@ def main() -> int:
 
 
 def tool_contract(task_type: str) -> tuple[str, dict]:
+    task_type = canonical_tse_task(canonical_task(task_type))
+    if task_type == "tse":
+        return tse_tool_name_for(task_type), tse_input_schema_for(task_type)
+    if task_type in CLASSIFICATION_TASKS:
+        return tool_name_for(task_type), input_schema_for(task_type)
     if task_type == "tts":
         return "synthesize_speech", {
             "type": "object",
@@ -342,6 +379,11 @@ def tool_contract(task_type: str) -> tuple[str, dict]:
 
 
 def io_contract_for(task_type: str) -> dict:
+    task_type = canonical_tse_task(canonical_task(task_type))
+    if task_type == "tse":
+        return tse_io_contract_for(task_type)
+    if task_type in CLASSIFICATION_TASKS:
+        return classification_io_contract_for(task_type)
     if task_type == "tts":
         return {
             "input_type": "text_and_audio_path",

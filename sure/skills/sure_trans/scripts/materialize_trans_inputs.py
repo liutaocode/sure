@@ -23,6 +23,9 @@ except ImportError as error:
         "from a complete sure-harness checkout"
     ) from error
 
+from classification_contract import canonical_task
+from tse_contract import canonical_task as canonical_tse_task
+
 FRAMEWORK_ALIASES = {
     "pytorch": "pytorch",
     "torch": "pytorch",
@@ -38,7 +41,7 @@ MODEL_FRAMEWORK_ALIASES = {
 }
 MODEL_FRAMEWORK = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
-TASK_TYPES = {"asr", "kws", "s2tt", "sa_asr", "sd", "se", "tts", "vad", "vc"}
+TASK_TYPES = {"asr", "kws", "s2tt", "sa_asr", "sd", "se", "ser", "gr", "slu", "tts", "tse", "vad", "vc"}
 TASK_TYPE_ALIASES = {
     "acoustic noise suppression": "se",
     "acoustic-noise-suppression": "se",
@@ -68,6 +71,42 @@ TASK_TYPE_ALIASES = {
     "transcribe-diarize": "sa_asr",
     "transcription diarization": "sa_asr",
     "transcription-diarization": "sa_asr",
+    "speech emotion recognition": "ser",
+    "speech-emotion-recognition": "ser",
+    "speech_emotion_recognition": "ser",
+    "speaker emotion recognition": "ser",
+    "speaker-emotion-recognition": "ser",
+    "emotion recognition": "ser",
+    "emotion-recognition": "ser",
+    "emotion_recognition": "ser",
+    "gender recognition": "gr",
+    "gender-recognition": "gr",
+    "gender_recognition": "gr",
+    "speaker gender": "gr",
+    "spoken language understanding": "slu",
+    "spoken-language-understanding": "slu",
+    "spoken_language_understanding": "slu",
+    "target speaker extraction": "tse",
+    "target-speaker-extraction": "tse",
+    "target_speaker_extraction": "tse",
+    "target speaker extractor": "tse",
+    "target-speaker-extractor": "tse",
+    "target_speaker_extractor": "tse",
+    "target speaker extraction model": "tse",
+    "target-speaker-extraction-model": "tse",
+    "target_speaker_extraction_model": "tse",
+    "target speaker": "tse",
+    "target-speaker": "tse",
+    "target_speaker": "tse",
+    "speaker extraction": "tse",
+    "speaker-extraction": "tse",
+    "speaker_extraction": "tse",
+    "target voice separation": "tse",
+    "target-voice-separation": "tse",
+    "target_voice_separation": "tse",
+    "target voice extraction": "tse",
+    "target-voice-extraction": "tse",
+    "target_voice_extraction": "tse",
     "speech activity detection": "vad",
     "speech-activity-detection": "vad",
     "speech_activity_detection": "vad",
@@ -139,6 +178,55 @@ TASK_MARKERS = {
         "detect_speech",
         "get_speech_timestamps",
     ),
+    "ser": (
+        "ser",
+        "speech emotion",
+        "speech-emotion",
+        "emotion recognition",
+        "emotion_recognize",
+        "recognize_emotion",
+    ),
+    "gr": (
+        "gender recognition",
+        "gender-recognition",
+        "gender_recognize",
+        "recognize_gender",
+        "speaker gender",
+    ),
+    "slu": (
+        "slu",
+        "spoken language understanding",
+        "spoken-language-understanding",
+        "slu_understand",
+        "understand_audio",
+    ),
+    "tse": (
+        "tse",
+        "target speaker extraction",
+        "target-speaker-extraction",
+        "target_speaker_extraction",
+        "target speaker extractor",
+        "target-speaker-extractor",
+        "target_speaker_extractor",
+        "target speaker extraction model",
+        "target-speaker-extraction-model",
+        "target_speaker_extraction_model",
+        "target speaker",
+        "target-speaker",
+        "target_speaker",
+        "speaker extraction",
+        "speaker-extraction",
+        "speaker_extraction",
+        "target voice separation",
+        "target-voice-separation",
+        "target_voice_separation",
+        "target voice extraction",
+        "target-voice-extraction",
+        "target_voice_extraction",
+        "mixture_audio_path",
+        "enrollment_audio_path",
+        "extract_target_speaker",
+    ),
     "vc": ("voice conversion", "voice_conversion", "convert_voice", "reference_audio_path"),
 }
 
@@ -176,7 +264,10 @@ def existing_absolute(value: str, label: str) -> Path:
 def resolve_task_type(explicit: str | None, inference_entrypoint: Path, model_path: Path) -> str:
     if explicit:
         raw_task_type = explicit.strip().lower()
-        task_type = TASK_TYPE_ALIASES.get(raw_task_type, raw_task_type)
+        task_type = TASK_TYPE_ALIASES.get(
+            raw_task_type,
+            canonical_tse_task(canonical_task(raw_task_type)),
+        )
         if task_type not in TASK_TYPES:
             raise ValueError(f"unsupported task type {explicit!r}; expected one of {sorted(TASK_TYPES)}")
         return task_type
@@ -224,7 +315,7 @@ def resolve_task_type(explicit: str | None, inference_entrypoint: Path, model_pa
     if len(winners) != 1:
         raise ValueError(
             "task_type could not be inferred unambiguously; pass "
-            "task_type=asr|kws|s2tt|sa_asr|sd|se|tts|vad|vc"
+            "task_type=asr|kws|s2tt|sa_asr|sd|se|ser|gr|slu|tts|tse|vad|vc"
         )
     return winners[0]
 

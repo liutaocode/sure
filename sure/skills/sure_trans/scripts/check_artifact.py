@@ -19,8 +19,15 @@ from prepare_fixture import (
     validate_speaker_segments,
     validate_vad_intervals,
 )
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task,
+    validate_fixture_row,
+)
 from scaffold_adapter import io_contract_for
 from vc_exec import default_partition
+from tse_contract import validate_output_object as validate_tse_output_object
+from tse_contract import canonical_task as canonical_tse_task
 
 
 LEGACY_PATH = re.compile(r"/(?:mnt/cloudstorfs|hpc_stor\d+|hpc_\d+)/")
@@ -334,6 +341,237 @@ def validate_se_fixture_manifest(
     )
 
 
+def validate_tse_fixture_manifest(
+    value: dict,
+    *,
+    model_dir: Path,
+    staged_dir: Path,
+    gt_jsonl: Path,
+) -> None:
+    """Validate TSE's separate mixture/enrollment/reference roles.
+
+    The reference audio is retained for evaluation, but never becomes an
+    inference argument.  All role paths are portable relative paths and all
+    three files must be independent regular files.
+    """
+
+    require(staged_dir.is_relative_to(model_dir / "fixture"), "TSE staged_dir must stay under model_dir/fixture")
+    require(Path(str(value.get("staged_path") or "")).resolve() == staged_dir, "TSE staged_path must equal staged_dir")
+    require(gt_jsonl.is_file() and gt_jsonl.parent == staged_dir, "TSE gt_jsonl must exist directly inside staged_dir")
+    require(value.get("gt_sha256") == sha256_file(gt_jsonl), "TSE ground-truth checksum changed")
+    require(value.get("expected_sha256") == sha256_file(gt_jsonl), "TSE reference checksum changed")
+
+    rows: list[dict] = []
+    for line_number, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"TSE fixture gt_jsonl line {line_number} is invalid JSON: {error}") from error
+        require(isinstance(row, dict), f"TSE fixture gt_jsonl line {line_number} must be an object")
+        try:
+            json.dumps(row, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"TSE fixture row {line_number} must contain strict JSON: {error}") from error
+        rows.append(row)
+    require(1 <= len(rows) <= 5, "TSE smoke fixture must contain 1 to 5 samples")
+    samples = value.get("samples")
+    require(isinstance(samples, list) and len(samples) == len(rows), "TSE samples must mirror gt_jsonl rows")
+    require(value.get("sample_count") == len(rows), "TSE sample_count must match gt_jsonl")
+
+    allowed_row_fields = {
+        "key", "sample_id", "task_type", "audio", "mixture_audio", "mixed_audio",
+        "enrollment_audio", "reference_audio", "reference_text", "language",
+    }
+    relative_files = {Path("gt.jsonl")}
+    seen: set[str] = set()
+    for index, (row, sample) in enumerate(zip(rows, samples)):
+        require(isinstance(sample, dict), f"TSE fixture sample {index} must be an object")
+        key = str(row.get("sample_id") or row.get("key") or "").strip()
+        require(key and key not in seen and not looks_like_absolute_path_or_uri(key), f"TSE fixture key is missing, unsafe, or duplicated: {key!r}")
+        seen.add(key)
+        require(row.get("key") == key and row.get("sample_id") == key, f"TSE fixture row {key} key/sample_id aliases changed")
+        require(row.get("task_type") == "tse", f"TSE fixture row {key} must use canonical task_type=tse")
+        require(set(row).issubset(allowed_row_fields), f"TSE fixture row {key} contains unapproved fields")
+
+        role_paths: dict[str, tuple[Path, Path]] = {}
+        for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+            raw = row.get(role)
+            require(isinstance(raw, str) and raw.strip(), f"TSE fixture {key} requires {role}")
+            relative = Path(raw)
+            require(
+                not relative.is_absolute()
+                and ".." not in relative.parts
+                and "\\" not in raw
+                and "://" not in raw
+                and not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", raw),
+                f"TSE fixture {key} {role} path must be relative and contained",
+            )
+            current = staged_dir
+            for part in relative.parts:
+                current = current / part
+                require(not current.is_symlink(), f"TSE fixture {key} {role} must not traverse a symlink")
+            path = staged_dir / relative
+            require(path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(staged_dir), f"TSE fixture {key} {role} is missing or unsafe")
+            role_paths[role] = (relative, path)
+            relative_files.add(relative)
+
+        role_values = [role_paths[role][1] for role in ("mixture_audio", "enrollment_audio", "reference_audio")]
+        require(len({path.resolve() for path in role_values}) == 3, f"TSE fixture {key} roles must be independent files")
+        for left_index, left in enumerate(role_values):
+            for right in role_values[left_index + 1 :]:
+                require(not left.samefile(right), f"TSE fixture {key} roles must not alias the same file")
+
+        mixture_relative = role_paths["mixture_audio"][0]
+        require(row.get("audio") == mixture_relative.as_posix(), f"TSE fixture row {key} audio alias must equal mixture_audio")
+        if row.get("mixed_audio") is not None:
+            require(row.get("mixed_audio") == mixture_relative.as_posix(), f"TSE fixture row {key} mixed_audio alias must equal mixture_audio")
+        require(sample.get("key") == key and sample.get("sample_id") == key, f"TSE fixture sample {key} identity changed")
+        require(sample.get("audio") == mixture_relative.as_posix(), f"TSE fixture sample {key} audio changed")
+        for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+            relative, path = role_paths[role]
+            require(sample.get(role) == relative.as_posix(), f"TSE fixture sample {key} {role} changed")
+            sample_path = Path(str(sample.get(f"{role}_path") or ""))
+            require(sample_path.is_absolute() and sample_path.resolve() == path.resolve(), f"TSE fixture sample {key} {role}_path changed")
+            checksum = sample.get(f"{role.removesuffix('_audio')}_sha256")
+            require(checksum == sha256_file(path), f"TSE fixture sample {key} {role} checksum changed")
+        if row.get("reference_text") not in (None, ""):
+            require(isinstance(row.get("reference_text"), str), f"TSE fixture {key} reference_text must be a string")
+            require(sample.get("reference_text") == row.get("reference_text"), f"TSE fixture sample {key} reference_text changed")
+        require(sample.get("annotation_fields") in (["reference_audio"], ["reference_audio", "reference_text"]), f"TSE fixture sample {key} annotation_fields changed")
+
+    actual_files = {path.relative_to(staged_dir) for path in staged_dir.rglob("*") if path.is_file()}
+    require(actual_files == relative_files, "TSE fixture tree must contain only gt.jsonl and referenced role audio")
+    require(value.get("sha256") == fixture_tree_identity(staged_dir, relative_files), "TSE fixture tree checksum changed")
+    require(value.get("size_bytes") == sum((staged_dir / relative).stat().st_size for relative in relative_files), "TSE fixture tree size changed")
+    annotation_source = value.get("annotation_source")
+    require(isinstance(annotation_source, dict), "TSE annotation_source must be an object")
+    require(annotation_source.get("type") == "fixture_gt_jsonl" and annotation_source.get("fallback") is False, "TSE ground truth must come from fixture gt.jsonl")
+    require(Path(str(annotation_source.get("staged_path") or "")).resolve() == gt_jsonl, "TSE annotation_source staged_path must match gt_jsonl")
+
+
+def validate_classification_fixture_manifest(
+    value: dict,
+    *,
+    model_dir: Path,
+    staged_dir: Path,
+    gt_jsonl: Path,
+    task: str,
+) -> None:
+    """Validate keyed SER/GR/SLU fixtures and keep references out of samples."""
+
+    normalized_task = canonical_task(task)
+    require(normalized_task in CLASSIFICATION_TASKS, f"unsupported classification fixture task: {task}")
+    label = normalized_task.upper()
+    require(staged_dir.is_relative_to(model_dir / "fixture"), "classification staged_dir must stay under model_dir/fixture")
+    require(Path(str(value.get("staged_path") or "")).resolve() == staged_dir, f"{label} staged_path must equal staged_dir")
+    require(gt_jsonl.is_file() and gt_jsonl.parent == staged_dir, f"{label} gt_jsonl must exist directly inside staged_dir")
+    require(value.get("gt_sha256") == sha256_file(gt_jsonl), f"{label} ground-truth checksum changed")
+    require(value.get("expected_sha256") == sha256_file(gt_jsonl), f"{label} reference checksum changed")
+
+    rows: list[dict] = []
+    for line_number, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{label} fixture gt_jsonl line {line_number} is invalid JSON: {error}") from error
+        require(isinstance(row, dict), f"{label} fixture gt_jsonl line {line_number} must be an object")
+        try:
+            json.dumps(row, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} fixture row {line_number} must contain strict JSON: {error}") from error
+        rows.append(row)
+    require(1 <= len(rows) <= 5, f"{label} smoke fixture must contain 1 to 5 samples")
+    samples = value.get("samples")
+    require(isinstance(samples, list) and len(samples) == len(rows), f"{label} samples must mirror gt_jsonl rows")
+    require(value.get("sample_count") == len(rows), f"{label} sample_count must match gt_jsonl")
+
+    seen_keys: set[str] = set()
+    relative_files = {Path("gt.jsonl")}
+    allowed_row_fields = {"key", "task_type", "audio", "ground_truth", "language", "dataset", "prompt", "choices"}
+    for index, (row, sample) in enumerate(zip(rows, samples)):
+        require(isinstance(sample, dict), f"{label} fixture sample {index} must be an object")
+        key = str(row.get("key") or "").strip()
+        require(
+            key
+            and key not in seen_keys
+            and not looks_like_absolute_path_or_uri(key)
+            and "/" not in key
+            and "\\" not in key
+            and not any(ord(character) < 32 or character.isspace() for character in key),
+            f"{label} fixture key is missing, unsafe, or duplicated: {key!r}",
+        )
+        seen_keys.add(key)
+        require(row.get("task_type") == normalized_task, f"{label} fixture row {key} must use canonical task_type={normalized_task}")
+        require(set(row).issubset(allowed_row_fields), f"{label} fixture row {key} contains unapproved reference metadata")
+        expected = validate_fixture_row(normalized_task, row, key=key)
+        require(row.get("ground_truth") == expected, f"{label} fixture row {key} ground_truth is not canonical")
+        audio = row.get("audio")
+        require(isinstance(audio, str) and bool(audio.strip()), f"{label} fixture {key} requires audio")
+        relative_audio = Path(audio)
+        require(
+            not relative_audio.is_absolute() and ".." not in relative_audio.parts and "\\" not in audio,
+            f"{label} fixture {key} audio path must be relative and contained",
+        )
+        current = staged_dir
+        for part in relative_audio.parts:
+            current = current / part
+            require(not current.is_symlink(), f"{label} fixture {key} audio must not traverse a symlink")
+        audio_path = staged_dir / relative_audio
+        require(audio_path.is_file() and audio_path.resolve().is_relative_to(staged_dir), f"{label} fixture {key} audio is missing or unsafe")
+        relative_files.add(relative_audio)
+        require(sample.get("key") == key, f"{label} fixture sample {key} key changed")
+        require(
+            set(sample).issubset(
+                {
+                    "key",
+                    "audio",
+                    "audio_path",
+                    "annotation_fields",
+                    "sha256",
+                    "size_bytes",
+                    "language",
+                    "dataset",
+                    "prompt",
+                    "choices",
+                }
+            ),
+            f"{label} fixture sample {key} contains unapproved metadata",
+        )
+        require(
+            "ground_truth" not in sample and "target" not in sample,
+            f"{label} fixture sample {key} must not copy reference values",
+        )
+        require(sample.get("audio") == relative_audio.as_posix(), f"{label} fixture sample {key} audio changed")
+        require(Path(str(sample.get("audio_path") or "")).resolve() == audio_path.resolve(), f"{label} fixture sample {key} audio_path changed")
+        require(sample.get("annotation_fields") == ["ground_truth"], f"{label} fixture sample {key} annotation_fields changed")
+        require(sample.get("sha256") == sha256_file(audio_path), f"{label} fixture sample {key} checksum changed")
+        require(sample.get("size_bytes") == audio_path.stat().st_size, f"{label} fixture sample {key} size changed")
+        if normalized_task == "slu":
+            require(isinstance(row.get("prompt"), str) and row["prompt"].strip(), f"SLU fixture {key} prompt is missing")
+            require(sample.get("prompt") == row["prompt"], f"SLU fixture sample {key} prompt changed")
+            if "choices" in row:
+                require(sample.get("choices") == row["choices"], f"SLU fixture sample {key} choices changed")
+            else:
+                require("choices" not in sample, f"SLU fixture sample {key} unexpectedly contains choices")
+
+    actual_files: set[Path] = set()
+    for path in staged_dir.rglob("*"):
+        require(not path.is_symlink(), f"{label} fixture tree must not contain symlinks: {path}")
+        if path.is_file():
+            actual_files.add(path.relative_to(staged_dir))
+    require(actual_files == relative_files, f"{label} fixture tree must contain only gt.jsonl and referenced audio")
+    require(value.get("sha256") == fixture_tree_identity(staged_dir, relative_files), f"{label} fixture tree checksum changed")
+    require(value.get("size_bytes") == sum((staged_dir / relative).stat().st_size for relative in relative_files), f"{label} fixture tree size changed")
+    annotation_source = value.get("annotation_source")
+    require(isinstance(annotation_source, dict), f"{label} annotation_source must be an object")
+    require(annotation_source.get("type") == "fixture_gt_jsonl" and annotation_source.get("fallback") is False, f"{label} ground truth must come from fixture gt.jsonl")
+    require(Path(str(annotation_source.get("staged_path") or "")).resolve() == gt_jsonl, f"{label} annotation_source staged_path must match gt_jsonl")
+
+
 def validate_speaker_fixture_manifest(
     value: dict,
     *,
@@ -620,11 +858,19 @@ def validate_fixture_manifest(value: dict) -> None:
     require(value.get("status") == "ready", "fixture manifest is not ready")
     for key in ("model_dir", "staged_dir", "gt_jsonl", "samples", "annotation_source"):
         require(key in value, f"fixture manifest is missing {key}")
-    model_dir = Path(str(value["model_dir"])).resolve()
-    staged_dir = Path(str(value["staged_dir"])).resolve()
-    staged = Path(str(value.get("staged_path", ""))).resolve()
-    gt_jsonl = Path(str(value["gt_jsonl"])).resolve()
-    task = str(value.get("task_type") or "").replace("-", "_").lower()
+    raw_model_dir = Path(str(value["model_dir"])).expanduser()
+    raw_staged_dir = Path(str(value["staged_dir"])).expanduser()
+    raw_staged_path = Path(str(value.get("staged_path", ""))).expanduser()
+    raw_gt_jsonl = Path(str(value["gt_jsonl"])).expanduser()
+    task = canonical_tse_task(str(value.get("task_type") or "").replace("-", "_").lower())
+    if task == "tse":
+        require(not raw_staged_dir.is_symlink(), "TSE fixture staged_dir must not be a symlink")
+        require(not raw_staged_path.is_symlink(), "TSE fixture staged_path must not be a symlink")
+        require(not raw_gt_jsonl.is_symlink(), "TSE fixture gt_jsonl must not be a symlink")
+    model_dir = raw_model_dir.resolve()
+    staged_dir = raw_staged_dir.resolve()
+    staged = raw_staged_path.resolve()
+    gt_jsonl = raw_gt_jsonl.resolve()
     require(model_dir.is_dir(), "fixture model_dir is missing")
     require(staged_dir.is_dir(), "fixture staged_dir is missing")
     if task == "kws":
@@ -641,6 +887,23 @@ def validate_fixture_manifest(value: dict) -> None:
             model_dir=model_dir,
             staged_dir=staged_dir,
             gt_jsonl=gt_jsonl,
+        )
+        return
+    if task == "tse":
+        validate_tse_fixture_manifest(
+            value,
+            model_dir=model_dir,
+            staged_dir=staged_dir,
+            gt_jsonl=gt_jsonl,
+        )
+        return
+    if task in CLASSIFICATION_TASKS:
+        validate_classification_fixture_manifest(
+            value,
+            model_dir=model_dir,
+            staged_dir=staged_dir,
+            gt_jsonl=gt_jsonl,
+            task=task,
         )
         return
     if task == "vad":
@@ -998,6 +1261,42 @@ def main() -> int:
                         f"post-pull {task.upper()} MCP smoke sample {key} is malformed: "
                         + "; ".join(violations),
                     )
+            if protocol.get("tool") in {"extract_target_speaker", "target_speaker_extract", "target_speaker_extraction"}:
+                call = protocol.get("tools_call") if isinstance(protocol.get("tools_call"), dict) else {}
+                samples = call.get("samples")
+                require(
+                    isinstance(samples, list) and 1 <= len(samples) <= 5,
+                    "post-pull TSE MCP smoke must cover 1 to 5 samples",
+                )
+                require(
+                    call.get("expected_samples") == len(samples)
+                    and call.get("num_samples") == len(samples),
+                    "post-pull TSE MCP smoke sample counts must match",
+                )
+                keys: set[str] = set()
+                for sample in samples:
+                    require(
+                        isinstance(sample, dict) and sample.get("ok") is True,
+                        "every post-pull TSE MCP smoke sample must pass",
+                    )
+                    key = str(sample.get("key") or "")
+                    require(
+                        bool(key) and key not in keys and not looks_like_absolute_path_or_uri(key),
+                        "post-pull TSE MCP smoke samples require unique safe keys",
+                    )
+                    keys.add(key)
+                    result = sample.get("result")
+                    require(isinstance(result, dict), f"post-pull TSE sample {key} result must be an object")
+                    canonical = validate_tse_output_object(result, sample_id=key)
+                    require(
+                        result.get("prediction_audio") == canonical.get("prediction_audio"),
+                        f"post-pull TSE sample {key} prediction_audio must be canonical",
+                    )
+                    output = str(result.get("prediction_audio") or "")
+                    require(output.startswith("outputs/"), f"post-pull TSE sample {key} output path must be portable")
+                    for field in ("prediction_audio_sha256", "audio_sha256", "enrollment_audio_sha256", "reference_audio_sha256"):
+                        digest = sample.get(field)
+                        require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None, f"post-pull TSE sample {key} {field} is invalid")
     elif kind == "model_payload":
         require(value.get("status") == "ready", "model payload was not staged")
         require(Path(str(value.get("destination", ""))).is_dir(), "staged model directory is missing")
@@ -1131,6 +1430,31 @@ def main() -> int:
                 any(isinstance(tool, dict) and tool.get("name") == "kws_predict" for tool in tools),
                 "KWS adapter config must expose kws_predict",
             )
+        if resolved_task in CLASSIFICATION_TASKS:
+            contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
+            expected_contract = io_contract_for(resolved_task)
+            require(
+                contract == expected_contract,
+                f"{resolved_task.upper()} adapter io_contract must equal the canonical classification contract",
+            )
+            require(
+                contract.get("output_type") in {"classification", "classification_answer"}
+                and contract.get("primary_field") in {"label", "answer"}
+                and contract.get("required_fields") == [contract.get("primary_field")]
+                and contract.get("nonempty_fields") == [contract.get("primary_field")]
+                and isinstance(contract.get("approved_output_fields"), list),
+                f"{resolved_task.upper()} adapter io_contract must require a closed scalar output",
+            )
+            tools = config.get("tools") if isinstance(config.get("tools"), list) else []
+            expected_tool = {
+                "ser": "emotion_recognize",
+                "gr": "gender_recognize",
+                "slu": "slu_understand",
+            }[resolved_task]
+            require(
+                any(isinstance(tool, dict) and tool.get("name") == expected_tool for tool in tools),
+                f"{resolved_task.upper()} adapter config must expose {expected_tool}",
+            )
         if resolved_task == "se":
             contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
             require(
@@ -1145,6 +1469,29 @@ def main() -> int:
             require(
                 any(isinstance(tool, dict) and tool.get("name") == "enhance_speech" for tool in tools),
                 "SE adapter config must expose enhance_speech",
+            )
+        if resolved_task == "tse":
+            contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
+            require(
+                contract == io_contract_for("tse"),
+                "TSE adapter io_contract must equal the canonical target-speaker contract",
+            )
+            require(
+                contract.get("input_type") == "audio_pair"
+                and contract.get("output_type") == "audio"
+                and contract.get("primary_field") == "prediction_audio"
+                and contract.get("required_fields") == ["prediction_audio"]
+                and contract.get("nonempty_fields") == ["prediction_audio"]
+                and contract.get("approved_output_fields") == ["prediction_audio", "sample_id"],
+                "TSE adapter io_contract must require a closed prediction_audio output",
+            )
+            tools = config.get("tools") if isinstance(config.get("tools"), list) else []
+            require(
+                any(
+                    isinstance(tool, dict) and tool.get("name") == "extract_target_speaker"
+                    for tool in tools
+                ),
+                "TSE adapter config must expose extract_target_speaker",
             )
         if resolved_task == "vad":
             contract = value.get("io_contract") if isinstance(value.get("io_contract"), dict) else {}
@@ -1209,7 +1556,12 @@ def main() -> int:
                 re.fullmatch(r"docker-image://.+@sha256:[0-9a-f]{64}", build_context) is not None,
                 "image-backed Harness Runtime build context must be digest-pinned",
             )
-        for key in ("model_py", "init_py", "server_py", "config_yaml", "model_spec", "validate_py", "mcp_smoke_py"):
+        adapter_file_keys = ("model_py", "init_py", "server_py", "config_yaml", "model_spec", "validate_py", "mcp_smoke_py")
+        if resolved_task in CLASSIFICATION_TASKS:
+            adapter_file_keys += ("classification_contract_py",)
+        if resolved_task == "tse":
+            adapter_file_keys += ("tse_contract_py",)
+        for key in adapter_file_keys:
             declared = Path(str(value.get(key, "")))
             require(
                 declared.name in dockerfile_text,

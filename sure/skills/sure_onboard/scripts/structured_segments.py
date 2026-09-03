@@ -86,6 +86,27 @@ def canonical_task(value: Any) -> str:
         return "se"
     if normalized in {"speech_activity_detection", "voice_activity_detection"}:
         return "vad"
+    if normalized in {
+        "tse",
+        "target_speaker_extraction",
+        "target_speaker_extractor",
+        "target_speaker_extraction_model",
+        "target_speaker",
+        "speaker_extraction",
+        "target_voice_extraction",
+        "target_voice_separation",
+    }:
+        return "tse"
+    if normalized in {
+        "speech_emotion_recognition",
+        "speaker_emotion_recognition",
+        "emotion_recognition",
+    }:
+        return "ser"
+    if normalized in {"gender_recognition", "speaker_gender"}:
+        return "gr"
+    if normalized in {"spoken_language_understanding"}:
+        return "slu"
     return normalized
 
 

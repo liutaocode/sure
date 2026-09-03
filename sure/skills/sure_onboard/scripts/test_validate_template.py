@@ -8,6 +8,10 @@ import wave
 from unittest import mock
 from pathlib import Path
 
+import run_validate
+import check_fixture
+import prepare_fixture
+
 
 TEMPLATE = Path(__file__).parent / "templates" / "validate.py"
 STAGE_MODEL_ARTIFACTS = Path(__file__).parent / "stage_model_artifacts.py"
@@ -50,6 +54,26 @@ class ValidateTemplateTest(unittest.TestCase):
         self.module.write_json(path, {"text": "مرحبا بالعالم"})
         self.assertIn("مرحبا بالعالم", path.read_text(encoding="utf-8"))
 
+    def test_classification_reference_normalizers_reject_non_scalar_values(self):
+        normalizers = (
+            prepare_fixture.normalize_classification_answer,
+            check_fixture.normalized_classification_answer,
+        )
+        for normalize in normalizers:
+            for value in ({"answer": "A"}, ["A"], True, float("nan"), float("inf")):
+                with self.subTest(normalize=normalize.__module__, value=value):
+                    with self.assertRaises(ValueError):
+                        normalize(value)
+        label_normalizers = (
+            prepare_fixture.normalize_classification_label,
+            check_fixture.normalized_classification_label,
+        )
+        for normalize in label_normalizers:
+            for value in ({"label": "neu"}, ["neu"], True, float("nan"), float("inf")):
+                with self.subTest(normalize=normalize.__module__, value=value):
+                    with self.assertRaises(ValueError):
+                        normalize("ser", value)
+
     def test_output_summary_is_complete_json(self):
         outputs = [{"text": "مرحبا " * 200} for _ in range(3)]
         summary = self.module.output_summary(outputs)
@@ -90,6 +114,171 @@ class ValidateTemplateTest(unittest.TestCase):
         self.assertEqual(json.loads(self.module.SAMPLE_OUTPUT.read_text(encoding="utf-8"))["text"], "نص 1")
         infer_result = json.loads((self.module.ARTIFACTS_DIR / "infer_result.json").read_text(encoding="utf-8"))
         self.assertEqual(infer_result["sample_outputs_path"], "artifacts/sample_outputs.jsonl")
+
+    def test_classification_output_rows_are_closed_and_reference_safe(self):
+        self.module.TASK_TYPE = "ser"
+        fixtures = [
+            {
+                "input": {"audio_path": "sample.wav"},
+                "fixture": {
+                    "key": "sample-1",
+                    "audio": "sample.wav",
+                    "dataset": "classification-demo",
+                    "ground_truth": "neu",
+                },
+            }
+        ]
+        self.module.classification_fixture_payloads = lambda: fixtures
+        valid = {
+            "id": 1,
+            "key": "sample-1",
+            "task": "ser",
+            "audio": "sample.wav",
+            "dataset": "classification-demo",
+            "ground_truth": "neu",
+            "result": {"label": "neu"},
+        }
+        self.assertEqual(
+            self.module.validate_classification_output_document({"rows": [valid]}, "ser"),
+            [],
+        )
+        for field, value in (
+            ("reference_audio", "/company/private.wav"),
+            ("company_path", "/company/private"),
+            ("debug", {"target": "private-reference"}),
+        ):
+            with self.subTest(field=field):
+                bad = {**valid, field: value}
+                violations = self.module.validate_classification_output_document(
+                    {"rows": [bad]}, "ser"
+                )
+                self.assertTrue(violations)
+                self.assertTrue(
+                    any("unapproved" in item or "reference/path" in item for item in violations),
+                    violations,
+                )
+
+    def test_classification_jsonl_mirror_rejects_row_metadata_leakage(self):
+        self.module.TASK_TYPE = "ser"
+        self.module.IO_CONTRACT = {
+            "primary_field": "label",
+            "required_fields": ["label"],
+            "nonempty_fields": ["label"],
+            "json_serializable": True,
+        }
+        fixtures = [
+            {
+                "input": {"audio_path": "sample.wav"},
+                "fixture": {
+                    "key": "sample-1",
+                    "audio": "sample.wav",
+                    "dataset": "classification-demo",
+                    "ground_truth": "neu",
+                },
+            }
+        ]
+        self.module.classification_fixture_payloads = lambda: fixtures
+        row = {
+            "id": 1,
+            "key": "sample-1",
+            "task": "ser",
+            "audio": "sample.wav",
+            "dataset": "classification-demo",
+            "ground_truth": "neu",
+            "result": {"label": "neu"},
+        }
+        self.module.write_json(self.module.SAMPLE_OUTPUT, {"rows": [row]})
+        self.module.write_jsonl(self.module.SAMPLE_OUTPUTS, [row])
+        self.assertTrue(self.module.stage_contract())
+
+        leaked = {**row, "company_path": "/company/private"}
+        self.module.write_jsonl(self.module.SAMPLE_OUTPUTS, [leaked])
+        self.assertFalse(self.module.stage_contract())
+        contract_result = json.loads(
+            (self.module.ARTIFACTS_DIR / "contract_result.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("reference/path", contract_result["error"])
+
+    def test_outer_gate_rechecks_classification_evidence_and_mirror(self):
+        root = Path(self.temp_dir.name)
+        run_dir = root / ".sure" / "runs" / "ser-gate"
+        artifacts = run_dir / "artifacts"
+        artifacts.mkdir(parents=True)
+        model_dir = root / "sure" / "models" / "example__ser"
+        fixture_dir = model_dir / "fixture" / "ser" / "smoke"
+        fixture_dir.mkdir(parents=True)
+        (model_dir / "model.py").write_text("# test\n", encoding="utf-8")
+        audio = fixture_dir / "sample.wav"
+        audio.write_bytes(b"fixture")
+        gt = {
+            "key": "sample-1",
+            "task_type": "ser",
+            "audio": "sample.wav",
+            "ground_truth": "neu",
+            "dataset": "classification-demo",
+        }
+        (fixture_dir / "gt.jsonl").write_text(json.dumps(gt) + "\n", encoding="utf-8")
+        manifest = {
+            "model_dir": str(model_dir),
+            "task_type": "ser",
+            "staged_dir": str(fixture_dir),
+            "gt_jsonl": str(fixture_dir / "gt.jsonl"),
+            "sample_count": 1,
+            "samples": [
+                {
+                    "key": "sample-1",
+                    "audio": "sample.wav",
+                    "audio_path": str(audio),
+                    "annotation_fields": ["ground_truth"],
+                }
+            ],
+        }
+        (artifacts / "fixture_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        contract = {
+            "input_type": "audio_path",
+            "output_type": "json",
+            "primary_field": "label",
+            "required_fields": ["label"],
+            "nonempty_fields": ["label"],
+            "json_serializable": True,
+        }
+        (artifacts / "model_input_resolved.json").write_text(
+            json.dumps(
+                {
+                    "task_type": "ser",
+                    "model_dir": str(model_dir),
+                    "normalized_model_input": {"io_contract": contract},
+                }
+            ),
+            encoding="utf-8",
+        )
+        row = {
+            "id": 1,
+            "key": "sample-1",
+            "task": "ser",
+            "audio": "sample.wav",
+            "dataset": "classification-demo",
+            "ground_truth": "neu",
+            "result": {"label": "neu"},
+        }
+        sample_output = artifacts / "sample_output.json"
+        sample_outputs = artifacts / "sample_outputs.jsonl"
+        sample_output.write_text(json.dumps({"rows": [row]}), encoding="utf-8")
+        sample_outputs.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        gate_data = {
+            "model_dir": str(model_dir),
+            "io_contract": contract,
+            "sample_output_path": str(sample_output),
+            "sample_outputs_path": str(sample_outputs),
+        }
+        self.assertEqual(run_validate.validate_classification_evidence(gate_data, run_dir), [])
+
+        leaked = {**row, "company_path": "/company/private"}
+        sample_outputs.write_text(json.dumps(leaked) + "\n", encoding="utf-8")
+        violations = run_validate.validate_classification_evidence(gate_data, run_dir)
+        self.assertTrue(any("reference/path" in item or "unapproved" in item for item in violations))
 
     def test_fixture_payloads_use_first_selected_set_and_preserve_metadata(self):
         model_dir = Path(self.temp_dir.name) / "model"

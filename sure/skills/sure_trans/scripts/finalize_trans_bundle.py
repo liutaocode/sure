@@ -35,6 +35,16 @@ from prepare_fixture import (
     validate_speaker_segments,
     validate_vad_intervals,
 )
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task,
+    normalize_prediction,
+)
+from tse_contract import (
+    canonical_task as canonical_tse_task,
+    looks_like_absolute_path_or_uri as tse_path_or_uri,
+    validate_output_object as validate_tse_output_object,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -432,6 +442,130 @@ def stage_se_fixture(
     validate_fixture_manifest(finalized_manifest)
 
 
+def stage_tse_fixture(
+    run_dir: Path,
+    model_dir: Path,
+    resolved: dict,
+    fixture_manifest: dict,
+) -> None:
+    """Copy TSE mixture/enrollment/reference roles into the sealed bundle."""
+
+    samples = fixture_manifest.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("TSE fixture manifest must declare samples")
+    # The preparation gate proves the run-owned source tree before promotion.
+    validate_fixture_manifest(fixture_manifest)
+    raw_declared_staged_dir = Path(str(fixture_manifest.get("staged_dir") or "")).expanduser()
+    if raw_declared_staged_dir.is_symlink():
+        raise ValueError("TSE fixture staged_dir must not be a symlink")
+    declared_staged_dir = raw_declared_staged_dir.resolve()
+    if not declared_staged_dir.is_relative_to(run_dir.resolve()):
+        raise ValueError("TSE fixture staged_dir must stay below the current run directory")
+    source_candidates = (run_dir / "fixture" / "tse", declared_staged_dir)
+    staged_dir = next(
+        (candidate.resolve() for candidate in source_candidates if (candidate / "gt.jsonl").is_file()),
+        None,
+    )
+    if staged_dir is None:
+        raise ValueError("prepared TSE fixture source is missing")
+
+    source_samples: list[dict] = []
+    relative_files = {Path("gt.jsonl")}
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("TSE fixture samples must be objects")
+        item = dict(sample)
+        for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+            relative = Path(str(item.get(role) or ""))
+            if (
+                not str(relative)
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or "\\" in str(item.get(role) or "")
+            ):
+                raise ValueError(f"TSE fixture {role} path must be portable: {relative}")
+            source = staged_dir / relative
+            if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(staged_dir):
+                raise ValueError(f"TSE fixture {role} is missing or unsafe: {source}")
+            relative_files.add(relative)
+            item[f"{role}_path"] = str(source)
+            item[f"{role.removesuffix('_audio')}_sha256"] = sha256(source)
+            item[f"{role.removesuffix('_audio')}_size_bytes"] = source.stat().st_size
+        mixture = Path(str(item["mixture_audio"]))
+        item["audio"] = mixture.as_posix()
+        item["mixture_audio"] = mixture.as_posix()
+        source_samples.append(item)
+
+    annotation_source = fixture_manifest.get("annotation_source")
+    if not isinstance(annotation_source, dict):
+        raise ValueError("TSE fixture manifest is missing annotation_source")
+    source_manifest = {
+        **fixture_manifest,
+        "model_dir": str(run_dir if staged_dir.is_relative_to(run_dir) else model_dir),
+        "staged_dir": str(staged_dir),
+        "staged_path": str(staged_dir),
+        "gt_jsonl": str(staged_dir / "gt.jsonl"),
+        "samples": source_samples,
+        "sha256": fixture_tree_identity(staged_dir, relative_files),
+        "gt_sha256": sha256(staged_dir / "gt.jsonl"),
+        "expected_sha256": sha256(staged_dir / "gt.jsonl"),
+        "size_bytes": sum((staged_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(source_samples),
+        "annotation_source": {**annotation_source, "staged_path": str(staged_dir / "gt.jsonl")},
+    }
+    validate_fixture_manifest(source_manifest)
+
+    fixture_dir = model_dir / "fixture" / "tse"
+    clear_directory(fixture_dir, model_dir / "fixture")
+    for source in sorted(staged_dir.rglob("*")):
+        if source.is_symlink():
+            raise ValueError(f"TSE fixture tree must not contain symlinks: {source}")
+        relative = source.relative_to(staged_dir)
+        destination = fixture_dir / relative
+        if source.is_dir():
+            ensure_safe_bundle_parent(model_dir, destination / ".fixture-placeholder")
+            continue
+        if not source.is_file():
+            raise ValueError(f"TSE fixture tree contains an unsupported entry: {source}")
+        ensure_safe_bundle_parent(model_dir, destination)
+        shutil.copy2(source, destination)
+
+    finalized_samples: list[dict] = []
+    for item in source_samples:
+        finalized = dict(item)
+        for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+            relative = Path(str(finalized[role]))
+            path = fixture_dir / relative
+            finalized[f"{role}_path"] = str(path)
+            finalized[f"{role.removesuffix('_audio')}_sha256"] = sha256(path)
+            finalized[f"{role.removesuffix('_audio')}_size_bytes"] = path.stat().st_size
+        finalized["audio"] = finalized["mixture_audio"]
+        finalized_samples.append(finalized)
+    finalized_manifest = {
+        **fixture_manifest,
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(model_dir),
+        "task_type": "tse",
+        "staged_dir": str(fixture_dir),
+        "staged_path": str(fixture_dir),
+        "gt_jsonl": str(fixture_dir / "gt.jsonl"),
+        "samples": finalized_samples,
+        "sha256": fixture_tree_identity(fixture_dir, relative_files),
+        "gt_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "expected_sha256": sha256(fixture_dir / "gt.jsonl"),
+        "size_bytes": sum((fixture_dir / relative).stat().st_size for relative in relative_files),
+        "sample_count": len(finalized_samples),
+        "annotation_source": {
+            **annotation_source,
+            "staged_path": str(fixture_dir / "gt.jsonl"),
+            "bundled_path": str(fixture_dir / "gt.jsonl"),
+        },
+    }
+    write_identical(run_dir / "artifacts" / "fixture_manifest.json", json_bytes(finalized_manifest))
+    validate_fixture_manifest(finalized_manifest)
+
+
 def stage_speaker_fixture(
     run_dir: Path,
     model_dir: Path,
@@ -704,12 +838,18 @@ def stage_vad_fixture(
 
 def stage_fixture(run_dir: Path, model_dir: Path, resolved: dict) -> None:
     fixture_manifest = read_object(run_dir / "artifacts" / "fixture_manifest.json")
-    task = str(resolved.get("task_type") or "asr").lower().replace("-", "_")
+    task = canonical_tse_task(str(resolved.get("task_type") or "asr").lower().replace("-", "_"))
     if task == "kws":
         stage_kws_fixture(run_dir, model_dir, resolved, fixture_manifest)
         return
     if task == "se":
         stage_se_fixture(run_dir, model_dir, resolved, fixture_manifest)
+        return
+    if task == "tse":
+        stage_tse_fixture(run_dir, model_dir, resolved, fixture_manifest)
+        return
+    if task in CLASSIFICATION_TASKS:
+        stage_classification_fixture(run_dir, model_dir, resolved, fixture_manifest, task=task)
         return
     if task in SPEAKER_TASKS:
         stage_speaker_fixture(
@@ -816,6 +956,80 @@ def stage_fixture(run_dir: Path, model_dir: Path, resolved: dict) -> None:
         run_dir / "artifacts" / "fixture_manifest.json",
         json_bytes(finalized_manifest),
     )
+    validate_fixture_manifest(finalized_manifest)
+
+
+def stage_classification_fixture(
+    run_dir: Path,
+    model_dir: Path,
+    resolved: dict,
+    fixture_manifest: dict,
+    *,
+    task: str,
+) -> None:
+    """Copy only the keyed classification fixture files into the final bundle."""
+
+    normalized_task = canonical_task(task)
+    if normalized_task not in CLASSIFICATION_TASKS:
+        raise ValueError(f"unsupported classification fixture task: {task}")
+    source_manifest = dict(fixture_manifest)
+    source_manifest["model_dir"] = str(run_dir)
+    validate_fixture_manifest(source_manifest)
+    source_dir = Path(str(fixture_manifest.get("staged_dir") or "")).resolve()
+    if not source_dir.is_dir() or not source_dir.is_relative_to(run_dir.resolve()):
+        raise ValueError("classification fixture must be staged below the current run directory")
+    fixture_dir = model_dir / "fixture" / normalized_task
+    clear_directory(fixture_dir, model_dir / "fixture")
+    for source in sorted(source_dir.iterdir()):
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"classification fixture staged directory may contain regular files only: {source}")
+        destination = fixture_dir / source.name
+        ensure_safe_bundle_parent(model_dir, destination)
+        shutil.copy2(source, destination)
+    gt_jsonl = fixture_dir / "gt.jsonl"
+    if not gt_jsonl.is_file():
+        raise ValueError("classification fixture ground truth is missing")
+    samples = []
+    for sample in fixture_manifest.get("samples") or []:
+        if not isinstance(sample, dict):
+            raise ValueError("classification fixture sample must be an object")
+        audio = Path(str(sample.get("audio") or ""))
+        if audio.is_absolute() or ".." in audio.parts:
+            raise ValueError("classification fixture sample audio path is not portable")
+        bundled_audio = fixture_dir / audio
+        if not bundled_audio.is_file():
+            raise ValueError(f"classification fixture audio is missing: {bundled_audio}")
+        item = dict(sample)
+        item["audio_path"] = str(bundled_audio)
+        samples.append(item)
+    annotation_source = fixture_manifest.get("annotation_source")
+    if not isinstance(annotation_source, dict):
+        raise ValueError("classification fixture annotation_source is missing")
+    annotation_source = {
+        **annotation_source,
+        "staged_path": str(gt_jsonl),
+        "bundled_path": str(gt_jsonl),
+    }
+    relative_files = [path.relative_to(fixture_dir) for path in fixture_dir.rglob("*") if path.is_file()]
+    finalized_manifest = {
+        **fixture_manifest,
+        "model_id": resolved["model_name"],
+        "model_name": resolved["model_name"],
+        "model_dir": str(model_dir),
+        "task_type": normalized_task,
+        "staged_dir": str(fixture_dir),
+        "gt_jsonl": str(gt_jsonl),
+        "samples": samples,
+        "source_path": str(fixture_manifest.get("source_path") or fixture_manifest.get("source_dir") or ""),
+        "staged_path": str(fixture_dir),
+        "sample_count": len(samples),
+        "annotation_source": annotation_source,
+        "sha256": fixture_tree_identity(fixture_dir, relative_files),
+        "gt_sha256": sha256(gt_jsonl),
+        "expected_sha256": sha256(gt_jsonl),
+        "size_bytes": sum((fixture_dir / relative).stat().st_size for relative in relative_files),
+    }
+    write_identical(run_dir / "artifacts" / "fixture_manifest.json", json_bytes(finalized_manifest))
     validate_fixture_manifest(finalized_manifest)
 
 
@@ -951,6 +1165,140 @@ def validate_se_sample_output(sample: dict, contract: dict, fixture_manifest: di
     extra = sorted(set(outputs) - set(references))
     if missing or extra:
         raise ValueError(f"SE sample_output key mismatch: missing={missing}, extra={extra}")
+
+
+def tse_fixture_input_paths(fixture_manifest: dict) -> tuple[Path, ...]:
+    samples = fixture_manifest.get("samples")
+    if not isinstance(samples, list):
+        raise ValueError("TSE fixture manifest has no samples")
+    staged_raw = Path(str(fixture_manifest.get("staged_dir") or "")).expanduser()
+    if not staged_raw.is_absolute() or staged_raw.is_symlink() or not staged_raw.is_dir():
+        raise ValueError("TSE fixture manifest staged_dir must be a real absolute directory")
+    staged_dir = staged_raw.resolve()
+    paths: list[Path] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise ValueError("TSE fixture samples must be objects")
+        for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+            raw_path = Path(str(sample.get(f"{role}_path") or "")).expanduser()
+            path = raw_path if raw_path.is_absolute() else staged_dir / raw_path
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"TSE fixture {role}_path is missing or unsafe")
+            raw_relative = (
+                raw_path.relative_to(staged_dir)
+                if raw_path.is_absolute() and raw_path.is_relative_to(staged_dir)
+                else raw_path
+            )
+            current = staged_dir
+            for part in raw_relative.parts:
+                current /= part
+                if current.is_symlink():
+                    raise ValueError(f"TSE fixture {role}_path traverses a symlink")
+            resolved = path.resolve()
+            if not resolved.is_relative_to(staged_dir):
+                raise ValueError(f"TSE fixture {role}_path escapes staged_dir")
+            paths.append(resolved)
+        if len({path for path in paths[-3:]}) != 3:
+            raise ValueError("TSE mixture, enrollment, and reference audio must be independent files")
+    return tuple(paths)
+
+
+def expected_tse_validation_output(artifacts: Path, key: str, index: int) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    return artifacts / "adapter_validation" / "outputs" / f"{index:02d}-{digest}.wav"
+
+
+def validate_tse_sample_output(sample: dict, contract: dict, fixture_manifest: dict) -> None:
+    """Validate keyed TSE output before generated audio is promoted."""
+
+    rows = sample.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError("TSE sample_output.json must be an object with a rows array")
+    fixture_samples = fixture_manifest.get("samples")
+    if not isinstance(fixture_samples, list) or not fixture_samples:
+        raise ValueError("TSE fixture manifest has no samples")
+    references = {
+        str(item.get("key") or item.get("sample_id") or ""): item
+        for item in fixture_samples
+        if isinstance(item, dict) and (item.get("key") or item.get("sample_id"))
+    }
+    if len(references) != len(fixture_samples):
+        raise ValueError("TSE fixture manifest keys must be non-empty and unique")
+    outputs: dict[str, dict] = {}
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"TSE sample_output rows[{index}] must be an object")
+        unknown_row_fields = sorted(
+            str(field) for field in row if field not in {"key", "sample_id", "result"}
+        )
+        if unknown_row_fields:
+            raise ValueError(
+                f"TSE sample_output row {index} contains unapproved field(s): "
+                + ", ".join(unknown_row_fields)
+            )
+        if row.get("key") not in (None, "") and row.get("sample_id") not in (None, "") and row.get("key") != row.get("sample_id"):
+            raise ValueError(f"TSE sample_output row {index} key and sample_id must match")
+        key = str(row.get("key") or row.get("sample_id") or "").strip()
+        if not key or key in outputs or tse_path_or_uri(key):
+            raise ValueError(f"TSE sample_output key is missing, duplicated, or unsafe: {key!r}")
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"TSE sample_output result for {key} must be an object")
+        try:
+            canonical = validate_tse_output_object(result, sample_id=key)
+        except ValueError as error:
+            raise ValueError(f"TSE sample_output result for {key}: {error}") from error
+        if result.get("prediction_audio") != canonical.get("prediction_audio"):
+            raise ValueError(f"TSE sample_output result for {key} must use canonical prediction_audio fields")
+        outputs[key] = result
+    missing = sorted(set(references) - set(outputs))
+    extra = sorted(set(outputs) - set(references))
+    if missing or extra:
+        raise ValueError(f"TSE sample_output key mismatch: missing={missing}, extra={extra}")
+
+
+def validate_classification_sample_output(
+    sample: dict, contract: dict, fixture_manifest: dict, *, task: str
+) -> None:
+    """Validate every keyed SER/GR/SLU result against the canonical contract."""
+
+    normalized_task = canonical_task(task)
+    if normalized_task not in CLASSIFICATION_TASKS:
+        raise ValueError(f"unsupported classification output task: {task}")
+    rows = sample.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError(f"{normalized_task.upper()} sample_output.json must be an object with a rows array")
+    fixture_samples = fixture_manifest.get("samples")
+    if not isinstance(fixture_samples, list) or not fixture_samples:
+        raise ValueError(f"{normalized_task.upper()} fixture manifest has no samples")
+    references = {
+        str(item.get("key") or ""): item
+        for item in fixture_samples
+        if isinstance(item, dict) and item.get("key")
+    }
+    if len(references) != len(fixture_samples):
+        raise ValueError(f"{normalized_task.upper()} fixture keys must be non-empty and unique")
+    outputs: dict[str, dict] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{normalized_task.upper()} sample_output rows[{index}] must be an object")
+        key = str(row.get("key") or "")
+        if not key or key in outputs:
+            raise ValueError(f"{normalized_task.upper()} sample_output key is missing or duplicated: {key!r}")
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"{normalized_task.upper()} sample_output result for {key} must be an object")
+        try:
+            _scalar, normalized_result = normalize_prediction(normalized_task, result)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{normalized_task.upper()} sample_output result for {key}: {error}") from error
+        if result != normalized_result:
+            raise ValueError(f"{normalized_task.upper()} sample_output result for {key} is not canonical")
+        outputs[key] = result
+    missing = sorted(set(references) - set(outputs))
+    extra = sorted(set(outputs) - set(references))
+    if missing or extra:
+        raise ValueError(f"{normalized_task.upper()} sample_output key mismatch: missing={missing}, extra={extra}")
 
 
 def validate_speaker_sample_output(
@@ -1255,7 +1603,17 @@ def promote_sample_output(run_dir: Path) -> None:
         write_identical(artifacts / "sample_output.json", json_bytes(sample))
         return
     fixture_manifest = read_object(artifacts / "fixture_manifest.json")
-    if fixture_manifest.get("task_type") == "se":
+    task = canonical_tse_task(str(fixture_manifest.get("task_type") or "").lower().replace("-", "_"))
+    if task in CLASSIFICATION_TASKS:
+        validate_classification_sample_output(
+            sample,
+            contract,
+            fixture_manifest,
+            task=task,
+        )
+        write_identical(artifacts / "sample_output.json", json_bytes(sample))
+        return
+    if task == "se":
         validate_se_sample_output(sample, contract, fixture_manifest)
         forbidden_inputs = se_fixture_input_paths(fixture_manifest)
         for index, row in enumerate(sample["rows"], 1):
@@ -1270,7 +1628,23 @@ def promote_sample_output(run_dir: Path) -> None:
             )
         write_identical(artifacts / "sample_output.json", json_bytes(sample))
         return
-    task = str(fixture_manifest.get("task_type") or "").lower().replace("-", "_")
+    if task == "tse":
+        validate_tse_sample_output(sample, contract, fixture_manifest)
+        forbidden_inputs = tse_fixture_input_paths(fixture_manifest)
+        for index, row in enumerate(sample["rows"], 1):
+            result = row["result"]
+            key = str(row.get("key") or row.get("sample_id") or "")
+            result["prediction_audio"] = promote_generated_audio(
+                artifacts,
+                result["prediction_audio"],
+                expected_source=expected_tse_validation_output(artifacts, key, index),
+                require_pcm_wav=True,
+                forbidden_inputs=forbidden_inputs,
+            )
+            # Keep the row identity explicit even when the model omitted it.
+            result["sample_id"] = key
+        write_identical(artifacts / "sample_output.json", json_bytes(sample))
+        return
     if task == "vad":
         validate_vad_sample_output(sample, contract, fixture_manifest)
         write_identical(artifacts / "sample_output.json", json_bytes(sample))

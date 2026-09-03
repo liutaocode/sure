@@ -26,6 +26,16 @@ from sure_eval.core.config import Config
 from sure_eval.core.logging import configure_logging, get_logger
 from sure_eval.datasets import DatasetManager
 
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task as canonical_classification_task,
+    normalize_answer as normalize_classification_answer,
+    normalize_prediction as normalize_classification_prediction,
+    normalize_label as normalize_classification_label,
+    prompt_payload as classification_prompt_payload,
+    reference_value as classification_reference_value,
+)
+
 configure_logging(level="INFO")
 logger = get_logger(__name__)
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +43,25 @@ KWS_POSITIVE_LABELS = {"detect", "detected", "positive", "true", "1", "yes"}
 KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
 KWS_OPERATING_THRESHOLD = 0.5
 ANNOTATION_TASKS = {"SD", "SA-ASR"}
-STRUCTURED_REQUIRED_TASKS = {"KWS", "SE", "VAD", *ANNOTATION_TASKS}
+TSE_TASK_ALIASES = {
+    "TSE",
+    "TARGET_SPEAKER_EXTRACTION",
+    "TARGET_SPEAKER_EXTRACTOR",
+    "TARGET_SPEAKER_EXTRACTION_MODEL",
+    "TARGET_SPEAKER",
+    "SPEAKER_EXTRACTION",
+    "TARGET_VOICE_EXTRACTION",
+    "TARGET_VOICE_SEPARATION",
+}
+TSE_OUTPUT_FIELDS = {"prediction_audio", "sample_id"}
+TSE_REFERENCE_FIELDS = {
+    "answer", "expected", "ground_truth", "input", "input_audio",
+    "mixture_audio", "mixture_audio_path", "mixed_audio", "reference",
+    "reference_audio", "reference_audio_path", "reference_text", "target",
+    "target_audio", "target_audio_path", "target_text", "enrollment_audio",
+    "enrollment_audio_path",
+}
+STRUCTURED_REQUIRED_TASKS = {"KWS", "SE", "TSE", "VAD", *ANNOTATION_TASKS, *CLASSIFICATION_TASKS}
 
 
 def _normalize_task(value: Any) -> str:
@@ -42,6 +70,11 @@ def _normalize_task(value: Any) -> str:
     )
     if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
         return "VAD"
+    if normalized in TSE_TASK_ALIASES:
+        return "TSE"
+    classification = canonical_classification_task(normalized).upper()
+    if classification in CLASSIFICATION_TASKS:
+        return classification
     return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
@@ -159,6 +192,60 @@ def _valid_se_pcm_output(value: Any, base_dir: Path | None) -> bool:
             )
     except (EOFError, OSError, wave.Error):
         return False
+
+
+def _valid_tse_prediction_audio(value: Any, base_dir: Path | None) -> bool:
+    """Check that prediction_audio is a run-local generated PCM WAV."""
+
+    if base_dir is None or value in (None, ""):
+        return False
+    root = (base_dir / "audio").expanduser().absolute()
+    if root.is_symlink() or root.resolve() != root:
+        return False
+    path = Path(str(value)).expanduser()
+    if ".." in path.parts or "://" in str(value):
+        return False
+    path = path.absolute() if path.is_absolute() else (base_dir / path).absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
+        return False
+    try:
+        with wave.open(str(resolved), "rb") as handle:
+            return (
+                handle.getcomptype() == "NONE"
+                and handle.getnchannels() >= 1
+                and handle.getsampwidth() in {1, 2, 3, 4}
+                and handle.getframerate() >= 1
+                and handle.getnframes() >= 1
+            )
+    except (EOFError, OSError, wave.Error):
+        return False
+
+
+def _tse_forbidden_output_fields(value: Any, path: str = "prediction") -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            child = f"{path}.{key}"
+            if normalized in TSE_REFERENCE_FIELDS or normalized.endswith("_path"):
+                found.append(child)
+            found.extend(_tse_forbidden_output_fields(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(_tse_forbidden_output_fields(item, f"{path}[{index}]"))
+    return found
 
 
 def _kws_reference_contract_violation(sample: dict[str, Any]) -> bool:
@@ -336,9 +423,13 @@ def _task_contract_violations(
     *,
     base_dir: Path | None = None,
     kws_require_score: bool = False,
+    dataset_name: str = "",
 ) -> list[str]:
     violations: list[str] = []
-    sample_by_key = {str(sample.get("key", "")): sample for sample in samples}
+    sample_by_key = {
+        str(sample.get("key") or sample.get("sample_id") or ""): sample
+        for sample in samples
+    }
     for key, row in structured.items():
         sample = sample_by_key.get(key)
         if not isinstance(sample, dict):
@@ -350,10 +441,98 @@ def _task_contract_violations(
             violations.append(key)
             continue
         task = sample_task
+        if task == "TSE" and (
+            not key.strip() or "/" in key or "\\" in key or any(ch.isspace() for ch in key)
+        ):
+            violations.append(key)
+            continue
+        if task in CLASSIFICATION_TASKS and dataset_name and str(row.get("dataset") or "") != dataset_name:
+            violations.append(key)
+            continue
+        if task == "TSE" and dataset_name and str(row.get("dataset") or "") != dataset_name:
+            violations.append(key)
+            continue
+        if task in CLASSIFICATION_TASKS:
+            has_reference_field = any(
+                field in row for field in ("ground_truth", "target", "reference", "expected")
+            )
+            if has_reference_field:
+                violations.append(key)
+                continue
         prediction = row.get("prediction") if isinstance(row.get("prediction"), dict) else {}
         normalized = str(row.get("normalized_prediction") or "")
         if task in {"ASR", "S2TT"} and not (prediction.get("text") or normalized):
             violations.append(key)
+        elif task == "TSE":
+            if any(
+                field not in TSE_OUTPUT_FIELDS
+                for field in prediction
+            ):
+                violations.append(key)
+                continue
+            if _tse_forbidden_output_fields(prediction):
+                violations.append(key)
+                continue
+            raw_response = row.get("raw_response")
+            if isinstance(raw_response, dict) and _tse_forbidden_output_fields(raw_response, "raw_response"):
+                violations.append(key)
+                continue
+            expected_sample_id = str(sample.get("sample_id") or sample.get("key") or key)
+            if row.get("sample_id") not in (None, "", expected_sample_id):
+                violations.append(key)
+                continue
+            returned_sample_id = prediction.get("sample_id")
+            if returned_sample_id is not None and str(returned_sample_id) != expected_sample_id:
+                violations.append(key)
+                continue
+            prediction_audio = prediction.get("prediction_audio")
+            if not _valid_tse_prediction_audio(prediction_audio, base_dir):
+                violations.append(key)
+                continue
+            generated_path = _resolve_audio_path(prediction_audio, base_dir)
+            leaked = False
+            for role in (
+                "mixture_audio_path",
+                "mixture_audio",
+                "mixed_audio",
+                "enrollment_audio_path",
+                "enrollment_audio",
+                "reference_audio",
+                "reference_audio_path",
+                "target_audio",
+                "target_audio_path",
+            ):
+                role_value = sample.get(role)
+                if role_value in (None, ""):
+                    continue
+                role_path = _resolve_audio_path(role_value, base_dir)
+                try:
+                    if generated_path.exists() and role_path.exists() and generated_path.resolve().samefile(role_path.resolve()):
+                        leaked = True
+                        break
+                except OSError:
+                    continue
+            if leaked:
+                violations.append(key)
+                continue
+            if str(row.get("normalized_prediction") or "") != str(prediction_audio):
+                violations.append(key)
+                continue
+            # TSE fixture rows must expose all scoring roles, but these fields
+            # are checked only as dataset metadata and are never model output.
+            if not all(
+                isinstance(sample.get(field), str) and sample.get(field).strip()
+                for field in (
+                    "reference_audio"
+                    if sample.get("reference_audio") not in (None, "")
+                    else "reference_audio_path",
+                    "enrollment_audio"
+                    if sample.get("enrollment_audio") not in (None, "")
+                    else "enrollment_audio_path",
+                )
+            ):
+                violations.append(key)
+                continue
         elif task in {"TTS", "VC"}:
             audio_path = prediction.get("audio_path") or normalized
             if not audio_path or not _resolve_audio_path(audio_path, base_dir).exists():
@@ -366,10 +545,26 @@ def _task_contract_violations(
                 continue
             if not _valid_se_pcm_output(audio_path, base_dir):
                 violations.append(key)
-        elif task in {"SER", "GR"} and not (prediction.get("label") or normalized):
-            violations.append(key)
-        elif task == "SLU" and not (prediction.get("text") or prediction.get("label") or normalized):
-            violations.append(key)
+        elif task in CLASSIFICATION_TASKS:
+            try:
+                scalar, canonical_prediction = normalize_classification_prediction(task, prediction)
+                if prediction != canonical_prediction or normalized != scalar:
+                    violations.append(key)
+                    continue
+                raw_response = row.get("raw_response")
+                if raw_response is not None:
+                    _raw_scalar, raw_canonical = normalize_classification_prediction(task, raw_response)
+                    if raw_canonical != canonical_prediction:
+                        violations.append(key)
+                        continue
+                reference = classification_reference_value(sample, task)
+                if task in {"SER", "GR"}:
+                    normalize_classification_label(task, reference)
+                else:
+                    classification_prompt_payload(sample)
+                    normalize_classification_answer(reference)
+            except (TypeError, ValueError):
+                violations.append(key)
         elif task in ANNOTATION_TASKS:
             if any(field not in {"segments", "num_speakers"} for field in prediction):
                 violations.append(key)
@@ -513,7 +708,7 @@ def validate_prediction_file(
         for sample in samples
     )
 
-    expected_keys = [str(sample.get("key", "")) for sample in samples]
+    expected_keys = [str(sample.get("key") or sample.get("sample_id") or "") for sample in samples]
     expected_key_set = set(expected_keys)
     prediction_key_set = set(predictions.keys())
 
@@ -535,6 +730,7 @@ def validate_prediction_file(
             structured_predictions,
             base_dir=structured_path.parent,
             kws_require_score=kws_require_score,
+            dataset_name=canonical_name,
         )
         if structured_path.exists()
         else []

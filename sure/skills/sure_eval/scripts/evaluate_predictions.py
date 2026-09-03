@@ -34,6 +34,16 @@ from sure_eval.evaluation.rps import EvaluationRecord, RPSManager
 from sure_eval.evaluation.sure_evaluator import SUREEvaluator
 from sure_eval.reports import SOTAManager
 
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task as canonical_classification_task,
+    label_spec_payload,
+    normalize_answer as normalize_classification_answer,
+    normalize_label as normalize_classification_label,
+    prompt_payload as classification_prompt_payload,
+    reference_value as classification_reference_value,
+)
+
 from resolve_evaluation_engine import resolve_engine_root
 from evaluation_runtime import (
     EvaluationRuntimeError,
@@ -51,6 +61,17 @@ KWS_NEGATIVE_LABELS = {"reject", "rejected", "negative", "false", "0", "no"}
 KWS_OPERATING_THRESHOLD = 0.5
 ANNOTATION_TASKS = {"SD", "SA-ASR", "SA_ASR"}
 VAD_DETECTION_METRICS = ("f1", "p_fa", "p_miss", "dcf_nist")
+TSE_TASK_ALIASES = {
+    "TSE",
+    "TARGET_SPEAKER_EXTRACTION",
+    "TARGET_SPEAKER_EXTRACTOR",
+    "TARGET_SPEAKER_EXTRACTION_MODEL",
+    "TARGET_SPEAKER",
+    "SPEAKER_EXTRACTION",
+    "TARGET_VOICE_EXTRACTION",
+    "TARGET_VOICE_SEPARATION",
+}
+TSE_DEFAULT_METRIC = "si_sdr"
 
 LOWER_IS_BETTER_METRICS = {
     "wer",
@@ -74,6 +95,11 @@ def _normalize_task(value: Any) -> str:
     )
     if normalized in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
         return "VAD"
+    if normalized in TSE_TASK_ALIASES:
+        return "TSE"
+    classification = canonical_classification_task(normalized).upper()
+    if classification in CLASSIFICATION_TASKS:
+        return classification
     return "SA-ASR" if normalized == "SA_ASR" else normalized
 
 
@@ -158,7 +184,7 @@ def load_structured_prediction_map(path: Path) -> dict[str, dict[str, Any]]:
             row = json.loads(line)
             if not isinstance(row, dict):
                 raise ValueError(f"Structured prediction row must be an object: {path}")
-            key = str(row.get("key", ""))
+            key = str(row.get("key") or row.get("sample_id") or "")
             if not key:
                 raise ValueError(f"Structured prediction row is missing key: {path}")
             if key in predictions:
@@ -173,7 +199,7 @@ def _samples_with_predictions(
     *,
     dataset_name: str,
 ) -> list[dict[str, Any]]:
-    expected_keys = [str(sample.get("key", "")) for sample in samples]
+    expected_keys = [_sample_key(sample) for sample in samples]
     if not expected_keys or any(not key for key in expected_keys):
         raise ValueError(f"Dataset samples have missing keys: {dataset_name}")
     if len(set(expected_keys)) != len(expected_keys):
@@ -193,15 +219,19 @@ def _scoped_samples(samples: list[dict[str, Any]], max_samples: int) -> list[dic
     return samples[:max_samples] if max_samples > 0 else samples
 
 
+def _sample_key(sample: dict[str, Any]) -> str:
+    return str(sample.get("key") or sample.get("sample_id") or "")
+
+
 def _vad_has_complete_frame_scores(
     prediction_path: Path,
     samples: list[dict[str, Any]],
 ) -> bool:
     structured = load_structured_prediction_map(prediction_path.with_suffix(".jsonl"))
-    if not structured or set(structured) != {str(sample.get("key") or "") for sample in samples}:
+    if not structured or set(structured) != {_sample_key(sample) for sample in samples}:
         return False
     for sample in samples:
-        key = str(sample.get("key") or "")
+        key = _sample_key(sample)
         try:
             duration = _sample_duration_seconds(sample)
         except ValueError:
@@ -265,6 +295,35 @@ def _write_eval_file(rows: list[str]) -> str:
     return handle.name
 
 
+def _write_classification_label_spec(task: str) -> str:
+    """Materialize the task label spec for the standalone classify node."""
+
+    handle = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+    handle.write(json.dumps(label_spec_payload(task), ensure_ascii=False, indent=2) + "\n")
+    handle.close()
+    return handle.name
+
+
+def _write_slu_prompt_file(samples: list[dict[str, Any]]) -> str:
+    """Project only prompt/choice fields into the SLU normalization input."""
+
+    handle = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
+    try:
+        for sample in samples:
+            key = _sample_key(sample)
+            if not key:
+                raise ValueError("SLU sample key is required for prompt projection")
+            prompt_fields = classification_prompt_payload(sample)
+            row = {"key": key, **prompt_fields}
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+        handle.close()
+    except Exception:
+        handle.close()
+        Path(handle.name).unlink(missing_ok=True)
+        raise
+    return handle.name
+
+
 def _describe_evaluation_context(task: str, language: str, metric: str) -> dict[str, Any]:
     """Describe the dataset-driven post-processing used by the evaluator."""
     context: dict[str, Any] = {
@@ -297,6 +356,8 @@ def _describe_evaluation_context(task: str, language: str, metric: str) -> dict[
             {
                 "postprocessing": "evaluation-pipeline process_prediction compatible" if task == "SLU" else f"SUREEvaluator.{task.lower()}_label_normalization",
                 "normalization": "prompt_option_restoration" if task == "SLU" else "label_normalization",
+                "structured_prediction_contract": "keyed scalar classification v1",
+                "reference_projection": "classification label spec" if task in {"SER", "GR"} else "SLU prompt_jsonl",
             }
         )
     elif task == "SA-ASR":
@@ -304,6 +365,15 @@ def _describe_evaluation_context(task: str, language: str, metric: str) -> dict[
             {
                 "postprocessing": "SUREEvaluator._eval_sa_asr",
                 "normalization": "evaluation-pipeline text_normalizer.normalize_text compatible",
+            }
+        )
+    elif task == "TSE":
+        context.update(
+            {
+                "postprocessing": "evaluation-pipeline TSE samples_jsonl role bridge",
+                "normalization": "prediction_audio/reference_audio role normalization",
+                "structured_prediction_contract": "keyed target-speaker audio v1",
+                "reference_projection": "mixture/enrollment/reference role projection",
             }
         )
 
@@ -321,6 +391,7 @@ def _legacy_default_metric(task: str, language: str) -> str:
     return (
         "accuracy" if task in {"SER", "GR", "SLU"}
         else "f1" if task == "VAD"
+        else "si_sdr" if task == "TSE"
         else "bleu" if task == "S2TT"
         else "der" if task == "SD"
         else "cpwer" if task == "SA-ASR"
@@ -365,6 +436,8 @@ def _metric_task_hint(metrics: list[str | None]) -> str:
             hinted.append("VC")
         elif metric_name.startswith("tts_"):
             hinted.append("TTS")
+        elif metric_name.startswith("tse_"):
+            hinted.append("TSE")
     hinted = [task for index, task in enumerate(hinted) if task not in hinted[:index]]
     return hinted[0] if len(hinted) == 1 else ""
 
@@ -372,7 +445,7 @@ def _metric_task_hint(metrics: list[str | None]) -> str:
 def _effective_audio_task(dataset_task: str, task_hint: str) -> str:
     task = _normalize_task(dataset_task)
     hint = _normalize_task(task_hint)
-    if task in {"TTS", "VC"} and hint in {"TTS", "VC"}:
+    if task in {"TTS", "VC", "TSE"} and hint in {"TTS", "VC", "TSE"}:
         return hint
     return task
 
@@ -400,7 +473,7 @@ def _write_optional_source_file(samples: list[dict[str, Any]]) -> str | None:
     rows: list[str] = []
     has_source = False
     for sample in samples:
-        key = sample.get("key", "")
+        key = _sample_key(sample)
         value = (
             sample.get("source")
             or sample.get("src")
@@ -465,6 +538,7 @@ def _sample_reference_audio(sample: dict[str, Any]) -> str:
 def _sample_source_audio(sample: dict[str, Any]) -> str:
     return str(
         sample.get("source_audio")
+        or sample.get("source_audio_path")
         or sample.get("src_audio")
         or sample.get("input_audio")
         or sample.get("path")
@@ -475,6 +549,7 @@ def _sample_source_audio(sample: dict[str, Any]) -> str:
 def _sample_noisy_audio(sample: dict[str, Any]) -> str:
     return str(
         sample.get("noisy_audio")
+        or sample.get("noisy_audio_path")
         or sample.get("input_audio")
         or sample.get("audio")
         or sample.get("path")
@@ -485,10 +560,40 @@ def _sample_noisy_audio(sample: dict[str, Any]) -> str:
 def _sample_clean_reference_audio(sample: dict[str, Any]) -> str:
     return str(
         sample.get("reference_audio")
+        or sample.get("reference_audio_path")
         or sample.get("clean_audio")
         or sample.get("clean_audio_path")
         or sample.get("target_audio")
         or sample.get("target_audio_path")
+        or ""
+    )
+
+
+def _sample_tse_mixture_audio(sample: dict[str, Any]) -> str:
+    """Return the TSE mixture role, never a clean/reference fallback."""
+
+    return str(
+        sample.get("mixture_audio_path")
+        or sample.get("mixture_audio")
+        or sample.get("mixed_audio_path")
+        or sample.get("mixed_audio")
+        or sample.get("audio_path")
+        or sample.get("audio")
+        or sample.get("path")
+        or ""
+    )
+
+
+def _sample_tse_enrollment_audio(sample: dict[str, Any]) -> str:
+    """Return the explicit TSE enrollment role."""
+
+    return str(
+        sample.get("enrollment_audio_path")
+        or sample.get("enrollment_audio")
+        or sample.get("enrollment_path")
+        or sample.get("enrollment")
+        or sample.get("speaker_audio")
+        or sample.get("enroll_audio")
         or ""
     )
 
@@ -664,7 +769,7 @@ def _write_external_annotation_role_files(
     hypothesis_lines: list[str] = []
     rows: list[dict[str, Any]] = []
     for sample in samples:
-        key = str(sample.get("key") or "").strip()
+        key = _sample_key(sample).strip()
         session_id = _annotation_token(key, label="session_id", key=key or "sample")
         duration = _sample_duration_seconds(sample)
         reference_segments = _validated_annotation_segments(
@@ -803,7 +908,7 @@ def _write_external_vad_role_files(
     prediction_rows: list[dict[str, Any]] = []
     manifest_rows: list[dict[str, Any]] = []
     for sample in samples:
-        key = str(sample.get("key") or "").strip()
+        key = _sample_key(sample).strip()
         if not key:
             raise ValueError("VAD reference sample is missing key")
         duration = _sample_duration_seconds(sample)
@@ -925,6 +1030,119 @@ def _se_external_prediction_audio(value: Any, structured_prediction_path: Path) 
     return str(path)
 
 
+def _tse_external_prediction_audio(value: Any, structured_prediction_path: Path) -> str:
+    """Resolve TSE prediction_audio below the generated prediction audio root."""
+
+    root = (structured_prediction_path.parent / "audio").expanduser().absolute()
+    if root.is_symlink() or root.resolve() != root:
+        raise ValueError("TSE prediction audio root must not traverse a symlink")
+    path = Path(str(value)).expanduser()
+    if ".." in path.parts or "://" in str(value):
+        raise ValueError("TSE prediction audio must not contain traversal components")
+    candidate_paths = (
+        [path.absolute()]
+        if path.is_absolute()
+        else [
+            (structured_prediction_path.parent / path).absolute(),
+            (root / path).absolute(),
+        ]
+    )
+    path = next((candidate for candidate in candidate_paths if candidate.is_file()), candidate_paths[0])
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"TSE prediction audio escapes the run-local audio root: {path}") from exc
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"TSE prediction audio must not traverse a symlink: {path}")
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError(f"TSE prediction audio file is missing or empty: {path}")
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"TSE prediction audio escapes the run-local audio root: {path}")
+    try:
+        with wave.open(str(resolved), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                raise ValueError(f"TSE prediction audio must be a readable non-empty PCM WAV: {path}")
+    except (EOFError, OSError, wave.Error) as exc:
+        raise ValueError(f"TSE prediction audio must be a readable non-empty PCM WAV: {path}") from exc
+    return str(resolved)
+
+
+def _tse_external_input_audio(
+    value: Any,
+    dataset_jsonl_path: Path,
+    *,
+    role: str,
+) -> str:
+    """Resolve a TSE input/reference role and reject symlink escapes."""
+
+    raw_value = str(value or "")
+    raw_path = Path(raw_value).expanduser()
+    if ".." in raw_path.parts or "://" in raw_value:
+        raise ValueError(f"TSE {role} path must not contain traversal components")
+    localized = _localize_sample_audio_path(value, dataset_jsonl_path)
+    if not localized:
+        return ""
+    path = Path(localized).expanduser()
+    if not path.is_absolute():
+        path = (dataset_jsonl_path.parent / path).absolute()
+    else:
+        path = path.absolute()
+    current = Path(path.anchor) if path.anchor else Path(".")
+    for part in path.parts[1:] if path.anchor else path.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"TSE {role} must not traverse a symlink: {path}")
+    resolved = path.resolve()
+    if not resolved.is_file() or resolved.stat().st_size <= 0:
+        raise ValueError(f"TSE {role} file does not exist or is empty: {path}")
+    return str(resolved)
+
+
+def _tse_forbidden_fields(value: Any, path: str = "prediction") -> list[str]:
+    """Find reference or host-path fields in any persisted model evidence."""
+
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            child = f"{path}.{key}"
+            if normalized != "prediction_audio" and (
+                normalized.endswith("_path")
+                or normalized
+                in {
+                    "answer",
+                    "expected",
+                    "ground_truth",
+                    "reference",
+                    "reference_audio",
+                    "reference_text",
+                    "target",
+                    "target_audio",
+                    "target_text",
+                    "input",
+                    "mixture_audio",
+                    "mixed_audio",
+                    "enrollment_audio",
+                }
+            ):
+                found.append(child)
+            found.extend(_tse_forbidden_fields(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(_tse_forbidden_fields(item, f"{path}[{index}]"))
+    return found
+
+
 def _write_external_audio_samples_jsonl(
     *,
     task: str,
@@ -934,18 +1152,74 @@ def _write_external_audio_samples_jsonl(
     structured_prediction_path: Path,
     output_path: Path,
     required_roles: set[str],
+    dataset_name: str | None = None,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     task_upper = task.upper()
     for sample in samples:
-        key = str(sample.get("key", ""))
+        key = _sample_key(sample)
+        sample_id = str(sample.get("sample_id") or key)
         structured = structured_predictions.get(key)
         if structured is None:
             raise ValueError(f"Missing structured prediction row for {task_upper} sample: {key}")
+        if task_upper == "TSE":
+            allowed_envelope_fields = {
+                "key",
+                "sample_id",
+                "dataset",
+                "task",
+                "language",
+                "prediction",
+                "normalized_prediction",
+                "raw_response",
+            }
+            unknown_envelope_fields = sorted(
+                str(field) for field in structured if field not in allowed_envelope_fields
+            )
+            if unknown_envelope_fields:
+                raise ValueError(
+                    "TSE structured prediction contains unapproved envelope field(s): "
+                    + ", ".join(unknown_envelope_fields)
+                )
+            structured_sample_id = structured.get("sample_id")
+            if structured_sample_id not in (None, sample_id, key):
+                raise ValueError(f"TSE structured prediction sample_id does not match sample key: {key}")
+            if _normalize_task(structured.get("task")) != "TSE":
+                raise ValueError(f"TSE structured prediction task mismatch: {key}")
+            if dataset_name is not None and structured.get("dataset") not in (None, "", dataset_name):
+                # Dataset identity is checked by the caller as well; reject a
+                # conflicting row here before any role conversion occurs.
+                raise ValueError(f"TSE structured prediction dataset mismatch: {key}")
+            prediction_candidate = structured.get("prediction")
+            if not isinstance(prediction_candidate, dict):
+                raise ValueError(f"TSE structured prediction requires a prediction object: {key}")
+            forbidden_fields = _tse_forbidden_fields(prediction_candidate)
+            if forbidden_fields:
+                raise ValueError(
+                    "TSE structured prediction contains forbidden field(s): "
+                    + ", ".join(sorted(str(field) for field in forbidden_fields))
+                )
+            unknown_fields = sorted(
+                str(field) for field in prediction_candidate if field not in {"prediction_audio", "sample_id"}
+            )
+            if unknown_fields:
+                raise ValueError(
+                    "TSE structured prediction contains unapproved field(s): "
+                    + ", ".join(unknown_fields)
+                )
+            for evidence_name in ("raw_response", "normalized_prediction"):
+                evidence_value = structured.get(evidence_name)
+                evidence_fields = _tse_forbidden_fields(evidence_value, evidence_name)
+                if evidence_fields:
+                    raise ValueError(
+                        f"TSE structured prediction {evidence_name} contains forbidden field(s): "
+                        + ", ".join(sorted(evidence_fields))
+                    )
         prediction = structured.get("prediction") if isinstance(structured.get("prediction"), dict) else {}
         audio_path = (
-            prediction.get("audio_path")
+            prediction.get("prediction_audio")
+            or prediction.get("audio_path")
             or prediction.get("enhanced_audio")
             or structured.get("normalized_prediction")
         )
@@ -954,6 +1228,8 @@ def _write_external_audio_samples_jsonl(
         generated_audio = (
             _se_external_prediction_audio(audio_path, structured_prediction_path)
             if task_upper == "SE"
+            else _tse_external_prediction_audio(audio_path, structured_prediction_path)
+            if task_upper == "TSE"
             else _resolve_existing_prediction_path(audio_path, structured_prediction_path.parent)
         )
         language = str(sample.get("language") or structured.get("language") or "en")
@@ -1015,6 +1291,69 @@ def _write_external_audio_samples_jsonl(
                     "source_key": key,
                 },
             }
+        elif task_upper == "TSE":
+            mixture_audio = _tse_external_input_audio(
+                _sample_tse_mixture_audio(sample), dataset_jsonl_path, role="mixture_audio"
+            )
+            enrollment_value = _sample_tse_enrollment_audio(sample)
+            enrollment_audio = (
+                _tse_external_input_audio(
+                    enrollment_value, dataset_jsonl_path, role="enrollment_audio"
+                )
+                if enrollment_value
+                else ""
+            )
+            reference_value = (
+                sample.get("reference_audio")
+                or sample.get("reference_audio_path")
+                or sample.get("target_audio")
+                or sample.get("target_audio_path")
+            )
+            reference_audio = (
+                _tse_external_input_audio(
+                    reference_value, dataset_jsonl_path, role="reference_audio"
+                )
+                if reference_value
+                else ""
+            )
+            if "reference_audio" in required_roles and not reference_audio:
+                raise ValueError(f"TSE sample {key} reference audio does not exist")
+            mixture_path = Path(mixture_audio) if mixture_audio else None
+            role_paths = [
+                path
+                for path in (
+                    mixture_path,
+                    Path(enrollment_audio) if enrollment_audio else None,
+                    Path(reference_audio) if reference_audio else None,
+                )
+                if path is not None
+            ]
+            if len({path.resolve() for path in role_paths}) != len(role_paths):
+                raise ValueError(f"TSE sample {key} mixture/enrollment/reference roles must differ")
+            if generated_audio and any(
+                Path(generated_audio).samefile(path)
+                for path in role_paths
+            ):
+                raise ValueError(f"TSE sample {key} prediction audio must not alias an input/reference")
+            row = {
+                "sample_id": sample_id,
+                "prediction_audio": generated_audio,
+                "language": language,
+                "metadata": {
+                    "dataset": structured.get("dataset"),
+                    "task": "TSE",
+                    "source_key": key,
+                },
+            }
+            if reference_audio:
+                row["reference_audio"] = reference_audio
+            if mixture_audio:
+                row["mixed_audio"] = mixture_audio
+            if enrollment_audio:
+                row["enrollment_audio"] = enrollment_audio
+            reference_text = _sample_reference_text(sample)
+            if reference_text:
+                row["reference_text"] = reference_text
         else:
             raise ExternalEvaluationUnsupported(f"task {task!r} does not use samples_jsonl audio bridge")
         missing_roles = [role for role in sorted(required_roles) if not row.get(role)]
@@ -1065,7 +1404,7 @@ def _write_external_kws_role_files(
     prediction_rows: list[dict[str, Any]] = []
 
     for sample in samples:
-        key = str(sample.get("key", ""))
+        key = _sample_key(sample)
         if not key:
             raise ValueError("KWS reference sample is missing key")
         parsed_labels: list[tuple[str, bool]] = []
@@ -1448,8 +1787,8 @@ def evaluate_prediction_file_external(
         dataset_name=canonical_name,
     )
 
-    dataset_task = str(all_samples[0].get("task", "ASR")).upper()
-    task = str(task_override or dataset_task).upper()
+    dataset_task = _normalize_task(all_samples[0].get("task", "ASR"))
+    task = _normalize_task(task_override or dataset_task)
     language = str(all_samples[0].get("language", "auto"))
     requested_metric = metric_override or _metric_from_sota(
         sota_manager, canonical_name, fallback_names=_source_fallback_names(jsonl_path)
@@ -1471,8 +1810,31 @@ def evaluate_prediction_file_external(
             "external route requires input roles that the text-pair bridge cannot materialize: "
             f"{sorted(_pipeline_required_roles(pipeline))}"
         )
-    ref_file = _write_eval_file([f"{sample.get('key', '')}\t{sample.get('target', '')}" for sample in samples])
-    hyp_file = _write_eval_file([f"{sample.get('key', '')}\t{predictions.get(sample.get('key', ''), '')}" for sample in samples])
+    reference_values: list[str] = []
+    label_spec_path: str | None = None
+    prompt_jsonl_path: str | None = None
+    if task in CLASSIFICATION_TASKS:
+        for sample in samples:
+            reference = classification_reference_value(sample, task)
+            if task in {"SER", "GR"}:
+                reference_values.append(normalize_classification_label(task, reference))
+            else:
+                reference_values.append(normalize_classification_answer(reference))
+        if task in {"SER", "GR"}:
+            label_spec_path = _write_classification_label_spec(task)
+        else:
+            prompt_jsonl_path = _write_slu_prompt_file(samples)
+    else:
+        reference_values = [str(sample.get("target", "")) for sample in samples]
+    ref_file = _write_eval_file(
+        [
+            f"{_sample_key(sample)}\t{reference}"
+            for sample, reference in zip(samples, reference_values, strict=True)
+        ]
+    )
+    hyp_file = _write_eval_file(
+        [f"{_sample_key(sample)}\t{predictions.get(_sample_key(sample), '')}" for sample in samples]
+    )
     src_file = _write_optional_source_file(samples) if task == "S2TT" else None
 
     run_dir = _external_run_dir(
@@ -1496,7 +1858,8 @@ def evaluate_prediction_file_external(
                 "ref_file": ref_file,
                 "hyp_file": hyp_file,
                 "src_file": src_file,
-                "prompt_jsonl": str(jsonl_path) if task == "SLU" else None,
+                "prompt_jsonl": prompt_jsonl_path if task == "SLU" else None,
+                "label_spec": label_spec_path if task in {"SER", "GR"} else None,
                 "samples_jsonl": None,
                 "device": device,
                 "cache_dir": cache_dir,
@@ -1509,6 +1872,10 @@ def evaluate_prediction_file_external(
         Path(hyp_file).unlink(missing_ok=True)
         if src_file:
             Path(src_file).unlink(missing_ok=True)
+        if label_spec_path:
+            Path(label_spec_path).unlink(missing_ok=True)
+        if prompt_jsonl_path:
+            Path(prompt_jsonl_path).unlink(missing_ok=True)
 
     summary = external_payload["summary"]
     pipeline = external_payload["pipeline"]
@@ -1553,6 +1920,21 @@ def evaluate_prediction_file_external(
                 "cli_override" if metric_override else "sota_baseline" if requested_metric else "sure-evaluation_task_manifest"
             ),
             "requested_pipeline_id": pipeline_id_override,
+            "classification_roles": (
+                {
+                    "ref": "temporary keyed label file",
+                    "hyp": "temporary keyed prediction file",
+                    "label_spec": label_spec_payload(task)["id"],
+                }
+                if task in {"SER", "GR"}
+                else {
+                    "ref": "temporary keyed answer file",
+                    "hyp": "temporary keyed prediction file",
+                    "prompt_jsonl": "temporary key/prompt/choices projection",
+                }
+                if task == "SLU"
+                else None
+            ),
         },
         "details": {
             "summary": summary,
@@ -1913,14 +2295,16 @@ def evaluate_audio_prediction_file_external(
     all_samples = _scoped_samples(dataset_samples, max_samples)
     if not all_samples:
         raise ValueError(f"Dataset has no samples: {canonical_name}")
-    dataset_task = str(all_samples[0].get("task", "")).upper()
-    task = str(task_override or dataset_task).upper()
+    dataset_task = _normalize_task(all_samples[0].get("task", ""))
+    task = _normalize_task(task_override or dataset_task)
     language = str(all_samples[0].get("language") or "en")
     requested_metric = metric_override or _metric_from_sota(
         sota_manager, canonical_name, fallback_names=_source_fallback_names(jsonl_path)
     )
     if task == "SE" and not requested_metric and not pipeline_id_override:
         requested_metric = "si-sdr"
+    if task == "TSE" and not requested_metric and not pipeline_id_override:
+        requested_metric = TSE_DEFAULT_METRIC
     pipeline = _describe_external_pipeline(
         engine_root=engine_root,
         task=task,
@@ -1958,6 +2342,11 @@ def evaluate_audio_prediction_file_external(
         row_required_roles.add("noisy_audio")
         if _se_pipeline_requires_reference(pipeline):
             row_required_roles.add("reference_audio")
+    elif task == "TSE":
+        # The standalone TSE loader requires prediction/reference for every
+        # route. Mixture/enrollment are optional evaluator context; the
+        # model-side generator still requires enrollment in its MCP call.
+        row_required_roles.update({"prediction_audio", "reference_audio"})
     samples_jsonl = _write_external_audio_samples_jsonl(
         task=task,
         dataset_jsonl_path=jsonl_path,
@@ -1966,6 +2355,7 @@ def evaluate_audio_prediction_file_external(
         structured_prediction_path=structured_prediction_path,
         output_path=run_dir / "samples.jsonl",
         required_roles=row_required_roles,
+        dataset_name=canonical_name,
     )
 
     external_payload = _run_external_pipeline(
@@ -1991,6 +2381,14 @@ def evaluate_audio_prediction_file_external(
     score = summary.get("score", report.get("score", 0.0))
     if task == "SE":
         rps, rps_status = _calculate_se_rps(
+            sota_manager,
+            canonical_name,
+            metric,
+            score,
+            fallback_names=_source_fallback_names(jsonl_path),
+        )
+    elif task == "TSE":
+        rps, rps_status = _calculate_tse_rps(
             sota_manager,
             canonical_name,
             metric,
@@ -2035,6 +2433,17 @@ def evaluate_audio_prediction_file_external(
             "node_config_paths": summary.get("node_config_paths", []),
             "external_output_dir": summary.get("output_dir"),
             "samples_jsonl": str(samples_jsonl),
+            "tse_roles": (
+                {
+                    "prediction_audio": "model-generated output",
+                    "reference_audio": "clean target reference",
+                    "mixed_audio": "optional mixture for SI-SDRi",
+                    "enrollment_audio": "model enrollment input",
+                    "reference_text": "optional semantic reference",
+                }
+                if task == "TSE"
+                else None
+            ),
             "requested_metric_source": (
                 "cli_pipeline_id" if pipeline_id_override else
                 "cli_override" if metric_override else "sota_baseline" if requested_metric else "sure-evaluation_task_manifest"
@@ -2231,12 +2640,33 @@ def evaluate_prediction_file(
         dataset_name=canonical_name,
     )
 
-    task = all_samples[0].get("task", "ASR")
+    task = _normalize_task(all_samples[0].get("task", "ASR"))
     language = all_samples[0].get("language", "auto")
     metric = metric_override or _legacy_metric(sota_manager, canonical_name, task, language)
 
-    ref_file = _write_eval_file([f"{sample.get('key', '')}\t{sample.get('target', '')}" for sample in samples])
-    hyp_file = _write_eval_file([f"{sample.get('key', '')}\t{predictions.get(sample.get('key', ''), '')}" for sample in samples])
+    classification_prompt_path: str | None = None
+    if task in CLASSIFICATION_TASKS:
+        reference_values: list[str] = []
+        for sample in samples:
+            reference = classification_reference_value(sample, task)
+            reference_values.append(
+                normalize_classification_label(task, reference)
+                if task in {"SER", "GR"}
+                else normalize_classification_answer(reference)
+            )
+        if task == "SLU":
+            classification_prompt_path = _write_slu_prompt_file(samples)
+    else:
+        reference_values = [str(sample.get("target", "")) for sample in samples]
+    ref_file = _write_eval_file(
+        [
+            f"{_sample_key(sample)}\t{reference}"
+            for sample, reference in zip(samples, reference_values, strict=True)
+        ]
+    )
+    hyp_file = _write_eval_file(
+        [f"{_sample_key(sample)}\t{predictions.get(_sample_key(sample), '')}" for sample in samples]
+    )
 
     try:
         evaluator = SUREEvaluator(language=language)
@@ -2244,11 +2674,13 @@ def evaluate_prediction_file(
         if task == "ASR":
             eval_kwargs["tochar"] = metric == "cer"
         elif task == "SLU":
-            eval_kwargs["prompt_jsonl"] = str(jsonl_path)
+            eval_kwargs["prompt_jsonl"] = classification_prompt_path or str(jsonl_path)
         result = evaluator.evaluate(task, ref_file, hyp_file, **eval_kwargs)
     finally:
         Path(ref_file).unlink(missing_ok=True)
         Path(hyp_file).unlink(missing_ok=True)
+        if classification_prompt_path:
+            Path(classification_prompt_path).unlink(missing_ok=True)
 
     if isinstance(result, dict):
         details = result
@@ -2362,6 +2794,17 @@ def _primary_result(metric: str, score: Any, report: dict[str, Any] | None = Non
     if metric_name in {*VAD_DETECTION_METRICS, "auc_roc"}:
         result[metric_name] = numeric_score
         result["score_key"] = metric_name
+    if metric_name in {"si_sdr", "sisdr", "si-sdr"}:
+        details = report.get("details") if isinstance(report, dict) else None
+        if isinstance(details, dict):
+            candidate = details.get("si_sdri")
+            if candidate is None:
+                candidate = details.get("si_sdr_i")
+            if isinstance(candidate, (int, float)) and math.isfinite(float(candidate)):
+                result["si_sdri"] = float(candidate)
+    if metric_name in {"si_sdri", "sisdr_i", "si_sdr_i"}:
+        result["si_sdri"] = numeric_score
+        result["score_key"] = "si_sdri"
     return result
 
 
@@ -2495,6 +2938,34 @@ def _calculate_se_rps(
     )
 
 
+def _calculate_tse_rps(
+    sota_manager: SOTAManager,
+    dataset: str,
+    metric: str,
+    score: Any,
+    *,
+    fallback_names: tuple[str, ...] | list[str] = (),
+) -> tuple[float | None, dict[str, Any] | None]:
+    """SI-SDR/SI-SDRi are dB scores and have no meaningful RPS baseline."""
+
+    normalized_metric = str(metric).lower().replace("-", "_")
+    if normalized_metric in {"si_sdr", "sisdr", "si_sdri", "sisdr_i"}:
+        return None, {
+            "status": "rps_undefined_for_db_metric",
+            "dataset": dataset,
+            "metric": normalized_metric,
+            "score": score,
+            "unit": "dB",
+        }
+    return _calculate_metric_rps(
+        sota_manager,
+        dataset,
+        metric,
+        score,
+        fallback_names=fallback_names,
+    )
+
+
 def _dataset_metric_row(result: dict[str, Any]) -> dict[str, Any]:
     report = _result_report(result)
     pipeline = _result_pipeline(result)
@@ -2568,7 +3039,7 @@ def _is_lower_better_metric(metric: str) -> bool:
 
 def _metric_unit(metric: str) -> str:
     metric_name = str(metric or "").lower()
-    if metric_name in {"si_sdr", "si-sdr", "sisdr"}:
+    if metric_name in {"si_sdr", "si-sdr", "sisdr", "si_sdri", "sisdr_i", "si_sdr_i"}:
         return "dB"
     if _is_lower_better_metric(metric_name):
         return "fraction"
@@ -3354,7 +3825,7 @@ def _write_sample_report(
         metric_details_by_key.update(_meeteval_per_session(report))
     with output_path.open("w", encoding="utf-8") as handle:
         for sample in samples:
-            key = str(sample.get("key", ""))
+            key = _sample_key(sample)
             prediction = predictions.get(key, "")
             row: dict[str, Any] = {
                 "key": key,
@@ -3413,6 +3884,40 @@ def _write_sample_report(
                     "noisy_audio": _sample_noisy_audio(sample),
                     "reference_audio": _sample_clean_reference_audio(sample),
                 }
+                if key in metric_details_by_key:
+                    row["metric_details"] = metric_details_by_key[key]
+            elif task == "TSE":
+                structured = (structured_predictions or {}).get(key, {})
+                structured_prediction = structured.get("prediction")
+                row["prediction"] = (
+                    dict(structured_prediction) if isinstance(structured_prediction, dict) else {}
+                )
+                row["reference"] = {
+                    "prediction_audio": "model-generated output",
+                    "reference_audio": _sample_clean_reference_audio(sample),
+                    "mixed_audio": _sample_tse_mixture_audio(sample),
+                    "enrollment_audio": _sample_tse_enrollment_audio(sample),
+                    "reference_text": _sample_reference_text(sample),
+                }
+                row["sample_id"] = str(sample.get("sample_id") or key)
+                if key in metric_details_by_key:
+                    row["metric_details"] = metric_details_by_key[key]
+            elif task in CLASSIFICATION_TASKS:
+                structured = (structured_predictions or {}).get(key, {})
+                structured_prediction = structured.get("prediction")
+                row["prediction"] = (
+                    dict(structured_prediction)
+                    if isinstance(structured_prediction, dict)
+                    else {}
+                )
+                reference = classification_reference_value(sample, task)
+                row["reference"] = (
+                    normalize_classification_label(task, reference)
+                    if task in {"SER", "GR"}
+                    else normalize_classification_answer(reference)
+                )
+                if task == "SLU":
+                    row["prompt"] = classification_prompt_payload(sample)
                 if key in metric_details_by_key:
                     row["metric_details"] = metric_details_by_key[key]
             elif task in ANNOTATION_TASKS:
@@ -3626,7 +4131,7 @@ def _record_evaluation_result(
         "details": result["details"],
     }
     task = str(result.get("task") or "").upper()
-    if task not in {"KWS", "SE", "SD", "SA-ASR", "SA_ASR", "VAD"}:
+    if task not in {"KWS", "SE", "TSE", "SD", "SA-ASR", "SA_ASR", "VAD"}:
         return rps_manager.evaluate_and_record(
             tool_name=tool_name,
             dataset=result["dataset"],
@@ -3726,6 +4231,10 @@ def _write_run_artifacts(
                 if str(result.get("task") or "").upper() in {
                     "KWS",
                     "SE",
+                    "TSE",
+                    "SER",
+                    "GR",
+                    "SLU",
                     "SD",
                     "SA-ASR",
                     "SA_ASR",

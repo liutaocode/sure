@@ -10,6 +10,7 @@ validation results, weights, or verdicts.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from structured_segments import is_structured_task, validate_structured_rows
+from tse_contract import validate_output_object as validate_tse_output_object
 
 CORE_FILES = ["model.spec.yaml", "model.py", "server.py", "__init__.py", "validate.py", "config.yaml"]
 REQUIRED_RUN_ARTIFACTS = [
@@ -90,9 +92,20 @@ def copy_artifact(source: Path, dest: Path) -> None:
 
 
 def canonical_task(value: Any) -> str:
-    normalized = str(value or "").strip().lower().replace("-", "_")
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if normalized in {"speech_enhancement", "acoustic_noise_suppression"}:
         return "se"
+    if normalized in {
+        "tse",
+        "target_speaker_extraction",
+        "target_speaker_extractor",
+        "target_speaker_extraction_model",
+        "target_speaker",
+        "speaker_extraction",
+        "target_voice_extraction",
+        "target_voice_separation",
+    }:
+        return "tse"
     return normalized
 
 
@@ -134,7 +147,7 @@ def validated_output_files(root: Path, *, require_pcm_wav: bool) -> list[Path]:
 def stage_output_tree(run_artifacts: Path, model_artifacts: Path, *, task: str) -> list[str]:
     source = run_artifacts / "outputs"
     destination = model_artifacts / "outputs"
-    require_pcm_wav = task == "se"
+    require_pcm_wav = task in {"se", "tse"}
     if source.exists() or source.is_symlink():
         validated_output_files(source, require_pcm_wav=require_pcm_wav)
         if not same_file(source, destination):
@@ -151,7 +164,10 @@ def stage_output_tree(run_artifacts: Path, model_artifacts: Path, *, task: str) 
 
 
 def validate_se_sample_evidence(model_artifacts: Path) -> None:
-    output_root = (model_artifacts / "outputs").resolve()
+    output_root_path = model_artifacts / "outputs"
+    if output_root_path.is_symlink() or not output_root_path.is_dir():
+        raise ValueError("SE bundled outputs must be a real directory")
+    output_root = output_root_path.resolve()
     evidence_paths = [model_artifacts / "sample_output.json", model_artifacts / "sample_outputs.jsonl"]
     for evidence_path in evidence_paths:
         if not evidence_path.is_file():
@@ -209,6 +225,106 @@ def validate_structured_sample_evidence(model_artifacts: Path, *, task: str) -> 
         violations.append("sample_output.json must equal the first structured output row")
     if violations:
         raise ValueError("invalid SD/SA-ASR sample evidence: " + "; ".join(violations))
+
+
+def validate_tse_sample_evidence(model_artifacts: Path) -> None:
+    output_root_path = model_artifacts / "outputs"
+    sample_output_path = model_artifacts / "sample_output.json"
+    sample_outputs_path = model_artifacts / "sample_outputs.jsonl"
+    fixture_manifest_path = model_artifacts / "fixture_manifest.json"
+    for path in (sample_output_path, sample_outputs_path, fixture_manifest_path):
+        if not path.is_file():
+            raise ValueError(f"TSE staging requires {path.name}")
+    manifest = read_json(fixture_manifest_path)
+    if canonical_task(manifest.get("task_type")) != "tse":
+        raise ValueError("fixture manifest task_type disagrees with TSE staging task")
+    fixture_samples = manifest.get("samples") if isinstance(manifest.get("samples"), list) else []
+    expected = [
+        str(item.get("key") or item.get("sample_id") or "")
+        for item in fixture_samples
+        if isinstance(item, dict)
+    ]
+    if not 1 <= len(expected) <= 5 or len(expected) != len(fixture_samples):
+        raise ValueError("TSE fixture manifest must contain 1 to 5 object samples")
+    rows = [
+        json.loads(line)
+        for line in sample_outputs_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    sample_output = read_json(sample_output_path)
+    if sample_output.get("rows") != rows:
+        raise ValueError("TSE sample_output.json must exactly mirror sample_outputs.jsonl")
+    observed: list[str] = []
+    referenced_outputs: set[Path] = set()
+    output_root = output_root_path.resolve()
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"{sample_outputs_path}:{index} must be an object")
+        unknown_row_fields = sorted(str(field) for field in row if field not in {"key", "sample_id", "result"})
+        if unknown_row_fields:
+            raise ValueError(
+                f"TSE sample row {index} contains unapproved field(s): "
+                + ", ".join(unknown_row_fields)
+            )
+        key = str(row.get("key") or row.get("sample_id") or "").strip()
+        if (
+            not key
+            or key in observed
+            or "/" in key
+            or "\\" in key
+            or any(ord(character) < 32 or character.isspace() for character in key)
+        ):
+            raise ValueError(f"TSE sample row {index} has an unsafe or duplicate key")
+        observed.append(key)
+        result = row.get("result")
+        canonical = validate_tse_output_object(result, sample_id=key)
+        if result != canonical:
+            raise ValueError(f"TSE sample output {key} is not canonical")
+        relative = Path(str(canonical["prediction_audio"]))
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[:2] != ("artifacts", "outputs"):
+            raise ValueError(f"TSE sample output {key} prediction_audio must be portable")
+        expected_name = f"{index:02d}-{hashlib.sha256(key.encode('utf-8')).hexdigest()[:12]}.wav"
+        if relative != Path("artifacts", "outputs", expected_name):
+            raise ValueError(f"TSE sample output {key} prediction_audio must use the harness-assigned path")
+        candidate = model_artifacts.parent / relative
+        generated = candidate.resolve()
+        if candidate.is_symlink() or not generated.is_file() or not generated.is_relative_to(output_root):
+            raise ValueError(f"TSE sample output {key} prediction_audio is missing from model outputs")
+        current = output_root
+        for part in generated.relative_to(output_root).parts:
+            current /= part
+            if current.is_symlink():
+                raise ValueError(f"TSE sample output {key} prediction_audio traverses a symlink")
+        try:
+            with wave.open(str(generated), "rb") as handle:
+                if (
+                    handle.getcomptype() != "NONE"
+                    or handle.getnchannels() < 1
+                    or handle.getsampwidth() not in {1, 2, 3, 4}
+                    or handle.getframerate() < 1
+                    or handle.getnframes() < 1
+                ):
+                    raise ValueError(f"TSE sample output {key} must be a non-empty PCM WAV")
+        except (EOFError, OSError, wave.Error) as error:
+            raise ValueError(f"TSE sample output {key} is not a readable PCM WAV: {error}") from error
+        referenced_outputs.add(generated)
+    if observed != expected:
+        raise ValueError(f"TSE sample output keys mismatch: expected={expected}, observed={observed}")
+    output_entries = list(output_root_path.rglob("*"))
+    output_symlinks = [path for path in output_entries if path.is_symlink()]
+    if output_symlinks:
+        raise ValueError(f"TSE output tree must not contain symlinks: {output_symlinks[0]}")
+    actual_outputs = {
+        path.resolve()
+        for path in output_entries
+        if path.is_file()
+    }
+    if actual_outputs != referenced_outputs:
+        extras = sorted(path.name for path in actual_outputs - referenced_outputs)
+        missing = sorted(path.name for path in referenced_outputs - actual_outputs)
+        raise ValueError(
+            f"TSE output tree must exactly match referenced predictions: extras={extras}, missing={missing}"
+        )
 
 
 def artifact_entry(path: str, description: str) -> dict[str, Any]:
@@ -313,7 +429,7 @@ def main_with_args(argv: list[str] | None = None) -> int:
 
     task = canonical_task(resolved.get("task_type"))
     required_run_artifacts = list(REQUIRED_RUN_ARTIFACTS)
-    if is_structured_task(task):
+    if is_structured_task(task) or task == "tse":
         required_run_artifacts.extend(("sample_output.json", "sample_outputs.jsonl"))
     if resolved.get("deployment_type") == "local" and resolved.get("package_profile") == "none":
         required_run_artifacts.append(MODEL_RUNTIME_ARTIFACT)
@@ -353,6 +469,10 @@ def main_with_args(argv: list[str] | None = None) -> int:
             if not copied_outputs:
                 raise ValueError("SE staging requires at least one generated output")
             validate_se_sample_evidence(model_artifacts)
+        elif task == "tse":
+            if not copied_outputs:
+                raise ValueError("TSE staging requires at least one generated output")
+            validate_tse_sample_evidence(model_artifacts)
         elif is_structured_task(task) and (
             not args.allow_missing_run_artifacts
             or all(

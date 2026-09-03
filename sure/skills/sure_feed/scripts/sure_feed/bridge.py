@@ -184,6 +184,27 @@ def _canonical_task_type(task_type: str) -> str:
         return "sa_asr"
     if normalized in {"sd", "speaker_diarization", "speaker_diarisation", "diarization", "diarisation"}:
         return "sd"
+    if normalized in {
+        "speech_emotion_recognition",
+        "speaker_emotion_recognition",
+        "emotion_recognition",
+    }:
+        return "ser"
+    if normalized in {"gender_recognition", "speaker_gender"}:
+        return "gr"
+    if normalized == "spoken_language_understanding":
+        return "slu"
+    if normalized in {
+        "tse",
+        "target_speaker_extraction",
+        "target_speaker_extractor",
+        "target_speaker_extraction_model",
+        "target_speaker",
+        "speaker_extraction",
+        "target_voice_extraction",
+        "target_voice_separation",
+    }:
+        return "tse"
     return value
 
 
@@ -199,6 +220,7 @@ def _sure_task_name(task_type: str) -> str:
         "tts": "TTS",
         "se": "SE",
         "vad": "VAD",
+        "tse": "TSE",
     }
     return mapping.get(task_type.lower(), task_type.upper())
 
@@ -216,6 +238,7 @@ def _default_tool_name(task_type: str) -> str:
         "kws": "kws_predict",
         "se": "enhance_speech",
         "vad": "detect_speech",
+        "tse": "extract_target_speaker",
     }
     return mapping.get(task_type.lower(), f"{task_type.lower()}_predict")
 
@@ -251,6 +274,10 @@ def _io_contract_for_task(task_type: str) -> dict[str, Any]:
             "required_fields": ["audio_path"],
             "nonempty_fields": ["audio_path"],
         }
+    if task in {"ser", "gr", "slu"}:
+        return {"input_field": "audio_path", **io_contract_for_task(task)}
+    if task == "tse":
+        return {"input_field": "mixture_audio_path", **io_contract_for_task(task)}
     return {
         "input_field": "audio_path",
         "input_type": "audio_path",
@@ -304,6 +331,32 @@ def _tool_input_schema_for_task(task_type: str) -> dict[str, Any]:
                 "output_path": {"type": "string"},
             },
             "required": ["audio_path"],
+        }
+    if task in {"ser", "gr", "slu"}:
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "audio_path": {"type": "string", "minLength": 1},
+                "language": {"type": "string"},
+            },
+            "required": ["audio_path"],
+            "additionalProperties": False,
+        }
+        if task == "slu":
+            schema["properties"]["prompt"] = {"type": "string", "minLength": 1}
+            schema["properties"]["choices"] = {"type": ["object", "array"]}
+            schema["required"].append("prompt")
+        return schema
+    if task == "tse":
+        return {
+            "type": "object",
+            "properties": {
+                "mixture_audio_path": {"type": "string", "minLength": 1},
+                "enrollment_audio_path": {"type": "string", "minLength": 1},
+                "output_path": {"type": "string", "minLength": 1},
+            },
+            "required": ["mixture_audio_path", "enrollment_audio_path", "output_path"],
+            "additionalProperties": False,
         }
     input_field = "text" if task == "tts" else "audio_path"
     return {
@@ -431,7 +484,7 @@ def _default_config_yaml(
     io_contract = _io_contract_for_task(task_type)
     input_field = io_contract["input_field"]
     input_description = "Text to synthesize" if input_field == "text" else "Path to an audio file"
-    if task_type in {"kws", "se", "vad", "sd", "sa_asr"}:
+    if task_type in {"kws", "se", "vad", "sd", "sa_asr", "ser", "gr", "slu", "tse"}:
         input_schema_block = (
             "    input_schema: "
             + json.dumps(_tool_input_schema_for_task(task_type), ensure_ascii=False, separators=(",", ":"))
@@ -553,7 +606,9 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         result_fields = '''    text: str = ""
     audio_path: str = ""
     language: str = "auto"
-    raw: dict[str, Any] | None = None'''
+'''
+        to_dict_body = '''        result = asdict(self)
+        return result'''
     elif task_type == "kws":
         predict_body = '''        if not isinstance(input_data, dict):
             raise ValueError("KWS input must contain audio_path")
@@ -580,7 +635,9 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         result_fields = '''    detected: bool = False
     keyword: str | None = None
     score: float | None = None
-    raw: dict[str, Any] | None = None'''
+'''
+        to_dict_body = '''        result = asdict(self)
+        return result'''
     elif task_type == "se":
         predict_body = '''        if not isinstance(input_data, dict):
             raise ValueError("SE input must contain audio_path")
@@ -596,7 +653,9 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
             self.load()
         raise NotImplementedError("SURE tool-agent must implement speech enhancement inference.")'''
         result_fields = '''    audio_path: str = ""
-    raw: dict[str, Any] | None = None'''
+'''
+        to_dict_body = '''        result = asdict(self)
+        return result'''
     elif task_type == "vad":
         predict_body = '''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
         if not isinstance(audio_path, str) or not audio_path.strip():
@@ -612,6 +671,62 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         if result["frame_scores"] is None:
             del result["frame_scores"]
         return result'''
+    elif task_type in {"ser", "gr"}:
+        predict_body = '''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            raise ValueError("audio_path is required")
+        if not Path(audio_path).is_file():
+            raise FileNotFoundError(audio_path)
+        if not self.model_loaded:
+            self.load()
+        raise NotImplementedError("SURE tool-agent must implement classification inference.")'''
+        result_fields = '''    label: str = ""
+    score: float | None = None
+'''
+        to_dict_body = '''        result = asdict(self)
+        if result["score"] is None:
+            del result["score"]
+        return result'''
+    elif task_type == "slu":
+        predict_body = '''        if not isinstance(input_data, dict):
+            raise ValueError("SLU input must contain audio_path and prompt")
+        audio_path = input_data.get("audio_path")
+        prompt = input_data.get("prompt")
+        if not isinstance(audio_path, str) or not audio_path.strip():
+            raise ValueError("audio_path is required")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt is required")
+        if not Path(audio_path).is_file():
+            raise FileNotFoundError(audio_path)
+        if not self.model_loaded:
+            self.load()
+        raise NotImplementedError("SURE tool-agent must implement SLU inference.")'''
+        result_fields = '''    answer: str = ""
+    label: str | None = None
+'''
+        to_dict_body = '''        result = asdict(self)
+        if result["label"] is None:
+            del result["label"]
+        return result'''
+    elif task_type == "tse":
+        predict_body = '''        if not isinstance(input_data, dict):
+            raise ValueError("TSE input must contain mixture_audio_path, enrollment_audio_path, and output_path")
+        for field_name in ("mixture_audio_path", "enrollment_audio_path", "output_path"):
+            field_value = input_data.get(field_name)
+            if not isinstance(field_value, str) or not field_value.strip():
+                raise ValueError(f"{field_name} is required")
+            if field_name != "output_path" and not Path(field_value).is_file():
+                raise FileNotFoundError(field_value)
+        if not self.model_loaded:
+            self.load()
+        raise NotImplementedError("SURE tool-agent must implement TSE inference.")'''
+        result_fields = '''    prediction_audio: str = ""
+    sample_id: str | None = None
+'''
+        to_dict_body = '''        result = asdict(self)
+        if result["sample_id"] is None:
+            del result["sample_id"]
+        return result'''
     elif task_type in {"sd", "sa_asr"}:
         task_label = "SD" if task_type == "sd" else "SA-ASR"
         method = "diarization" if task_type == "sd" else "speaker-attributed transcription"
@@ -624,7 +739,9 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
             self.load()
         raise NotImplementedError("SURE tool-agent must implement {task_label} {method} inference.")'''
         result_fields = '''    segments: list[dict[str, Any]] = field(default_factory=list)
-    raw: dict[str, Any] | None = None'''
+'''
+        to_dict_body = '''        result = asdict(self)
+        return result'''
     else:
         predict_body = '''        audio_path = input_data.get("audio_path") if isinstance(input_data, dict) else input_data
         if not audio_path:
@@ -637,7 +754,9 @@ def _default_model_py(manifest: dict[str, Any]) -> str:
         result_fields = '''    text: str = ""
     audio_path: str = ""
     language: str = "auto"
-    raw: dict[str, Any] | None = None'''
+'''
+        to_dict_body = '''        result = asdict(self)
+        return result'''
     return f'''"""SURE model wrapper scaffold for {source["id"]}.
 
 This file is generated by sure_feed so the SURE model tool-agent can
@@ -693,7 +812,7 @@ def _default_server_py(task_type: str) -> str:
     input_schema = repr(_tool_input_schema_for_task(task_type))
     content_value = (
         "json.dumps(result, ensure_ascii=False)"
-        if task_type.lower() in {"kws", "se", "vad", "sd", "sa_asr"}
+        if task_type.lower() in {"kws", "se", "vad", "sd", "sa_asr", "ser", "gr", "slu", "tse"}
         else f'str(result.get("{content_field}", ""))'
     )
     result_validation = ""
@@ -759,7 +878,7 @@ class MCPServer:
                 return {{
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "result": {{"content": [{{"type": "text", "text": {content_value}}}], "raw": result}},
+                    "result": {{"content": [{{"type": "text", "text": {content_value}}}]}},
                 }}
             except Exception as exc:
                 return {{

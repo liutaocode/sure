@@ -117,7 +117,7 @@ def _node_ids(row: dict[str, Any]) -> list[str]:
 
 
 def _allows_generated_audio_score_drift(row: dict[str, Any]) -> bool:
-    return _task(row) in {"TTS", "VC"}
+    return _task(row) in {"TTS", "VC", "TSE"}
 
 
 def _validate_tree(root: Path, label: str) -> tuple[dict[str, Any], list[str]]:

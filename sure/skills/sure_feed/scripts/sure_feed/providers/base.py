@@ -76,6 +76,9 @@ def canonical_task(task: str) -> str:
         "speech activity detection": "vad",
         "emotion-recognition": "ser",
         "speech-emotion-recognition": "ser",
+        "speaker-emotion-recognition": "ser",
+        "spoken-language-understanding": "slu",
+        "spoken language understanding": "slu",
         "speaker-diarization": "sd",
         "speaker diarization": "sd",
         "speaker diarisation": "sd",
@@ -83,6 +86,21 @@ def canonical_task(task: str) -> str:
         "diarization": "sd",
         "diarisation": "sd",
         "gender-recognition": "gr",
+        "speaker-gender": "gr",
+        "target-speaker-extraction": "tse",
+        "target speaker extraction": "tse",
+        "target-speaker-extractor": "tse",
+        "target speaker extractor": "tse",
+        "target-speaker-extraction-model": "tse",
+        "target speaker extraction model": "tse",
+        "target-speaker": "tse",
+        "target speaker": "tse",
+        "speaker-extraction": "tse",
+        "speaker extraction": "tse",
+        "target-voice-extraction": "tse",
+        "target voice extraction": "tse",
+        "target-voice-separation": "tse",
+        "target voice separation": "tse",
     }
     return aliases.get(value, value.replace("-", "_") if value == "sa-asr" else value)
 
@@ -106,6 +124,22 @@ TASK_KEYWORDS: dict[str, tuple[str, ...]] = {
     "ser": ("ser", "speech emotion", "speaker emotion", "emotion-recognition"),
     "slu": ("slu", "spoken language understanding", "speech understanding"),
     "gr": ("gender recognition", "speaker gender", "gender-recognition"),
+    "tse": (
+        "tse",
+        "target speaker extraction",
+        "target-speaker-extraction",
+        "target speaker extractor",
+        "target speaker extraction model",
+        "target-speaker-extraction-model",
+        "target speaker",
+        "target-speaker",
+        "speaker extraction",
+        "speaker-extraction",
+        "target voice extraction",
+        "target-voice-extraction",
+        "target voice separation",
+        "target-voice-separation",
+    ),
     "sd": ("speaker diarization", "diarization", "speaker-diarization"),
     "sa_asr": (
         "sa-asr",
@@ -969,7 +1003,7 @@ def _derive_fixture_and_contract(
             fixture["provider_fixture_hint"] = provider_fixture_hint
 
     normalized_task = canonical_task(task_type)
-    if normalized_task in {"vad", "sd", "sa_asr"}:
+    if normalized_task in {"vad", "sd", "sa_asr", "ser", "gr", "slu", "tse"}:
         io_contract = registry_contract
     elif outputs_audio or normalized_task in {"tts", "vc", "se"}:
         input_type = "text_with_reference_audio" if fixture.get("text") and fixture.get("reference_audio") else "text"

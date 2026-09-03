@@ -12,10 +12,36 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
+
+
+CLASSIFICATION_TASKS = {"ser", "gr", "slu"}
+SER_LABEL_ALIASES = {
+    "neu": "neu", "neutral": "neu", "calm": "neu",
+    "hap": "hap", "happy": "hap", "happiness": "hap", "joy": "hap",
+    "ang": "ang", "angry": "ang", "anger": "ang",
+    "sad": "sad", "sadness": "sad",
+}
+GR_LABEL_ALIASES = {
+    "man": "man", "male": "man", "m": "man",
+    "woman": "woman", "female": "woman", "f": "woman",
+}
+SER_NUMERIC_ALIASES = {"0": "neu", "1": "hap", "2": "ang", "3": "sad"}
+GR_NUMERIC_ALIASES = {"0": "man", "1": "woman"}
+CLASSIFICATION_CHOICE_REFERENCE_FIELDS = {
+    "answer",
+    "expected",
+    "ground_truth",
+    "reference",
+    "reference_audio",
+    "reference_text",
+    "target",
+    "target_text",
+}
 
 from structured_segments import (
     canonical_task,
@@ -24,6 +50,7 @@ from structured_segments import (
     reference_segments_field,
     validate_segments,
 )
+from tse_contract import safe_relative_audio, safe_sample_id
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -70,7 +97,7 @@ def default_fixture_dir(repo_root: Path, task: str) -> Path | None:
         return None
     if (task_dir / "gt.jsonl").exists():
         return task_dir
-    options = sorted(path.parent for path in task_dir.glob("*/gt.jsonl"))
+    options = sorted(path.parent for path in task_dir.rglob("gt.jsonl"))
     return options[0] if options else None
 
 
@@ -254,6 +281,245 @@ def load_samples(source_dir: Path, task: str) -> list[dict[str, Any]]:
     return samples
 
 
+def normalize_classification_label(task: str, value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"{task.upper()} fixture label is unknown: {value!r}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{task.upper()} fixture label is unknown: {value!r}")
+    text = ("" if value is None else str(value)).strip().lower()
+    text = re.sub(r"^[\s\[({<]+|[\s\])}>.,!?;:：，。！？；]+$", "", text)
+    aliases = (
+        {**SER_LABEL_ALIASES, **SER_NUMERIC_ALIASES}
+        if task == "ser"
+        else {**GR_LABEL_ALIASES, **GR_NUMERIC_ALIASES}
+    )
+    if text not in aliases:
+        raise ValueError(f"{task.upper()} fixture label is unknown: {value!r}")
+    return aliases[text]
+
+
+def normalize_classification_answer(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError("SLU fixture answer must be a string or finite scalar")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("SLU fixture answer must be a string or finite scalar")
+    text = ("" if value is None else str(value)).strip().rstrip(".!?。！？")
+    if not text or any(ord(character) < 32 for character in text):
+        raise ValueError("SLU fixture answer must be non-empty and must not contain control characters")
+    match = re.fullmatch(r"(?is)(?:the\s+)?answer\s*(?:is|:|-)?\s*([A-Za-z0-9_+-]+)", text)
+    if match:
+        return match.group(1)
+    match = re.fullmatch(r"答案\s*(?:是|为|:|：)?\s*([A-Za-z0-9_+-]+)", text)
+    return match.group(1) if match else text
+
+
+def validate_classification_choices(value: Any, path: str = "choices") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            if normalized in CLASSIFICATION_CHOICE_REFERENCE_FIELDS or normalized.endswith("_path"):
+                raise ValueError(f"SLU choices contain reference/path field at {path}.{key}")
+            validate_classification_choices(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            validate_classification_choices(item, f"{path}[{index}]")
+
+
+def prepare_classification_tree(source_dir: Path, staged_dir: Path, task: str) -> list[dict[str, Any]]:
+    """Copy only referenced audio and a sanitized keyed classification gt file."""
+
+    source_dir = source_dir.resolve()
+    source_gt = source_dir / "gt.jsonl"
+    if source_gt.is_symlink() or not source_gt.is_file():
+        raise ValueError(f"{task.upper()} fixture must contain a regular gt.jsonl")
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(source_gt.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{task.upper()} fixture line {line_number} must be an object")
+        key = str(row.get("key") or row.get("id") or "").strip()
+        if (
+            not key
+            or key in seen
+            or "/" in key
+            or "\\" in key
+            or any(ord(character) < 32 or character.isspace() for character in key)
+        ):
+            raise ValueError(f"{task.upper()} fixture key is missing or duplicated: {key!r}")
+        seen.add(key)
+        audio = row.get("audio") or row.get("wav")
+        if not isinstance(audio, str) or not audio.strip():
+            raise ValueError(f"{task.upper()} fixture {key} requires audio")
+        relative_audio = Path(audio)
+        if relative_audio.is_absolute() or ".." in relative_audio.parts or "\\" in audio:
+            raise ValueError(f"{task.upper()} fixture {key} audio path must be relative and contained")
+        current = source_dir
+        for part in relative_audio.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"{task.upper()} fixture {key} audio must not traverse a symlink")
+        audio_source = (source_dir / relative_audio).resolve()
+        if not audio_source.is_file() or not audio_source.is_relative_to(source_dir):
+            raise ValueError(f"{task.upper()} fixture {key} audio is missing or unsafe")
+        reference = row.get("ground_truth", row.get("target", row.get("answer", row.get("label"))))
+        if task in {"ser", "gr"}:
+            reference = normalize_classification_label(task, reference)
+        else:
+            reference = normalize_classification_answer(reference)
+        sanitized: dict[str, Any] = {
+            "key": key,
+            "task_type": task,
+            "audio": relative_audio.as_posix(),
+            "ground_truth": reference,
+        }
+        if isinstance(row.get("language"), str) and row["language"].strip():
+            sanitized["language"] = row["language"]
+        if isinstance(row.get("dataset"), str) and row["dataset"].strip():
+            sanitized["dataset"] = row["dataset"]
+        if task == "slu":
+            prompt = row.get("prompt") or row.get("instruction")
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError(f"SLU fixture {key} requires a non-empty prompt")
+            sanitized["prompt"] = prompt
+            choices = row.get("choices", row.get("options"))
+            if choices is not None:
+                if not isinstance(choices, (dict, list)) or not choices:
+                    raise ValueError(f"SLU fixture {key} choices must be non-empty")
+                validate_classification_choices(choices)
+                sanitized["choices"] = choices
+        rows.append(sanitized)
+        destination = staged_dir / relative_audio
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(audio_source, destination)
+    if not 1 <= len(rows) <= 5:
+        raise ValueError(f"{task.upper()} fixture must contain 1 to 5 samples")
+    staged_gt = staged_dir / "gt.jsonl"
+    staged_gt.write_text(
+        "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return rows
+
+
+def load_tse_samples(source_dir: Path) -> list[dict[str, Any]]:
+    """Validate TSE mixture/enrollment/reference roles without exposing references to inference."""
+
+    validate_structured_source_tree(source_dir)
+    gt_path = source_dir / "gt.jsonl"
+    rows = [
+        json.loads(line)
+        for line in gt_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("TSE fixture must contain 1 to 5 samples")
+    samples: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            raise ValueError(f"TSE fixture row {index} must be an object")
+        key = safe_sample_id(row.get("sample_id") or row.get("key"))
+        if key in seen:
+            raise ValueError(f"TSE fixture contains duplicate sample_id: {key}")
+        seen.add(key)
+        role_values = {
+            "mixture_audio": row.get("mixture_audio") or row.get("mixed_audio") or row.get("audio"),
+            "enrollment_audio": row.get("enrollment_audio") or row.get("enrollment"),
+            "reference_audio": row.get("reference_audio") or row.get("target_audio"),
+        }
+        role_paths: dict[str, tuple[Path, Path]] = {}
+        for role, value in role_values.items():
+            relative = safe_relative_audio(value, role=role)
+            current = source_dir
+            for part in relative.parts:
+                current /= part
+                if current.is_symlink():
+                    raise ValueError(f"TSE fixture {key} {role} must not traverse a symlink")
+            resolved = (source_dir / relative).resolve()
+            if (
+                not resolved.is_file()
+                or resolved.stat().st_size <= 0
+                or not resolved.is_relative_to(source_dir.resolve())
+            ):
+                raise ValueError(f"TSE fixture {key} {role} is missing or unsafe")
+            role_paths[role] = (relative, resolved)
+        resolved_roles = [item[1] for item in role_paths.values()]
+        if len({path for path in resolved_roles}) != 3 or any(
+            left.samefile(right)
+            for offset, left in enumerate(resolved_roles)
+            for right in resolved_roles[offset + 1 :]
+        ):
+            raise ValueError(f"TSE fixture {key} roles must be independent files")
+        sample: dict[str, Any] = {
+            "key": key,
+            "sample_id": key,
+            "audio": role_paths["mixture_audio"][0].as_posix(),
+            "audio_path": str(role_paths["mixture_audio"][1]),
+            "mixture_audio": role_paths["mixture_audio"][0].as_posix(),
+            "mixture_audio_path": str(role_paths["mixture_audio"][1]),
+            "enrollment_audio": role_paths["enrollment_audio"][0].as_posix(),
+            "enrollment_audio_path": str(role_paths["enrollment_audio"][1]),
+            "reference_audio": role_paths["reference_audio"][0].as_posix(),
+            "reference_audio_path": str(role_paths["reference_audio"][1]),
+            "annotation_fields": ["reference_audio"],
+        }
+        language = row.get("language")
+        if isinstance(language, str) and language.strip():
+            sample["language"] = language.strip()
+        reference_text = row.get("reference_text")
+        if reference_text is not None:
+            if not isinstance(reference_text, str) or any(ord(character) < 32 for character in reference_text):
+                raise ValueError(f"TSE fixture {key} reference_text must be a safe string")
+            if reference_text.strip():
+                sample["reference_text"] = reference_text
+                sample["annotation_fields"].append("reference_text")
+        samples.append(sample)
+    return samples
+
+
+def replace_tse_tree(source_dir: Path, staged_dir: Path, samples: list[dict[str, Any]]) -> None:
+    """Write a canonical TSE fixture containing only referenced role audio and labels."""
+
+    validate_structured_source_tree(source_dir)
+    if staged_dir.exists() or staged_dir.is_symlink():
+        if staged_dir.is_symlink() or staged_dir.is_file():
+            staged_dir.unlink()
+        else:
+            shutil.rmtree(staged_dir)
+    staged_dir.mkdir(parents=True)
+    copied: set[Path] = set()
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        row: dict[str, Any] = {
+            "key": sample["key"],
+            "sample_id": sample["sample_id"],
+            "task_type": "tse",
+            "audio": sample["mixture_audio"],
+            "mixture_audio": sample["mixture_audio"],
+            "enrollment_audio": sample["enrollment_audio"],
+            "reference_audio": sample["reference_audio"],
+        }
+        for field in ("language", "reference_text"):
+            if sample.get(field) not in (None, ""):
+                row[field] = sample[field]
+        rows.append(row)
+        for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+            relative = Path(str(sample[role]))
+            if relative in copied:
+                continue
+            copied.add(relative)
+            destination = staged_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_dir / relative, destination)
+    (staged_dir / "gt.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
 def replace_tree(source_dir: Path, staged_dir: Path) -> None:
     if staged_dir.exists() or staged_dir.is_symlink():
         if staged_dir.is_symlink() or staged_dir.is_file():
@@ -323,7 +589,7 @@ def main() -> int:
         return 1
     task = canonical_task(task_raw)
     declared_model_dir = Path(model_dir_raw).expanduser()
-    if is_structured_task(task) and declared_model_dir.is_symlink():
+    if (is_structured_task(task) or task == "tse") and declared_model_dir.is_symlink():
         print("structured-task model_dir must not be a symlink", file=sys.stderr)
         return 1
     model_dir = declared_model_dir.resolve()
@@ -333,7 +599,11 @@ def main() -> int:
         source_dir = Path(args.source_dir)
         if not source_dir.is_absolute():
             source_dir = repo_root / source_dir
-        symlink_component = first_symlink_component(source_dir) if is_structured_task(task) else None
+        symlink_component = (
+            first_symlink_component(source_dir)
+            if is_structured_task(task) or task == "tse"
+            else None
+        )
         if symlink_component is not None:
             print(
                 f"structured fixture source path must not traverse a symlink: {symlink_component}",
@@ -352,9 +622,27 @@ def main() -> int:
         print(f"Fixture source must contain gt.jsonl: {source_dir}", file=sys.stderr)
         return 1
 
-    samples = load_samples(source_dir, task)
+    samples = load_tse_samples(source_dir) if task == "tse" else load_samples(source_dir, task)
     staged_dir = model_dir / "fixture" / task / source_dir.name
-    if is_structured_task(task):
+    if task in CLASSIFICATION_TASKS:
+        for parent in (model_dir / "fixture", model_dir / "fixture" / task):
+            if parent.is_symlink():
+                print(f"classification staged fixture parent must not be a symlink: {parent}", file=sys.stderr)
+                return 1
+        if staged_dir.exists() or staged_dir.is_symlink():
+            if staged_dir.is_symlink() or staged_dir.is_file():
+                staged_dir.unlink()
+            else:
+                shutil.rmtree(staged_dir)
+        staged_dir.mkdir(parents=True, exist_ok=True)
+        prepare_classification_tree(source_dir, staged_dir, task)
+    elif task == "tse":
+        for parent in (model_dir / "fixture", model_dir / "fixture" / task):
+            if parent.is_symlink():
+                print(f"TSE staged fixture parent must not be a symlink: {parent}", file=sys.stderr)
+                return 1
+        replace_tse_tree(source_dir, staged_dir, samples)
+    elif is_structured_task(task):
         for parent in (model_dir / "fixture", model_dir / "fixture" / task):
             if parent.is_symlink():
                 print(f"structured staged fixture parent must not be a symlink: {parent}", file=sys.stderr)
@@ -364,7 +652,10 @@ def main() -> int:
         replace_tree(source_dir, staged_dir)
 
     staged_samples = []
-    for sample in load_samples(staged_dir, task):
+    staged_source_samples = (
+        load_tse_samples(staged_dir) if task == "tse" else load_samples(staged_dir, task)
+    )
+    for sample in staged_source_samples:
         staged_samples.append(sample)
 
     manifest = {

@@ -24,6 +24,27 @@ import wave
 from collections import deque
 from pathlib import Path, PureWindowsPath
 
+from classification_contract import (
+    CLASSIFICATION_TASKS,
+    canonical_task,
+    inference_arguments,
+    normalize_prediction,
+    validate_fixture_row,
+)
+from tse_contract import (
+    TSE_TOOL,
+    looks_like_absolute_path_or_uri as tse_path_or_uri,
+    validate_output_object as validate_tse_output_object,
+)
+
+TSE_TOOL_NAMES = frozenset(
+    {
+        TSE_TOOL,
+        "target_speaker_extract",
+        "target_speaker_extraction",
+    }
+)
+
 SCHEMA = "sure.trans.mcp_smoke.v1"
 STDERR_TAIL_LINES = 200
 PORTABLE_CONTAINER_ROOTS = ("/fixture/", "/models/", "/opt/", "/validation/", "/workspace/")
@@ -46,6 +67,7 @@ REFERENCE_OUTPUT_FIELDS = {
     "target_segments",
     "target_text",
 }
+TSE_OUTPUT_FIELDS = frozenset({"prediction_audio", "sample_id"})
 
 
 def sha256_file(path: Path | None) -> str | None:
@@ -135,7 +157,14 @@ def tool_arguments(
     audio: Path,
     fixture_row: dict | None = None,
     output_path: Path | None = None,
+    enrollment_audio: Path | None = None,
 ) -> dict[str, object]:
+    if tool in {"emotion_recognize", "recognize_emotion"}:
+        return inference_arguments("ser", fixture_row or {}, str(audio))
+    if tool in {"gender_recognize", "recognize_gender"}:
+        return inference_arguments("gr", fixture_row or {}, str(audio))
+    if tool in {"slu_understand", "understand_audio", "audio_question_answer"}:
+        return inference_arguments("slu", fixture_row or {}, str(audio))
     if tool == "synthesize_speech":
         return {
             "text": "SURE smoke test",
@@ -164,18 +193,34 @@ def tool_arguments(
         if output_path is not None:
             arguments["output_path"] = str(output_path)
         return arguments
+    if tool in TSE_TOOL_NAMES:
+        if enrollment_audio is None:
+            raise ValueError("TSE smoke requires enrollment_audio")
+        if output_path is None:
+            raise ValueError("TSE smoke requires an assigned output_path")
+        return {
+            "mixture_audio_path": str(audio),
+            "enrollment_audio_path": str(enrollment_audio),
+            "output_path": str(output_path),
+        }
     return {"audio_path": str(audio)}
 
 
 def primary_output_field(tool: str) -> str:
     if tool in {"synthesize_speech", "convert_voice", "enhance_speech"}:
         return "audio_path"
+    if tool in TSE_TOOL_NAMES:
+        return "prediction_audio"
     if tool == "kws_predict":
         return "detected"
     if tool in {"diarize", "transcribe_with_speakers"}:
         return "segments"
     if tool == "detect_speech":
         return "speech_segments"
+    if tool in {"emotion_recognize", "recognize_emotion", "gender_recognize", "recognize_gender"}:
+        return "label"
+    if tool in {"slu_understand", "understand_audio", "audio_question_answer"}:
+        return "answer"
     return "text"
 
 
@@ -186,7 +231,7 @@ def output_is_nonempty(primary_field: str, value: object) -> bool:
     holds bytes; the server runs as this script's child, so the path it
     returns is one this process can stat.
     """
-    if primary_field.endswith("_path"):
+    if primary_field.endswith("_path") or primary_field == "prediction_audio":
         if not isinstance(value, str) or not value:
             return False
         candidate = Path(value)
@@ -283,6 +328,73 @@ def validate_kws_output(value: object, reference: dict) -> list[str]:
     return violations
 
 
+def load_classification_fixture(
+    path: Path, *, task: str
+) -> list[tuple[str, Path, dict, None]]:
+    """Load bounded keyed classification rows without exposing references."""
+
+    normalized_task = canonical_task(task)
+    if normalized_task not in CLASSIFICATION_TASKS:
+        raise ValueError(f"unsupported classification fixture task: {task}")
+    if path.is_dir():
+        path = path / "gt.jsonl"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{normalized_task.upper()} fixture gt.jsonl must be a regular file")
+    rows: list[tuple[str, Path, dict, None]] = []
+    seen: set[str] = set()
+    fixture_root = path.parent.resolve()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{normalized_task.upper()} fixture line {line_number} must be an object")
+        key = str(row.get("key") or row.get("id") or "").strip()
+        if not key or key in seen:
+            raise ValueError(f"{normalized_task.upper()} fixture key is missing or duplicated: {key!r}")
+        seen.add(key)
+        validate_fixture_row(normalized_task, row, key=key)
+        audio = row.get("audio") or row.get("wav")
+        if not isinstance(audio, str) or not audio.strip():
+            raise ValueError(f"{normalized_task.upper()} fixture {key} requires audio")
+        relative = Path(audio)
+        if relative.is_absolute() or ".." in relative.parts or "\\" in audio:
+            raise ValueError(f"{normalized_task.upper()} fixture {key} audio path must be relative and contained")
+        current = path.parent
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"{normalized_task.upper()} fixture {key} audio must not traverse a symlink")
+        audio_path = (path.parent / relative).resolve()
+        if not audio_path.is_file() or not audio_path.is_relative_to(fixture_root):
+            raise ValueError(f"{normalized_task.upper()} fixture {key} audio is missing or unsafe")
+        rows.append((key, audio_path, row, None))
+    if not 1 <= len(rows) <= 5:
+        raise ValueError(f"{normalized_task.upper()} MCP smoke requires 1 to 5 samples")
+    return rows
+
+
+def validate_classification_output(value: object, *, task: str) -> list[str]:
+    """Validate the closed output object exposed by a classification tool."""
+
+    if not isinstance(value, dict):
+        return ["classification output must be an object"]
+    try:
+        _scalar, normalized = normalize_prediction(task, value)
+    except (TypeError, ValueError) as error:
+        return [str(error)]
+    if value != normalized:
+        return [
+            f"{canonical_task(task).upper()} output must use the canonical fields: "
+            + ", ".join(sorted(normalized))
+        ]
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        return [f"classification output must be strict JSON: {error}"]
+    return []
+
+
 def load_kws_fixture(path: Path) -> list[tuple[str, Path, dict]]:
     rows: list[tuple[str, Path, dict]] = []
     seen: set[str] = set()
@@ -350,6 +462,122 @@ def load_se_fixture(path: Path) -> list[tuple[str, Path, dict, Path]]:
     if not 1 <= len(rows) <= 5:
         raise ValueError("SE MCP smoke requires 1 to 5 noisy/clean samples")
     return rows
+
+
+def load_tse_fixture(path: Path) -> list[tuple[str, Path, dict, Path, Path]]:
+    """Load bounded TSE rows as mixture, reference, and enrollment paths."""
+
+    if path.is_dir():
+        path = path / "gt.jsonl"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("TSE fixture gt.jsonl must be a regular file")
+    fixture_root = path.parent.resolve()
+    rows: list[tuple[str, Path, dict, Path, Path]] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"TSE fixture line {line_number} must be an object")
+        key = str(row.get("sample_id") or row.get("key") or "").strip()
+        if not key or key in seen or tse_path_or_uri(key):
+            raise ValueError(f"TSE fixture key is missing, unsafe, or duplicated: {key!r}")
+        seen.add(key)
+        paths: dict[str, Path] = {}
+        for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+            raw = row.get(role)
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError(f"TSE fixture {key} requires {role}")
+            relative = Path(raw)
+            if relative.is_absolute() or ".." in relative.parts or "\\" in raw or "://" in raw:
+                raise ValueError(f"TSE fixture {key} {role} path must be relative and contained")
+            current = path.parent
+            for part in relative.parts:
+                current = current / part
+                if current.is_symlink():
+                    raise ValueError(f"TSE fixture {key} {role} must not traverse a symlink")
+            resolved = (path.parent / relative).resolve()
+            if (
+                not resolved.is_file()
+                or resolved.stat().st_size <= 0
+                or not resolved.is_relative_to(fixture_root)
+            ):
+                raise ValueError(f"TSE fixture {key} {role} is missing or unsafe")
+            paths[role] = resolved
+        role_paths = [paths[role] for role in ("mixture_audio", "enrollment_audio", "reference_audio")]
+        if len({item.resolve() for item in role_paths}) != 3 or any(
+            left.samefile(right)
+            for offset, left in enumerate(role_paths)
+            for right in role_paths[offset + 1 :]
+        ):
+            raise ValueError(f"TSE fixture {key} roles must be independent files")
+        rows.append((key, paths["mixture_audio"], row, paths["reference_audio"], paths["enrollment_audio"]))
+    if not 1 <= len(rows) <= 5:
+        raise ValueError("TSE MCP smoke requires 1 to 5 samples")
+    return rows
+
+
+def validate_tse_output(
+    value: object,
+    *,
+    key: str,
+    outputs_root: Path,
+    expected_path: Path,
+    forbidden_inputs: tuple[Path, ...],
+) -> tuple[list[str], Path | None]:
+    """Validate generated TSE audio and reject reference/input leakage."""
+
+    if not isinstance(value, dict):
+        return ["TSE output must be an object"], None
+    try:
+        canonical = validate_tse_output_object(value, sample_id=key)
+    except (TypeError, ValueError) as error:
+        return [str(error)], None
+    if value.get("prediction_audio") != canonical.get("prediction_audio"):
+        return ["TSE output prediction_audio must be a canonical non-empty path"], None
+    raw_path = canonical["prediction_audio"]
+    candidate = Path(str(raw_path)).expanduser()
+    if not candidate.is_absolute():
+        candidate = outputs_root / candidate
+    root = outputs_root.resolve()
+    if root.is_symlink() or root != outputs_root.absolute():
+        return ["TSE outputs directory must not traverse a symlink"], None
+    try:
+        lexical = candidate.absolute().relative_to(root)
+    except ValueError:
+        return ["TSE prediction_audio must stay below MCP validation outputs"], None
+    current = root
+    for part in lexical.parts:
+        current = current / part
+        if current.is_symlink():
+            return ["TSE prediction_audio must not traverse a symlink"], None
+    if not candidate.is_file() or candidate.is_symlink() or candidate.stat().st_size <= 0:
+        return ["TSE prediction_audio must name a real non-empty file"], None
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        return ["TSE prediction_audio must stay below MCP validation outputs"], None
+    if candidate.absolute() != expected_path.absolute() or resolved != expected_path.resolve():
+        return ["TSE prediction_audio must equal the harness-assigned output_path"], None
+    for input_path in forbidden_inputs:
+        try:
+            if resolved.samefile(input_path):
+                return ["TSE prediction_audio must not alias mixture, enrollment, or reference audio"], None
+        except OSError:
+            continue
+    try:
+        with wave.open(str(resolved), "rb") as handle:
+            if (
+                handle.getcomptype() != "NONE"
+                or handle.getnchannels() < 1
+                or handle.getsampwidth() not in {1, 2, 3, 4}
+                or handle.getframerate() < 1
+                or handle.getnframes() < 1
+            ):
+                return ["TSE prediction_audio must be a readable non-empty PCM WAV"], None
+    except (EOFError, OSError, wave.Error):
+        return ["TSE prediction_audio must be a readable non-empty PCM WAV"], None
+    return [], resolved
 
 
 def validate_vad_intervals(
@@ -926,14 +1154,30 @@ def main() -> int:
                 calls = [(*call, None) for call in load_kws_fixture(fixture_gt_jsonl)]
             elif args.tool == "enhance_speech":
                 calls = load_se_fixture(fixture_gt_jsonl)
+            elif args.tool in TSE_TOOL_NAMES:
+                calls = load_tse_fixture(fixture_gt_jsonl)
             elif args.tool in {"diarize", "transcribe_with_speakers"}:
                 calls = load_speaker_fixture(fixture_gt_jsonl, tool=args.tool)
             elif args.tool == "detect_speech":
                 calls = load_vad_fixture(fixture_gt_jsonl)
+            elif args.tool in {
+                "emotion_recognize",
+                "recognize_emotion",
+                "gender_recognize",
+                "recognize_gender",
+                "slu_understand",
+                "understand_audio",
+                "audio_question_answer",
+            }:
+                task = "slu" if args.tool in {"slu_understand", "understand_audio", "audio_question_answer"} else (
+                    "ser" if args.tool in {"emotion_recognize", "recognize_emotion"} else "gr"
+                )
+                calls = load_classification_fixture(fixture_gt_jsonl, task=task)
             else:
                 raise ValueError(
                     "--fixture-gt-jsonl is only valid with --tool kws_predict, enhance_speech, "
-                    "diarize, transcribe_with_speakers, or detect_speech"
+                    "extract_target_speaker, "
+                    "diarize, transcribe_with_speakers, detect_speech, or classification tools"
                 )
         else:
             assert audio is not None
@@ -972,11 +1216,16 @@ def main() -> int:
         primary_field = primary_output_field(args.tool)
         sample_evidence: list[dict] = []
         all_calls_ok = True
-        for sample_index, (key, call_audio, fixture_row, reference_audio) in enumerate(calls, 1):
+        for sample_index, call in enumerate(calls, 1):
+            if len(call) == 5:
+                key, call_audio, fixture_row, reference_audio, enrollment_audio = call
+            else:
+                key, call_audio, fixture_row, reference_audio = call
+                enrollment_audio = None
             request_id = sample_index + 2
             requested_output = (
                 mcp_output_path(produces, key, sample_index)
-                if args.tool == "enhance_speech"
+                if args.tool == "enhance_speech" or args.tool in TSE_TOOL_NAMES
                 else None
             )
             if requested_output is not None and (requested_output.exists() or requested_output.is_symlink()):
@@ -995,6 +1244,7 @@ def main() -> int:
                             call_audio,
                             fixture_row,
                             requested_output,
+                            enrollment_audio,
                         ),
                     },
                 },
@@ -1011,12 +1261,35 @@ def main() -> int:
                 except (IndexError, KeyError, TypeError, json.JSONDecodeError):
                     parsed = None
             primary_value = parsed.get(primary_field) if isinstance(parsed, dict) else None
+            if (
+                primary_field == "prediction_audio"
+                and isinstance(primary_value, str)
+                and requested_output is not None
+                and not Path(primary_value).is_absolute()
+            ):
+                # TSE adapters may return the assigned file as a run-local
+                # basename; resolve it against the harness-owned output dir
+                # before checking that bytes were actually produced.
+                primary_value = str(requested_output.parent / primary_value)
             output_nonempty = output_is_nonempty(primary_field, primary_value)
             violations = (
                 validate_kws_output(parsed, fixture_row)
                 if args.tool == "kws_predict" and fixture_row is not None
                 else []
             )
+            if args.tool in {
+                "emotion_recognize",
+                "recognize_emotion",
+                "gender_recognize",
+                "recognize_gender",
+                "slu_understand",
+                "understand_audio",
+                "audio_question_answer",
+            }:
+                task = "slu" if args.tool in {"slu_understand", "understand_audio", "audio_question_answer"} else (
+                    "ser" if args.tool in {"emotion_recognize", "recognize_emotion"} else "gr"
+                )
+                violations.extend(validate_classification_output(parsed, task=task))
             structured_wav_info: dict[str, object] | None = None
             if args.tool in {"diarize", "transcribe_with_speakers"}:
                 structured_wav_info = pcm_wav_info(call_audio)
@@ -1051,6 +1324,17 @@ def main() -> int:
                     ),
                 )
                 violations.extend(se_violations)
+            if args.tool in TSE_TOOL_NAMES:
+                tse_violations, generated_audio = validate_tse_output(
+                    parsed,
+                    key=key,
+                    outputs_root=produces.parent / "outputs",
+                    expected_path=requested_output,
+                    forbidden_inputs=tuple(
+                        path for path in (call_audio, enrollment_audio, reference_audio) if path is not None
+                    ),
+                )
+                violations.extend(tse_violations)
             call_ok = ok and output_nonempty and not violations
             all_calls_ok = all_calls_ok and call_ok
             result_preview: object = (
@@ -1071,9 +1355,27 @@ def main() -> int:
                     if generated_audio is not None
                     else None
                 )
+            if args.tool in TSE_TOOL_NAMES:
+                result_preview = (
+                    {
+                        "prediction_audio": f"outputs/{generated_audio.name}",
+                    }
+                    if generated_audio is not None
+                    else None
+                )
             if args.tool in {"diarize", "transcribe_with_speakers"}:
                 result_preview = parsed if isinstance(parsed, dict) else None
             if args.tool == "detect_speech":
+                result_preview = parsed if isinstance(parsed, dict) else None
+            if args.tool in {
+                "emotion_recognize",
+                "recognize_emotion",
+                "gender_recognize",
+                "recognize_gender",
+                "slu_understand",
+                "understand_audio",
+                "audio_question_answer",
+            }:
                 result_preview = parsed if isinstance(parsed, dict) else None
             sample_evidence.append(
                 {
@@ -1109,6 +1411,15 @@ def main() -> int:
                         else None
                     ),
                     "reference_audio_sha256": sha256_file(reference_audio),
+                    "enrollment_audio": (
+                        str(fixture_row.get("enrollment_audio"))
+                        if fixture_row is not None and enrollment_audio is not None
+                        else None
+                    ),
+                    "enrollment_audio_sha256": sha256_file(enrollment_audio),
+                    "prediction_audio_sha256": sha256_file(generated_audio)
+                    if args.tool in TSE_TOOL_NAMES
+                    else None,
                     "ok": call_ok,
                     "output_nonempty": output_nonempty,
                     "result": result_preview,

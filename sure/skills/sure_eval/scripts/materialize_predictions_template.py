@@ -43,7 +43,17 @@ def _default_metric(task: str | None, language: str | None) -> str:
     if task_name in {"SPEECH_ACTIVITY_DETECTION", "VOICE_ACTIVITY_DETECTION"}:
         task_name = "VAD"
     language_name = (language or "").lower()
-    if task_name in {"SER", "GR", "SLU"}:
+    if task_name in {
+        "SER",
+        "SPEECH_EMOTION_RECOGNITION",
+        "SPEAKER_EMOTION_RECOGNITION",
+        "EMOTION_RECOGNITION",
+        "GR",
+        "GENDER_RECOGNITION",
+        "SPEAKER_GENDER",
+        "SLU",
+        "SPOKEN_LANGUAGE_UNDERSTANDING",
+    }:
         return "accuracy"
     if task_name == "S2TT":
         return "bleu"
@@ -55,6 +65,17 @@ def _default_metric(task: str | None, language: str | None) -> str:
         return "f1"
     if task_name == "SE":
         return "si-sdr"
+    if task_name in {
+        "TSE",
+        "TARGET_SPEAKER_EXTRACTION",
+        "TARGET_SPEAKER_EXTRACTOR",
+        "TARGET_SPEAKER_EXTRACTION_MODEL",
+        "TARGET_SPEAKER",
+        "SPEAKER_EXTRACTION",
+        "TARGET_VOICE_EXTRACTION",
+        "TARGET_VOICE_SEPARATION",
+    }:
+        return "si_sdr"
     if task_name == "TTS":
         return "tts_cer" if language_name.startswith(("zh", "cmn", "yue")) else "tts_wer"
     if task_name == "ASR" and language_name == "cs":
@@ -88,7 +109,7 @@ def _materialize_one(
 
     with open(template_path, "w", encoding="utf-8") as handle:
         for sample in samples:
-            handle.write(f"{sample.get('key', '')}\t\n")
+            handle.write(f"{sample.get('key') or sample.get('sample_id') or ''}\t\n")
 
     info = dataset_manager.get_info(canonical_name) or {}
     task = samples[0].get("task", info.get("task"))

@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SURE TSE prediction output",
+  "type": "object",
+  "required": ["prediction_audio"],
+  "properties": {
+    "prediction_audio": { "type": "string", "minLength": 1 },
+    "sample_id": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

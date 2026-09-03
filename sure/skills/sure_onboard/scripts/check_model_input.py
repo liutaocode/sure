@@ -22,6 +22,7 @@ from sure.site.container_delivery import resolve_container_image, resolve_contai
 from sure.site.loader import load_site_policy
 
 from structured_segments import is_structured_task, structured_task_contract
+from tse_contract import task_contract as tse_task_contract
 
 TASK_TYPES = {
     "asr",
@@ -38,6 +39,7 @@ TASK_TYPES = {
     "speech_understanding",
     "sa-asr",
     "sa_asr",
+    "tse",
 }
 DEPLOYMENT_TYPES = {"local", "api"}
 PACKAGE_PROFILES = {"none", "docker-local", "docker-registry"}
@@ -113,8 +115,14 @@ def main() -> int:
         print(f"LOAD_MODEL_INPUT gate: unsupported task_type={task_type!r}", file=sys.stderr)
         return 1
 
-    if is_structured_task(task_type):
-        expected_contract = structured_task_contract(task_type)
+    expected_contract = (
+        tse_task_contract()
+        if task_type == "tse"
+        else structured_task_contract(task_type)
+        if is_structured_task(task_type)
+        else None
+    )
+    if expected_contract is not None:
         if data.get("task_contract") != expected_contract:
             print(
                 "LOAD_MODEL_INPUT gate: structured tasks require their canonical task_contract.",

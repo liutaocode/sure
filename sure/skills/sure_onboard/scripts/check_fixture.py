@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,22 @@ from structured_segments import (
     reference_segments_field,
     validate_segments,
 )
+from tse_contract import safe_relative_audio, safe_sample_id
+
+CLASSIFICATION_TASKS = {"ser", "gr", "slu"}
+TSE_TASK = "tse"
+SER_LABEL_ALIASES = {
+    "neu": "neu", "neutral": "neu", "calm": "neu",
+    "hap": "hap", "happy": "hap", "happiness": "hap", "joy": "hap",
+    "ang": "ang", "angry": "ang", "anger": "ang",
+    "sad": "sad", "sadness": "sad",
+}
+GR_LABEL_ALIASES = {
+    "man": "man", "male": "man", "m": "man",
+    "woman": "woman", "female": "woman", "f": "woman",
+}
+SER_NUMERIC_ALIASES = {"0": "neu", "1": "hap", "2": "ang", "3": "sad"}
+GR_NUMERIC_ALIASES = {"0": "man", "1": "woman"}
 
 
 def load_json(path: Path) -> Any:
@@ -43,6 +60,38 @@ def annotation_is_nonempty(value: Any) -> bool:
     if isinstance(value, (list, dict)):
         return bool(value)
     return value is not None
+
+
+def normalized_classification_label(task: str, value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"{task.upper()} fixture label is unknown: {value!r}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{task.upper()} fixture label is unknown: {value!r}")
+    text = ("" if value is None else str(value)).strip().lower()
+    text = re.sub(r"^[\s\[({<]+|[\s\])}>.,!?;:：，。！？；]+$", "", text)
+    aliases = (
+        {**SER_LABEL_ALIASES, **SER_NUMERIC_ALIASES}
+        if task == "ser"
+        else {**GR_LABEL_ALIASES, **GR_NUMERIC_ALIASES}
+    )
+    if text not in aliases:
+        raise ValueError(f"{task.upper()} fixture label is unknown: {value!r}")
+    return aliases[text]
+
+
+def normalized_classification_answer(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError("SLU fixture answer must be a string or finite scalar")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("SLU fixture answer must be a string or finite scalar")
+    text = ("" if value is None else str(value)).strip().rstrip(".!?。！？")
+    if not text or any(ord(character) < 32 for character in text):
+        raise ValueError("SLU fixture answer must be non-empty and must not contain control characters")
+    match = re.fullmatch(r"(?is)(?:the\s+)?answer\s*(?:is|:|-)?\s*([A-Za-z0-9_+-]+)", text)
+    if match:
+        return match.group(1)
+    match = re.fullmatch(r"答案\s*(?:是|为|:|：)?\s*([A-Za-z0-9_+-]+)", text)
+    return match.group(1) if match else text
 
 
 def vad_hard_link_error(path: Path, label: str) -> str | None:
@@ -78,9 +127,9 @@ def main() -> int:
     task = canonical_task(str(data["task_type"]))
     raw_staged_dir = Path(str(data["staged_dir"])).expanduser()
     raw_gt_jsonl = Path(str(data["gt_jsonl"])).expanduser()
-    if is_structured_task(task) and raw_staged_dir.is_symlink():
+    if (is_structured_task(task) or task in CLASSIFICATION_TASKS or task == TSE_TASK) and raw_staged_dir.is_symlink():
         return fail("structured staged fixture directory must not be a symlink")
-    if is_structured_task(task) and raw_gt_jsonl.is_symlink():
+    if (is_structured_task(task) or task in CLASSIFICATION_TASKS or task == TSE_TASK) and raw_gt_jsonl.is_symlink():
         return fail("structured staged gt.jsonl must not be a symlink")
     staged_dir = raw_staged_dir.resolve()
     gt_jsonl = raw_gt_jsonl.resolve()
@@ -95,7 +144,7 @@ def main() -> int:
         return fail(f"staged_dir must be under model_dir/fixture/{task}: {staged_dir}")
     if not staged_dir.exists() or not staged_dir.is_dir():
         return fail(f"staged_dir does not exist or is not a directory: {staged_dir}")
-    if is_structured_task(task):
+    if is_structured_task(task) or task in CLASSIFICATION_TASKS or task == TSE_TASK:
         symlinks = [entry for entry in staged_dir.rglob("*") if entry.is_symlink()]
         if symlinks:
             return fail(f"structured staged fixture tree must not contain symlinks: {symlinks[0]}")
@@ -114,7 +163,7 @@ def main() -> int:
     if not (1 <= len(samples) <= 5):
         return fail("sample_count must be between 1 and 5")
     parsed_rows = []
-    allowed_structured_files = {gt_jsonl} if is_structured_task(task) else set()
+    allowed_structured_files = {gt_jsonl} if (is_structured_task(task) or task in CLASSIFICATION_TASKS or task == TSE_TASK) else set()
     seen_keys: set[str] = set()
     for line_no, line in enumerate(gt_jsonl.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
@@ -128,6 +177,8 @@ def main() -> int:
         audio = (
             row.get("audio") or row.get("wav")
             if is_structured_task(task)
+            else row.get("mixture_audio") or row.get("mixed_audio") or row.get("audio") or row.get("wav")
+            if task == TSE_TASK
             else row.get("audio")
             or row.get("wav")
             or row.get("prompt_audio")
@@ -145,7 +196,7 @@ def main() -> int:
             return fail(f"{gt_jsonl}:{line_no} referenced audio does not exist: {audio}")
         if task == "vad" and (error := vad_hard_link_error(resolved_audio, f"audio {audio!r}")):
             return fail(error)
-        if is_structured_task(task):
+        if is_structured_task(task) or task in CLASSIFICATION_TASKS or task == TSE_TASK:
             allowed_structured_files.add(resolved_audio)
         key = str(row.get("key") or row.get("id") or audio_path.stem).strip()
         if not key:
@@ -153,6 +204,69 @@ def main() -> int:
         if key in seen_keys:
             return fail(f"{gt_jsonl}:{line_no} duplicates fixture key {key!r}")
         seen_keys.add(key)
+        if task == TSE_TASK:
+            try:
+                safe_key = safe_sample_id(row.get("sample_id") or key)
+            except ValueError as exc:
+                return fail(f"{gt_jsonl}:{line_no} invalid TSE sample_id: {exc}")
+            if safe_key != key or row.get("task_type") != TSE_TASK:
+                return fail(f"{gt_jsonl}:{line_no} TSE key/task_type aliases are not canonical")
+            allowed_fields = {
+                "key",
+                "sample_id",
+                "task_type",
+                "audio",
+                "mixture_audio",
+                "enrollment_audio",
+                "reference_audio",
+                "language",
+                "reference_text",
+            }
+            if not set(row).issubset(allowed_fields):
+                return fail(f"{gt_jsonl}:{line_no} contains unapproved TSE reference metadata")
+            role_paths: list[Path] = []
+            for role in ("mixture_audio", "enrollment_audio", "reference_audio"):
+                try:
+                    relative = safe_relative_audio(row.get(role), role=role)
+                except ValueError as exc:
+                    return fail(f"{gt_jsonl}:{line_no} {exc}")
+                current = gt_jsonl.parent
+                for part in relative.parts:
+                    current = current / part
+                    if current.is_symlink():
+                        return fail(f"{gt_jsonl}:{line_no} TSE {role} traverses a symlink")
+                role_path = (gt_jsonl.parent / relative).resolve()
+                if not role_path.is_file() or not role_path.is_relative_to(staged_dir):
+                    return fail(f"{gt_jsonl}:{line_no} TSE {role} is missing or unsafe")
+                role_paths.append(role_path)
+                allowed_structured_files.add(role_path)
+            if len({path for path in role_paths}) != 3 or any(
+                left.samefile(right)
+                for offset, left in enumerate(role_paths)
+                for right in role_paths[offset + 1 :]
+            ):
+                return fail(f"{gt_jsonl}:{line_no} TSE roles must be independent files")
+            if row.get("audio") != row.get("mixture_audio"):
+                return fail(f"{gt_jsonl}:{line_no} TSE audio must equal mixture_audio")
+            if row.get("reference_text") is not None and not isinstance(row.get("reference_text"), str):
+                return fail(f"{gt_jsonl}:{line_no} TSE reference_text must be a string")
+            if len(samples) <= len(parsed_rows):
+                return fail("samples array has fewer entries than gt.jsonl")
+            manifest_sample = samples[len(parsed_rows)]
+            if not isinstance(manifest_sample, dict):
+                return fail(f"samples[{len(parsed_rows)}] must be an object")
+            for role, role_path in zip(("mixture_audio", "enrollment_audio", "reference_audio"), role_paths):
+                if manifest_sample.get(role) != row.get(role):
+                    return fail(f"TSE manifest sample {key} {role} changed")
+                if Path(str(manifest_sample.get(f"{role}_path") or "")).resolve() != role_path:
+                    return fail(f"TSE manifest sample {key} {role}_path changed")
+            if manifest_sample.get("audio") != row.get("mixture_audio"):
+                return fail(f"TSE manifest sample {key} audio alias changed")
+            expected_annotations = ["reference_audio"]
+            if isinstance(row.get("reference_text"), str) and row["reference_text"].strip():
+                expected_annotations.append("reference_text")
+            if manifest_sample.get("annotation_fields") != expected_annotations:
+                return fail(f"TSE manifest sample {key} annotation_fields changed")
         reference_audio = row.get("reference_audio")
         if task == "se":
             if not isinstance(reference_audio, str) or not reference_audio:
@@ -190,6 +304,25 @@ def main() -> int:
             return fail(f"{gt_jsonl}:{line_no} task sd requires speaker segments")
         if task == "vad" and "speech_segments" not in row:
             return fail(f"{gt_jsonl}:{line_no} task vad requires speech_segments")
+        if task in CLASSIFICATION_TASKS:
+            if row.get("task_type") != task:
+                return fail(f"{gt_jsonl}:{line_no} must use canonical task_type={task}")
+            allowed_fields = {"key", "task_type", "audio", "wav", "ground_truth", "language", "dataset", "prompt", "choices"}
+            if not set(row).issubset(allowed_fields):
+                return fail(f"{gt_jsonl}:{line_no} contains unapproved classification reference metadata")
+            try:
+                reference = row.get("ground_truth")
+                if task in {"ser", "gr"}:
+                    normalized_reference = normalized_classification_label(task, reference)
+                else:
+                    normalized_reference = normalized_classification_answer(reference)
+                    prompt = row.get("prompt")
+                    if not isinstance(prompt, str) or not prompt.strip():
+                        raise ValueError("prompt must be non-empty")
+            except ValueError as exc:
+                return fail(f"{gt_jsonl}:{line_no} invalid {task} reference: {exc}")
+            if row.get("ground_truth") != normalized_reference:
+                return fail(f"{gt_jsonl}:{line_no} ground_truth must use canonical label/answer")
         if is_structured_task(task) and row.get("task") is not None and canonical_task(row["task"]) != task:
             return fail(f"{gt_jsonl}:{line_no} declares task {row['task']!r}, expected {task!r}")
 
@@ -249,6 +382,10 @@ def main() -> int:
         ]
         if task == "se" and annotation_is_nonempty(reference_audio):
             annotation_fields.append("reference_audio")
+        if task == TSE_TASK and annotation_is_nonempty(row.get("reference_audio")):
+            annotation_fields.append("reference_audio")
+            if annotation_is_nonempty(row.get("reference_text")):
+                annotation_fields.append("reference_text")
         if not annotation_fields:
             return fail(
                 f"{gt_jsonl}:{line_no} must contain at least one annotation field "
@@ -298,11 +435,15 @@ def main() -> int:
 
     if len(parsed_rows) != len(samples):
         return fail("samples array must mirror non-empty gt.jsonl rows")
-    if is_structured_task(task):
+    if is_structured_task(task) or task in CLASSIFICATION_TASKS or task == TSE_TASK:
+        symlinks = [entry for entry in staged_dir.rglob("*") if entry.is_symlink()]
+        if symlinks:
+            return fail(f"classification/structured staged fixture tree must not contain symlinks: {symlinks[0]}")
         staged_files = {entry.resolve() for entry in staged_dir.rglob("*") if entry.is_file()}
         extras = sorted(staged_files - allowed_structured_files)
         if extras:
             return fail(f"structured staged fixture contains an unreferenced sidecar: {extras[0]}")
+    if is_structured_task(task):
         if data.get("validation_protocol_env") != "SURE_VALIDATE_PROTOCOL_JSON":
             return fail("structured fixture manifest must declare SURE_VALIDATE_PROTOCOL_JSON")
 

@@ -38,6 +38,13 @@ CHECKS: dict[str, list[str]] = {
         "SI-SDR",
         "DNSMOS",
     ],
+    "task_playbooks/TSE.md": [
+        "extract_target_speaker",
+        "mixture_audio_path",
+        "enrollment_audio_path",
+        "prediction_audio",
+        "reference_audio",
+    ],
     "task_playbooks/VAD.md": [
         "detect_speech",
         "speech_segments",

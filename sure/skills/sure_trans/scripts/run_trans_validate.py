@@ -16,6 +16,11 @@ import wave
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 
+from classification_contract import CLASSIFICATION_TASKS, canonical_task, normalize_prediction
+from mcp_smoke import validate_classification_output
+from tse_contract import TSE_TOOL, validate_output_object as validate_tse_output_object
+from tse_contract import canonical_task as canonical_tse_task
+
 from vc_exec import (
     DEFAULT_CPUS,
     DEFAULT_GPUS,
@@ -275,6 +280,76 @@ def validate_mcp_evidence(evidence_path: Path, tool_name: str) -> str | None:
             reference_sha256 = sample.get("reference_audio_sha256")
             if not isinstance(reference_sha256, str) or len(reference_sha256) != 64:
                 return f"SE MCP smoke sample {key} clean reference hash is invalid"
+    if tool_name in {TSE_TOOL, "target_speaker_extract", "target_speaker_extraction"}:
+        samples = call.get("samples")
+        if not isinstance(samples, list) or not 1 <= len(samples) <= 5:
+            return "TSE MCP smoke must record 1 to 5 keyed mixture/enrollment samples"
+        if call.get("expected_samples") != len(samples) or call.get("num_samples") != len(samples):
+            return "TSE MCP smoke sample counts do not match"
+        keys: set[str] = set()
+        for sample in samples:
+            if not isinstance(sample, dict) or sample.get("ok") is not True:
+                return "every TSE MCP smoke sample must pass"
+            key = str(sample.get("key") or "")
+            if not key or key in keys or looks_like_absolute_path_or_uri(key):
+                return "TSE MCP smoke samples require unique safe keys"
+            keys.add(key)
+            result = sample.get("result")
+            if not isinstance(result, dict):
+                return f"TSE MCP smoke sample {key} must record generated audio evidence"
+            try:
+                canonical = validate_tse_output_object(result, sample_id=key)
+            except (TypeError, ValueError) as error:
+                return f"TSE MCP smoke sample {key}: {error}"
+            if result.get("prediction_audio") != canonical.get("prediction_audio"):
+                return f"TSE MCP smoke sample {key} prediction_audio is not canonical"
+            prediction_audio = result.get("prediction_audio")
+            audio_sha256 = sample.get("prediction_audio_sha256")
+            mixture_sha256 = sample.get("audio_sha256")
+            enrollment_sha256 = sample.get("enrollment_audio_sha256")
+            reference_sha256 = sample.get("reference_audio_sha256")
+            if (
+                not isinstance(prediction_audio, str)
+                or not prediction_audio.startswith("outputs/")
+                or not isinstance(audio_sha256, str)
+                or len(audio_sha256) != 64
+                or not isinstance(mixture_sha256, str)
+                or len(mixture_sha256) != 64
+                or not isinstance(enrollment_sha256, str)
+                or len(enrollment_sha256) != 64
+                or not isinstance(reference_sha256, str)
+                or len(reference_sha256) != 64
+            ):
+                return f"TSE MCP smoke sample {key} must preserve portable role/output identity"
+    if tool_name in {
+        "emotion_recognize",
+        "recognize_emotion",
+        "gender_recognize",
+        "recognize_gender",
+        "slu_understand",
+        "understand_audio",
+        "audio_question_answer",
+    }:
+        task = "slu" if tool_name in {"slu_understand", "understand_audio", "audio_question_answer"} else (
+            "ser" if tool_name in {"emotion_recognize", "recognize_emotion"} else "gr"
+        )
+        samples = call.get("samples")
+        if not isinstance(samples, list) or not 1 <= len(samples) <= 5:
+            return f"{task.upper()} MCP smoke must record 1 to 5 keyed samples"
+        if call.get("expected_samples") != len(samples) or call.get("num_samples") != len(samples):
+            return f"{task.upper()} MCP smoke sample counts do not match"
+        keys: set[str] = set()
+        for sample in samples:
+            if not isinstance(sample, dict) or sample.get("ok") is not True:
+                return f"every {task.upper()} MCP smoke sample must pass"
+            key = str(sample.get("key") or "")
+            if not key or key in keys or looks_like_absolute_path_or_uri(key):
+                return f"{task.upper()} MCP smoke samples require unique safe keys"
+            keys.add(key)
+            result = sample.get("result")
+            violations = validate_classification_output(result, task=task)
+            if violations:
+                return f"{task.upper()} MCP smoke sample {key}: " + "; ".join(violations)
     if tool_name in {"diarize", "transcribe_with_speakers"}:
         task = "sd" if tool_name == "diarize" else "sa_asr"
         samples = call.get("samples")
@@ -404,6 +479,43 @@ def output_text(path: Path, primary_field: str) -> str:
             f"io_contract primary field into both recorded outputs"
         )
     raise ValueError(f"{path} is neither a string nor an object holding {primary_field!r}")
+
+
+def compare_classification_equivalence(
+    baseline_path: Path, adapter_path: Path, *, task: str, policy: str
+) -> tuple[dict[str, object], str | None]:
+    """Compare canonical keyed scalar outputs, accepting documented aliases."""
+
+    def read(path: Path) -> tuple[str, dict[str, object]]:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            raw = path.read_text(encoding="utf-8")
+        scalar, structured = normalize_prediction(task, raw)
+        return scalar, structured
+
+    try:
+        baseline_scalar, baseline = read(baseline_path)
+        adapter_scalar, adapter = read(adapter_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        return {}, str(error)
+    normalized = lambda value: value if policy == "exact" else " ".join(value.split())
+    match = normalized(baseline_scalar) == normalized(adapter_scalar)
+    evidence: dict[str, object] = {
+        "policy": policy,
+        "task": canonical_task(task),
+        "baseline": baseline,
+        "adapter": adapter,
+        "baseline_scalar": baseline_scalar,
+        "adapter_scalar": adapter_scalar,
+        "match": match,
+    }
+    if not match:
+        return evidence, (
+            f"baseline and adapter classification outputs differ under {policy}: "
+            f"{baseline_scalar!r} vs {adapter_scalar!r}"
+        )
+    return evidence, None
 
 
 def kws_equivalence_rows(path: Path) -> dict[str, dict[str, object]]:
@@ -1166,6 +1278,124 @@ def compare_se_equivalence(
     )
 
 
+def tse_equivalence_rows(path: Path, run_dir: Path, role: str) -> dict[str, Path]:
+    """Read keyed TSE outputs and resolve only run-owned prediction audio."""
+
+    value = json.loads(path.read_text(encoding="utf-8"))
+    rows = value.get("rows") if isinstance(value, dict) else value
+    if not isinstance(rows, list):
+        raise ValueError(f"{path} must contain a TSE rows array")
+    roots = (
+        (run_dir / "original_output", run_dir / "artifacts" / "original_output")
+        if role == "baseline"
+        else (run_dir / "artifacts" / "adapter_validation" / "outputs", run_dir / "artifacts" / "outputs")
+    )
+    normalized: dict[str, Path] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{path} rows[{index}] must be an object")
+        unknown_row_fields = sorted(
+            str(field) for field in row if field not in {"key", "sample_id", "result"}
+        )
+        if unknown_row_fields:
+            raise ValueError(
+                f"{path} TSE row {index} contains unapproved field(s): "
+                + ", ".join(unknown_row_fields)
+            )
+        if (
+            row.get("key") not in (None, "")
+            and row.get("sample_id") not in (None, "")
+            and row.get("key") != row.get("sample_id")
+        ):
+            raise ValueError(f"{path} TSE row {index} key and sample_id must match")
+        key = str(row.get("sample_id") or row.get("key") or "")
+        if not key or key in normalized or looks_like_absolute_path_or_uri(key):
+            raise ValueError(f"{path} has a missing, unsafe, or duplicate TSE key: {key!r}")
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise ValueError(f"{path} TSE result for {key} must be an object")
+        canonical_result = validate_tse_output_object(result, sample_id=key)
+        if result.get("prediction_audio") != canonical_result.get("prediction_audio"):
+            raise ValueError(f"{path} TSE result for {key} is not canonical")
+        raw_audio = result.get("prediction_audio")
+        if not isinstance(raw_audio, str) or not raw_audio.strip():
+            raise ValueError(f"{path} TSE result for {key} is missing prediction_audio")
+        declared = Path(raw_audio)
+        candidates = [declared] if declared.is_absolute() else [path.parent / declared, run_dir / declared]
+        found: Path | None = None
+        for candidate in candidates:
+            absolute = candidate.absolute()
+            for root in roots:
+                root_absolute = root.absolute()
+                if absolute != root_absolute and not absolute.is_relative_to(root_absolute):
+                    continue
+                try:
+                    relative_to_run = absolute.relative_to(run_dir.absolute())
+                except ValueError as error:
+                    raise ValueError(f"{path} TSE prediction_audio escapes run root") from error
+                current = run_dir.resolve()
+                for part in relative_to_run.parts:
+                    current = current / part
+                    if current.is_symlink():
+                        raise ValueError(f"{path} TSE prediction_audio must not traverse a symlink")
+                if absolute.is_file() and not absolute.is_symlink() and absolute.stat().st_size > 0:
+                    resolved = absolute.resolve()
+                    if resolved.is_relative_to(root.resolve()):
+                        found = resolved
+                        break
+            if found is not None:
+                break
+        if found is None:
+            raise ValueError(f"{path} TSE prediction_audio for {key} is outside its controlled root")
+        normalized[key] = found
+    return normalized
+
+
+def compare_tse_equivalence(
+    run_dir: Path,
+    baseline_path: Path,
+    adapter_path: Path,
+    policy: str,
+) -> tuple[dict, str | None]:
+    baseline = tse_equivalence_rows(baseline_path, run_dir, "baseline")
+    adapter = tse_equivalence_rows(adapter_path, run_dir, "adapter")
+    missing = sorted(set(baseline) - set(adapter))
+    extra = sorted(set(adapter) - set(baseline))
+    comparisons: dict[str, dict[str, object]] = {}
+    mismatches: list[str] = []
+    for key in sorted(set(baseline) & set(adapter)):
+        if baseline[key].samefile(adapter[key]):
+            comparison = {
+                "method": "rejected_same_recorded_file",
+                "reason": "baseline and adapter must be independent run-owned files",
+            }
+            row_matches = False
+        else:
+            comparison, row_matches = compare_audio_content(baseline[key], adapter[key])
+        comparison["match"] = row_matches
+        comparisons[key] = comparison
+        if not row_matches:
+            mismatches.append(key)
+    match = not missing and not extra and not mismatches
+    evidence = {
+        "policy": policy,
+        "comparison": "keyed_tse_pcm_or_exact_content",
+        "primary_field": "prediction_audio",
+        "path_strings_compared": False,
+        "missing_keys": missing,
+        "extra_keys": extra,
+        "mismatched_keys": mismatches,
+        "rows": comparisons,
+        "match": match,
+    }
+    if match:
+        return evidence, None
+    return evidence, (
+        "baseline and adapter TSE audio differ: "
+        f"missing={missing}, extra={extra}, mismatched={mismatches}"
+    )
+
+
 def pcm_wav_info(path: Path) -> dict[str, object]:
     if path.suffix.lower() != ".wav":
         raise ValueError("structured speaker audio must be a PCM WAV")
@@ -1287,7 +1517,7 @@ def compare_equivalence_outputs(run_dir: Path, data: dict) -> tuple[dict | None,
         paths[key] = path
     resolved_path = run_dir / "artifacts" / "trans_input_resolved.json"
     resolved = read_object(resolved_path) if resolved_path.is_file() else {}
-    task_type = str(resolved.get("task_type") or "").lower().replace("-", "_")
+    task_type = canonical_tse_task(str(resolved.get("task_type") or "").lower().replace("-", "_"))
     if not task_type:
         manifest_path = run_dir / "artifacts" / "adapter_manifest.json"
         manifest = read_object(manifest_path) if manifest_path.is_file() else {}
@@ -1305,9 +1535,29 @@ def compare_equivalence_outputs(run_dir: Path, data: dict) -> tuple[dict | None,
             )
         except (json.JSONDecodeError, ValueError) as error:
             return None, str(error)
+    if task_type in CLASSIFICATION_TASKS:
+        try:
+            return compare_classification_equivalence(
+                paths["baseline_output"],
+                paths["adapter_output"],
+                task=task_type,
+                policy=policy,
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            return None, str(error)
     if task_type == "se":
         try:
             return compare_se_equivalence(
+                run_dir,
+                paths["baseline_output"],
+                paths["adapter_output"],
+                policy,
+            )
+        except (json.JSONDecodeError, ValueError) as error:
+            return None, str(error)
+    if task_type == "tse":
+        try:
+            return compare_tse_equivalence(
                 run_dir,
                 paths["baseline_output"],
                 paths["adapter_output"],
