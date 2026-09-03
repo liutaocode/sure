@@ -4,8 +4,8 @@
   "materialization_version": 4,
   "python": "3.11",
   "dynamic_loader": "/lib64/ld-linux-x86-64.so.2",
-  "engine_commit": "a387df9629c23e8fd780bebeecc6a5362f9d57dc",
-  "engine_pyproject_sha256": "8c5dcf76d91f0deeda73d0c2230d09d8c15268437cadaf15c6b8d2d8a36df878",
+  "engine_commit": "cb9267e9f887b1619f8449e49da828c77960a52e",
+  "engine_pyproject_sha256": "20ad69e445d7efb6a0786f4dd63e1ed88ef0b8f5dfb848290c43f3039b631e2f",
   "lock_file": "requirements.lock.txt",
   "required_imports": [
     "regex",

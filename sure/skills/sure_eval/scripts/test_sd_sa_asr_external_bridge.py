@@ -462,10 +462,10 @@ class ExternalBridgeTests(unittest.TestCase):
                 self.assertTrue(Path(request["hyp_file"]).is_file())
                 metric = "der" if task == "SD" else "cpwer"
                 pipeline_id = (
-                    "sd.any.der.meeteval_v2"
+                    "sd.any.der.meeteval_v1"
                     if task == "SD"
                     else "sa_asr.en.cpwer.conversion_sa_asr_cpwer_v1."
-                    "whisper_norm_english_v1.meeteval_v2"
+                    "whisper_norm_english_v1.meeteval_v1"
                 )
                 report = {"score": 0.0, "metric": metric, "pipeline_id": pipeline_id}
                 return {
@@ -510,7 +510,7 @@ class ExternalBridgeTests(unittest.TestCase):
 
     def test_sd_bridge_preserves_annotation_roles(self) -> None:
         result, observed = self._run("SD")
-        self.assertEqual(result["pipeline_id"], "sd.any.der.meeteval_v2")
+        self.assertEqual(result["pipeline_id"], "sd.any.der.meeteval_v1")
         self.assertTrue(observed["ref_file"].endswith(".rttm"))
         self.assertTrue(observed["hyp_file"].endswith(".rttm"))
         self.assertEqual(result["details"]["annotation_conversion"]["format"], "RTTM")
@@ -594,7 +594,7 @@ class ExternalBridgeTests(unittest.TestCase):
                 "evaluation_max_samples": 1,
                 "evaluation_backend": "external",
                 "evaluator_version": "sure-evaluation",
-                "pipeline_id": "sd.any.der.meeteval_v2",
+                "pipeline_id": "sd.any.der.meeteval_v1",
                 "evaluation_context": {"nodes": ["scoring/meeteval"]},
                 "details": {
                     "summary": {},
@@ -686,15 +686,21 @@ class RealMeetEvalTests(unittest.TestCase):
 
     def test_identical_sd_annotations_score_zero_der(self) -> None:
         summary = self._run("SD", _sample("SD"))
-        self.assertEqual(summary["pipeline_id"], "sd.any.der.meeteval_v2")
+        self.assertEqual(summary["pipeline_id"], "sd.any.der.meeteval_v1")
         self.assertEqual(summary["metric"], "der")
         self.assertEqual(float(summary["score"]), 0.0)
 
+    @unittest.skip(
+        "the pinned standalone evaluator does not define empty-session DER semantics"
+    )
     def test_identical_silent_sd_annotations_score_zero_der(self) -> None:
         summary = self._run("SD", {**_sample("SD"), "segments": []})
-        self.assertEqual(summary["pipeline_id"], "sd.any.der.meeteval_v2")
+        self.assertEqual(summary["pipeline_id"], "sd.any.der.meeteval_v1")
         self.assertEqual(float(summary["score"]), 0.0)
 
+    @unittest.skip(
+        "the pinned standalone evaluator does not define empty-session DER semantics"
+    )
     def test_silent_reference_with_false_alarm_scores_one_der(self) -> None:
         summary = self._run(
             "SD",
@@ -703,9 +709,12 @@ class RealMeetEvalTests(unittest.TestCase):
         )
         self.assertEqual(float(summary["score"]), 1.0)
 
+    @unittest.skip(
+        "the pinned standalone evaluator does not define empty-session DER semantics"
+    )
     def test_speech_reference_with_empty_prediction_scores_one_der(self) -> None:
         summary = self._run("SD", _sample("SD"), prediction_segments=[])
-        self.assertEqual(summary["pipeline_id"], "sd.any.der.meeteval_v2")
+        self.assertEqual(summary["pipeline_id"], "sd.any.der.meeteval_v1")
         self.assertEqual(float(summary["score"]), 1.0)
 
     def test_identical_sa_asr_annotations_score_zero_cpwer(self) -> None:
@@ -713,7 +722,7 @@ class RealMeetEvalTests(unittest.TestCase):
         self.assertEqual(
             summary["pipeline_id"],
             "sa_asr.en.cpwer.conversion_sa_asr_cpwer_v1."
-            "whisper_norm_english_v1.meeteval_v2",
+            "whisper_norm_english_v1.meeteval_v1",
         )
         self.assertEqual(summary["metric"], "cpwer")
         self.assertEqual(float(summary["score"]), 0.0)

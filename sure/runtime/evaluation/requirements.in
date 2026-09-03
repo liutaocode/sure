@@ -1,4 +1,4 @@
-# Root dependencies declared by sure-evaluation at engine commit a387df9629c2.
+# Root dependencies for the Harness external evaluation bridge (engine cb9267e9f887).
 pydantic>=2.0.0
 sacrebleu>=2.3.0
 regex>=2024.0.0
