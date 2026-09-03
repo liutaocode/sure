@@ -46,6 +46,13 @@ def _meeteval_runtime() -> dict:
 
 
 MEETEVAL_RUNTIME = _meeteval_runtime()
+PINNED_ENGINE_COMMIT = "cb9267e9f887b1619f8449e49da828c77960a52e"
+
+
+def _empty_annotation_der_supported() -> bool:
+    """Run edge-case assertions once the standalone evaluator defines them."""
+
+    return bool(MEETEVAL_RUNTIME) and MEETEVAL_RUNTIME.get("engine_commit") != PINNED_ENGINE_COMMIT
 
 
 class _DatasetManager:
@@ -690,7 +697,8 @@ class RealMeetEvalTests(unittest.TestCase):
         self.assertEqual(summary["metric"], "der")
         self.assertEqual(float(summary["score"]), 0.0)
 
-    @unittest.skip(
+    @unittest.skipUnless(
+        _empty_annotation_der_supported(),
         "the pinned standalone evaluator does not define empty-session DER semantics"
     )
     def test_identical_silent_sd_annotations_score_zero_der(self) -> None:
@@ -698,7 +706,8 @@ class RealMeetEvalTests(unittest.TestCase):
         self.assertEqual(summary["pipeline_id"], "sd.any.der.meeteval_v1")
         self.assertEqual(float(summary["score"]), 0.0)
 
-    @unittest.skip(
+    @unittest.skipUnless(
+        _empty_annotation_der_supported(),
         "the pinned standalone evaluator does not define empty-session DER semantics"
     )
     def test_silent_reference_with_false_alarm_scores_one_der(self) -> None:
@@ -709,7 +718,8 @@ class RealMeetEvalTests(unittest.TestCase):
         )
         self.assertEqual(float(summary["score"]), 1.0)
 
-    @unittest.skip(
+    @unittest.skipUnless(
+        _empty_annotation_der_supported(),
         "the pinned standalone evaluator does not define empty-session DER semantics"
     )
     def test_speech_reference_with_empty_prediction_scores_one_der(self) -> None:
