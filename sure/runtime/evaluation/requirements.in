@@ -1,4 +1,6 @@
-# Root dependencies for the Harness external evaluation bridge (engine cb9267e9f887).
+# Root dependencies for the Harness external evaluation bridge. MeetEval is
+# pinned here because run_pipeline_spec executes scoring/meeteval in this
+# interpreter; the upstream cb9267e9f887 engine keeps it optional.
 pydantic>=2.0.0
 sacrebleu>=2.3.0
 regex>=2024.0.0
